@@ -650,13 +650,31 @@ def _quote(text: str) -> str:
     return "\n".join(f"> {line}" if line else ">" for line in text.splitlines() or [text])
 
 
-_PLATFORM_GLYPH = {
+_PLATFORM_GLYPH_FALLBACK = {
     "PC": "\U0001F5A5\uFE0F",         # 🖥️
     "Xbox": "\U0001F7E2",             # 🟢
     "PlayStation": "\U0001F535",      # 🔵
     "Switch": "\U0001F534",           # 🔴
     "Mobile": "\U0001F4F1",           # 📱
 }
+
+_PLATFORM_EMOJI_ENV = {
+    "PC": "PLATFORM_EMOJI_PC",
+    "Xbox": "PLATFORM_EMOJI_XBOX",
+    "PlayStation": "PLATFORM_EMOJI_PLAYSTATION",
+    "Switch": "PLATFORM_EMOJI_SWITCH",
+    "Mobile": "PLATFORM_EMOJI_MOBILE",
+}
+
+CLAN_EMOJI = os.getenv("CLAN_EMOJI", "").strip() or "\U0001F6E1\uFE0F"  # 🛡️
+
+
+def _platform_glyph(platform: str | None) -> str:
+    if not platform:
+        return "\U0001F3AE"  # 🎮
+    env_key = _PLATFORM_EMOJI_ENV.get(platform)
+    custom = (os.getenv(env_key) or "").strip() if env_key else ""
+    return custom or _PLATFORM_GLYPH_FALLBACK.get(platform, "\U0001F3AE")
 
 
 def _pass_components(
@@ -665,12 +683,14 @@ def _pass_components(
     clan: str | None,
     role_lines: list[str],  # noqa: ARG001 — kept for API parity / preview
 ) -> list[dict]:
-    glyph = _PLATFORM_GLYPH.get(platform or "", "\U0001F3AE")  # 🎮
-    plat = f"{glyph} **{platform}**" if platform else "\U0001F3AE *Unknown*"
-    clan_part = f"\U0001F6E1\uFE0F **{clan}**" if clan else "\U0001F6E1\uFE0F *Unaffiliated*"
+    plat = (
+        f"{_platform_glyph(platform)} **{platform}**" if platform
+        else f"{_platform_glyph(None)} *Unknown*"
+    )
+    clan_part = f"{CLAN_EMOJI} **{clan}**" if clan else f"{CLAN_EMOJI} *Unaffiliated*"
     body = (
         f"### \u2705  `{profile}`\n"
-        f"{plat}  \u2022  {clan_part}"
+        f"{clan_part}  \u2022  {plat}"
     )
     return [_container(ACCENT_PASS, body)]
 
