@@ -1,42 +1,320 @@
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+from PIL import Image
+
+try:  # optional — only needed for the lazy icon downloader
+    import requests  # type: ignore
+except ImportError:  # pragma: no cover
+    requests = None  # type: ignore[assignment]
 
 
-@dataclass(frozen=True)
-class RoleRule:
-    keyword: str
-    role_name: str
+# --- Profile name -----------------------------------------------------------
+
+# Matches Warframe profile titles like "[DE]KickBot#072" or "PlayerName#123".
+_PROFILE_NAME_RE = re.compile(r"(?:\[[A-Za-z0-9]+\])?[A-Za-z0-9_\-\.]{2,}#\d{2,4}")
 
 
-def parse_role_rules(raw_rules: str) -> list[RoleRule]:
-    """Parse ROLE_RULES env value in the format: keyword:Role Name,keyword2:Role 2"""
-    if not raw_rules or not raw_rules.strip():
-        return []
+def parse_profile_name(ocr_text: str) -> str | None:
+    """Find the first profile-name token in OCR text."""
+    if not ocr_text:
+        return None
+    for line in ocr_text.splitlines():
+        match = _PROFILE_NAME_RE.search(line)
+        if match:
+            return match.group(0).strip()
+    match = _PROFILE_NAME_RE.search(ocr_text)
+    return match.group(0).strip() if match else None
 
-    rules: list[RoleRule] = []
-    for segment in raw_rules.split(","):
-        part = segment.strip()
-        if not part:
+
+# --- Clan name --------------------------------------------------------------
+
+_CLAN_HEADER_RE = re.compile(r"\bCLAN\b", re.IGNORECASE)
+_NO_CLAN_TOKENS = ("UNAFFILIATED", "NO CLAN")
+
+
+def parse_clan_name(ocr_text: str) -> str | None:
+    """Return the clan name found below the CLAN header, or None if unaffiliated."""
+    if not ocr_text:
+        return None
+
+    lines = [line.strip() for line in ocr_text.splitlines()]
+    for index, line in enumerate(lines):
+        if not _CLAN_HEADER_RE.search(line):
+            continue
+        for candidate in lines[index + 1 : index + 6]:
+            if not candidate:
+                continue
+            upper = candidate.upper()
+            if any(token in upper for token in _NO_CLAN_TOKENS):
+                return None
+            if re.fullmatch(r"[A-Z ]{2,}", upper) and len(upper) <= 4:
+                continue
+            return candidate
+    return None
+
+
+# --- Platform detection -----------------------------------------------------
+
+PLATFORM_PC = "PC"
+PLATFORM_XBOX = "Xbox"
+PLATFORM_PLAYSTATION = "PlayStation"
+PLATFORM_SWITCH = "Switch"
+PLATFORM_MOBILE = "Mobile"
+ALL_PLATFORMS = (
+    PLATFORM_PC,
+    PLATFORM_XBOX,
+    PLATFORM_PLAYSTATION,
+    PLATFORM_SWITCH,
+    PLATFORM_MOBILE,
+)
+
+# Reference icons from the Warframe wiki MMF symbol set (xWhite variants).
+# Cross-Play icon is intentionally excluded.
+PLATFORM_ICON_URLS: dict[str, str] = {
+    PLATFORM_PC: "https://wiki.warframe.com/w/Special:FilePath/IconWindows(xWhite).png",
+    PLATFORM_XBOX: "https://wiki.warframe.com/w/Special:FilePath/IconXbox(xWhite).png",
+    PLATFORM_PLAYSTATION: "https://wiki.warframe.com/w/Special:FilePath/IconPlaystation(xWhite).png",
+    PLATFORM_SWITCH: "https://wiki.warframe.com/w/Special:FilePath/IconSwitch(xWhite).png",
+    PLATFORM_MOBILE: "https://wiki.warframe.com/w/Special:FilePath/IconApple(xWhite).png",
+}
+
+_DEFAULT_ICON_DIR = Path(os.getenv("PLATFORM_ICON_DIR", "icons"))
+_REFERENCE_CACHE: dict[str, Image.Image] | None = None
+
+
+def load_default_references(
+    icon_dir: Path | None = None,
+) -> dict[str, Image.Image]:
+    """Load (and cache) the default reference icons, downloading any missing."""
+    global _REFERENCE_CACHE
+    if _REFERENCE_CACHE is not None and icon_dir is None:
+        return _REFERENCE_CACHE
+
+    target_dir = icon_dir or _DEFAULT_ICON_DIR
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        if icon_dir is None:
+            _REFERENCE_CACHE = {}
+        return {}
+
+    icons: dict[str, Image.Image] = {}
+    for key, url in PLATFORM_ICON_URLS.items():
+        path = target_dir / f"{key}.png"
+        if not path.exists():
+            if requests is None:
+                continue
+            try:
+                resp = requests.get(url, timeout=15, allow_redirects=True)
+                resp.raise_for_status()
+                path.write_bytes(resp.content)
+            except Exception:
+                continue
+        try:
+            icons[key] = Image.open(path).convert("RGBA")
+        except Exception:
             continue
 
-        keyword, separator, role_name = part.partition(":")
-        if not separator:
-            raise ValueError(f"Invalid role rule '{part}'. Expected keyword:Role Name")
-
-        keyword = keyword.strip().lower()
-        role_name = role_name.strip()
-        if not keyword or not role_name:
-            raise ValueError(f"Invalid role rule '{part}'. Keyword and role name are required")
-
-        rules.append(RoleRule(keyword=keyword, role_name=role_name))
-
-    return rules
+    if icon_dir is None:
+        _REFERENCE_CACHE = icons
+    return icons
 
 
-def match_role_name(ocr_text: str, rules: list[RoleRule]) -> str | None:
-    normalized = (ocr_text or "").lower()
-    for rule in rules:
-        if rule.keyword in normalized:
-            return rule.role_name
+def _icon_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
+    """Locate the platform icon (a compact bright blob) in the title bar."""
+    width, height = image.size
+    strip_h = max(8, int(height * 0.12))
+    top = image.convert("RGB").crop((0, 0, width, strip_h))
+    hsv = top.convert("HSV")
+    hsv_px = hsv.load()
+    sw, sh = top.size
+
+    def is_fg(x: int, y: int) -> bool:
+        _, s, v = hsv_px[x, y]
+        return (s >= 70 and v >= 90) or v >= 220
+
+    col_counts = [sum(1 for y in range(sh) if is_fg(x, y)) for x in range(sw)]
+    threshold = max(2, sh // 6)
+
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for x, c in enumerate(col_counts):
+        if c >= threshold:
+            if start is None:
+                start = x
+        elif start is not None:
+            runs.append((start, x - 1))
+            start = None
+    if start is not None:
+        runs.append((start, sw - 1))
+    if not runs:
+        return None
+
+    # Prefer runs that are roughly square (icons), not long (text). Pick the
+    # rightmost square-ish run since the title icon sits to the right of text.
+    square = [r for r in runs if (r[1] - r[0] + 1) <= sh * 1.6]
+    runs = square or runs
+    x0, x1 = runs[-1]
+
+    y_min, y_max = sh, -1
+    for x in range(x0, x1 + 1):
+        for y in range(sh):
+            if is_fg(x, y):
+                if y < y_min:
+                    y_min = y
+                if y > y_max:
+                    y_max = y
+    if y_max < 0:
+        return None
+
+    pad = 2
+    return (
+        max(0, x0 - pad),
+        max(0, y_min - pad),
+        min(width, x1 + 1 + pad),
+        min(strip_h, y_max + 1 + pad),
+    )
+
+
+def _silhouette(image: Image.Image, size: tuple[int, int]) -> list[int]:
+    """Return a binary silhouette (0/1 per pixel) of the icon at the given size."""
+    img = image.convert("RGBA").resize(size, Image.LANCZOS)
+    px = img.load()
+    w, h = size
+    out: list[int] = []
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = px[x, y]
+            v = max(r, g, b)
+            out.append(1 if a >= 128 and v >= 60 else 0)
+    return out
+
+
+def _silhouette_score(a: list[int], b: list[int]) -> float:
+    if not a or len(a) != len(b):
+        return 1.0
+    diff = sum(1 for x, y in zip(a, b) if x != y)
+    return diff / len(a)
+
+
+def detect_platform_from_image(
+    image: Image.Image,
+    references: dict[str, Image.Image] | None = None,
+) -> str | None:
+    """Detect platform by matching the title-bar icon against reference icons.
+
+    By default the wiki MMF icons are auto-loaded (and cached) and used for
+    silhouette template-matching. Pass ``references={}`` to force the
+    hue-based fallback only.
+    """
+    if image is None:
+        return None
+
+    if references is None:
+        references = load_default_references()
+
+    bbox = _icon_bbox(image)
+    if bbox is None:
+        return _color_fallback(image)
+
+    candidate = image.convert("RGBA").crop(bbox)
+    cw, ch = candidate.size
+    if cw < 6 or ch < 6:
+        return _color_fallback(image)
+
+    if references:
+        size = (32, 32)
+        cand_sil = _silhouette(candidate, size)
+        best_key: str | None = None
+        best_score = 1.0
+        for key, ref in references.items():
+            score = _silhouette_score(cand_sil, _silhouette(ref, size))
+            if score < best_score:
+                best_score = score
+                best_key = key
+        if best_key is not None and best_score <= 0.30:
+            return best_key
+
+    return _color_fallback(image)
+
+
+def _color_fallback(image: Image.Image) -> str | None:
+    """Hue-based platform classification used when no references are provided."""
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    if width == 0 or height == 0:
+        return None
+
+    top_strip = rgb.crop((0, 0, width, max(1, int(height * 0.10))))
+    hsv = top_strip.convert("HSV")
+    hsv_px = hsv.load()
+    rgb_px = top_strip.load()
+    sw, sh = top_strip.size
+
+    counts = {p: 0 for p in ALL_PLATFORMS}
+    for y in range(sh):
+        for x in range(sw):
+            h, s, v = hsv_px[x, y]
+            if s < 90 or v < 90:
+                continue
+            r, g, b = rgb_px[x, y]
+            platform = _classify_platform_color(h, s, v, r, g, b)
+            if platform is not None:
+                counts[platform] += 1
+
+    best = max(counts, key=counts.get)
+    return best if counts[best] >= 25 else None
+
+
+def _classify_platform_color(
+    h: int, s: int, v: int, r: int, g: int, b: int
+) -> str | None:
+    """Classify a saturated pixel into a Warframe platform brand colour."""
+    hue = (h / 255.0) * 360.0
+
+    if 90 <= hue <= 160 and g > r and g > b:
+        return PLATFORM_XBOX
+    if (hue <= 15 or hue >= 345) and r > g and r > b:
+        return PLATFORM_SWITCH
+    if 180 <= hue <= 260 and b >= r:
+        if v >= 200 and hue <= 220:
+            return PLATFORM_PC
+        return PLATFORM_PLAYSTATION
+    return None
+
+
+# --- Clan slot configuration ------------------------------------------------
+
+
+@dataclass
+class ClanSlot:
+    slot: int  # 1..N
+    clan_name: str | None
+    role_id: int | None
+
+
+def find_clan_slot(slots: Iterable["ClanSlot"], clan_name: str) -> "ClanSlot | None":
+    """Return the slot whose configured clan name matches the given clan name.
+
+    Match is case-insensitive and ignores any trailing ``#NNN`` clan tag on
+    either side, so ``Grand Warhorde#245`` matches a slot named
+    ``Grand Warhorde``.
+    """
+    if not clan_name:
+        return None
+    needle = re.sub(r"#\d+\s*$", "", clan_name).strip().lower()
+    if not needle:
+        return None
+    for slot in slots:
+        if not slot.clan_name:
+            continue
+        candidate = re.sub(r"#\d+\s*$", "", slot.clan_name).strip().lower()
+        if candidate == needle:
+            return slot
     return None
