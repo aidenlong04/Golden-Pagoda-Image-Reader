@@ -135,7 +135,7 @@ OUTREACH_ROLE_IDS: list[int] = [
 ]
 
 # Auto-delete bot replies after this many seconds (0 = keep forever).
-REPLY_TTL_SECONDS = _int_env("REPLY_TTL_SECONDS", 60)
+REPLY_TTL_SECONDS = _int_env("REPLY_TTL_SECONDS", 120)
 
 # URL of an image shown in the failure card when the platform icon can't be
 # detected (helps the user spot where the icon should appear).
@@ -831,6 +831,9 @@ async def on_message(message: discord.Message) -> None:
         else:
             _, status = await _add_role(member, role, "Screenshot clan verification")
             role_lines.append(f"Clan: {status}")
+    else:
+        issues.append("Clan shown as **Unaffiliated** — no matching server clan role.")
+        passed = False
 
     await _react(message, "pass" if passed else "incomplete")
     if passed:
