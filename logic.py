@@ -365,6 +365,7 @@ class ClanSlot:
     slot: int  # 1..N
     clan_name: str | None
     role_id: int | None
+    emoji: str | None = None
 
 
 def find_clan_slot(slots: Iterable["ClanSlot"], clan_name: str) -> "ClanSlot | None":

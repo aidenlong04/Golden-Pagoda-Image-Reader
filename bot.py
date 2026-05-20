@@ -163,7 +163,10 @@ def _load_clan_slots() -> list[ClanSlot]:
     for i in range(1, CLAN_SLOT_COUNT + 1):
         name = (os.getenv(f"CLAN_ROLE_{i}_NAME") or "").strip() or None
         role_id = _int_env(f"CLAN_ROLE_{i}_ID") or None
-        slots.append(ClanSlot(slot=i, clan_name=name, role_id=role_id))
+        emoji = (os.getenv(f"CLAN_ROLE_{i}_EMOJI") or "").strip() or None
+        slots.append(
+            ClanSlot(slot=i, clan_name=name, role_id=role_id, emoji=emoji)
+        )
     return slots
 
 
@@ -682,12 +685,15 @@ def _pass_components(
     platform: str | None,
     clan: str | None,
     role_lines: list[str],  # noqa: ARG001 — kept for API parity / preview
+    *,
+    clan_emoji: str | None = None,
 ) -> list[dict]:
     plat = (
         f"{_platform_glyph(platform)} **{platform}**" if platform
         else f"{_platform_glyph(None)} *Unknown*"
     )
-    clan_part = f"{CLAN_EMOJI} **{clan}**" if clan else f"{CLAN_EMOJI} *Unaffiliated*"
+    emoji = (clan_emoji or "").strip() or CLAN_EMOJI
+    clan_part = f"{emoji} **{clan}**" if clan else f"{emoji} *Unaffiliated*"
     body = (
         f"### \u2705  `{profile}`\n"
         f"{clan_part}  \u2022  {plat}"
@@ -907,7 +913,11 @@ async def on_message(message: discord.Message) -> None:
         _, status = await _add_role(member, role, "Screenshot platform verification")
         role_lines.append(f"Platform: {status}")
 
+    clan_emoji: str | None = None
     if clan_name:
+        slot = find_clan_slot(CLAN_SLOTS, clan_name)
+        if slot is not None:
+            clan_emoji = slot.emoji
         role = _find_clan_role(message.guild, clan_name)
         if role is None:
             issues.append(f"No role for clan {clan_name}.")
@@ -922,7 +932,13 @@ async def on_message(message: discord.Message) -> None:
     await _react(message, "pass" if passed else "incomplete")
     if passed:
         await _remove_unverified_role(member)
-        await _send_v2(message, _pass_components(profile_name, platform, clan_name, role_lines))
+        await _send_v2(
+            message,
+            _pass_components(
+                profile_name, platform, clan_name, role_lines,
+                clan_emoji=clan_emoji,
+            ),
+        )
     else:
         await _add_incomplete_role(member)
         components = _incomplete_components(" ".join(issues))
