@@ -826,13 +826,13 @@ async def on_message(message: discord.Message) -> None:
     if clan_name:
         role = _find_clan_role(message.guild, clan_name)
         if role is None:
-            issues.append(f"No role for clan **{clan_name}**.")
+            issues.append(f"No role for clan {clan_name}.")
             passed = False
         else:
             _, status = await _add_role(member, role, "Screenshot clan verification")
             role_lines.append(f"Clan: {status}")
     else:
-        issues.append("Clan shown as **Unaffiliated** — no matching server clan role.")
+        issues.append("Clan shown as Unaffiliated — no matching server clan role.")
         passed = False
 
     await _react(message, "pass" if passed else "incomplete")
