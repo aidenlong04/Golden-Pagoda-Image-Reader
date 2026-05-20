@@ -26,6 +26,7 @@ except ImportError:
 from logic import (
     ClanSlot,
     detect_platform_from_image,
+    detect_platform_near_anchor,
     find_clan_slot,
     load_default_references,
     parse_clan_name,
@@ -428,7 +429,9 @@ def _shrink_for_ocr(
     return shrunk, f"{base}.jpg", "image/jpeg"
 
 
-def _ocr_via_api(image_bytes: bytes, filename: str, content_type: str) -> str:
+def _ocr_via_api(
+    image_bytes: bytes, filename: str, content_type: str
+) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]]:
     image_bytes, filename, content_type = _shrink_for_ocr(
         image_bytes, filename, content_type
     )
@@ -441,6 +444,7 @@ def _ocr_via_api(image_bytes: bytes, filename: str, content_type: str) -> str:
             "scale": "true",
             "isTable": "false",
             "detectOrientation": "true",
+            "isOverlayRequired": "true",
         },
         files={"file": (filename, image_bytes, content_type or "image/png")},
         timeout=60,
@@ -450,19 +454,72 @@ def _ocr_via_api(image_bytes: bytes, filename: str, content_type: str) -> str:
     if payload.get("IsErroredOnProcessing"):
         raise RuntimeError(f"OCR API error: {payload.get('ErrorMessage') or payload}")
     parsed = payload.get("ParsedResults") or []
-    return "\n".join(item.get("ParsedText", "") for item in parsed)
+    text = "\n".join(item.get("ParsedText", "") for item in parsed)
+    words: list[tuple[str, tuple[int, int, int, int]]] = []
+    for item in parsed:
+        overlay = item.get("TextOverlay") or {}
+        for line in overlay.get("Lines") or []:
+            for word in line.get("Words") or []:
+                try:
+                    left = int(word.get("Left", 0))
+                    top = int(word.get("Top", 0))
+                    width = int(word.get("Width", 0))
+                    height = int(word.get("Height", 0))
+                except (TypeError, ValueError):
+                    continue
+                if width <= 0 or height <= 0:
+                    continue
+                words.append(
+                    (str(word.get("WordText", "")), (left, top, left + width, top + height))
+                )
+    return text, words
 
 
-def _ocr(image_bytes: bytes, filename: str, content_type: str) -> str:
+def _ocr(
+    image_bytes: bytes, filename: str, content_type: str
+) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]]:
     if OCR_API_KEY:
         return _ocr_via_api(image_bytes, filename, content_type)
     if pytesseract is None:
         raise RuntimeError(
             "No OCR backend available: set OCR_API_KEY or install pytesseract."
         )
-    return pytesseract.image_to_string(
+    text = pytesseract.image_to_string(
         Image.open(io.BytesIO(image_bytes)), config=TESSERACT_CONFIG
     )
+    return text, []
+
+
+_PROFILE_TOKEN_RE = re.compile(r"#\d{2,4}")
+
+
+def _profile_name_bbox(
+    words: list[tuple[str, tuple[int, int, int, int]]],
+) -> tuple[int, int, int, int] | None:
+    """Return the union bbox of words forming the profile name (handle + #NNN)."""
+    if not words:
+        return None
+    # Locate the word that contains the '#NNN' suffix; the handle may be split
+    # across one or two adjacent words on the same line.
+    for idx, (text, _bbox) in enumerate(words):
+        if _PROFILE_TOKEN_RE.search(text or ""):
+            cluster = [words[idx]]
+            tail_top = words[idx][1][1]
+            tail_bottom = words[idx][1][3]
+            line_h = tail_bottom - tail_top
+            for prev in reversed(words[:idx]):
+                ptext, pbbox = prev
+                if abs(pbbox[1] - tail_top) > line_h:
+                    break
+                if pbbox[2] < cluster[0][1][0] - line_h * 2:
+                    break
+                cluster.insert(0, prev)
+                if len(cluster) >= 3:
+                    break
+            xs = [b[0] for _, b in cluster] + [b[2] for _, b in cluster]
+            ys = [b[1] for _, b in cluster] + [b[3] for _, b in cluster]
+            return (min(xs), min(ys), max(xs), max(ys))
+    return None
 
 
 # ---------- Screenshot processing -------------------------------------------
@@ -783,11 +840,12 @@ async def on_message(message: discord.Message) -> None:
         return
 
     try:
-        ocr_text = _ocr(
+        ocr_text_raw, ocr_words = _ocr(
             image_bytes,
             attachment.filename,
             attachment.content_type or "image/png",
-        ).strip()
+        )
+        ocr_text = ocr_text_raw.strip()
     except Exception:
         logger.exception("OCR failed for uploaded image")
         await _fail(message, "Not readable", "No text could be read. Upload a clearer screenshot.")
@@ -795,7 +853,13 @@ async def on_message(message: discord.Message) -> None:
 
     profile_name = parse_profile_name(ocr_text)
     clan_name = parse_clan_name(ocr_text)
-    platform = detect_platform_from_image(image, PLATFORM_ICONS or None)
+
+    anchor_bbox = _profile_name_bbox(ocr_words) if profile_name else None
+    platform: str | None = None
+    if anchor_bbox is not None:
+        platform = detect_platform_near_anchor(image, anchor_bbox)
+    if platform is None:
+        platform = detect_platform_from_image(image, PLATFORM_ICONS or None)
 
     if not profile_name or not platform:
         await _fail(

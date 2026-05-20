@@ -244,6 +244,74 @@ def detect_platform_from_image(
     return _color_fallback(image)
 
 
+def detect_platform_near_anchor(
+    image: Image.Image,
+    anchor_bbox: tuple[int, int, int, int],
+) -> str | None:
+    """Detect platform by classifying icon pixels adjacent to a known anchor.
+
+    ``anchor_bbox`` is the (left, top, right, bottom) of the OCR'd profile-name
+    word. The Warframe profile shows the platform icon immediately to the left
+    of the player handle; some layouts place it on the right. We probe both
+    sides and pick whichever yields more saturated brand-coloured pixels.
+    """
+    if image is None:
+        return None
+    rgb = image.convert("RGB")
+    iw, ih = rgb.size
+    if iw == 0 or ih == 0:
+        return None
+
+    left, top, right, bottom = anchor_bbox
+    h = max(8, bottom - top)
+    pad_y = max(2, h // 4)
+    y0 = max(0, top - pad_y)
+    y1 = min(ih, bottom + pad_y)
+    box_w = max(h, 24)  # icon is roughly square at line height
+
+    candidates: list[tuple[int, int, int, int]] = []
+    if left - 4 > 0:
+        candidates.append((max(0, left - box_w - 8), y0, max(0, left - 2), y1))
+    if right + 4 < iw:
+        candidates.append((min(iw, right + 2), y0, min(iw, right + box_w + 8), y1))
+
+    best_platform: str | None = None
+    best_score = 0
+    for cx0, cy0, cx1, cy1 in candidates:
+        if cx1 - cx0 < 6 or cy1 - cy0 < 6:
+            continue
+        crop = rgb.crop((cx0, cy0, cx1, cy1))
+        platform, score = _vote_platform_color(crop)
+        if platform is not None and score > best_score:
+            best_platform = platform
+            best_score = score
+
+    if best_platform is not None and best_score >= 8:
+        return best_platform
+    return None
+
+
+def _vote_platform_color(crop: Image.Image) -> tuple[str | None, int]:
+    hsv = crop.convert("HSV")
+    hsv_px = hsv.load()
+    rgb_px = crop.load()
+    cw, ch = crop.size
+    counts = {p: 0 for p in ALL_PLATFORMS}
+    for y in range(ch):
+        for x in range(cw):
+            h, s, v = hsv_px[x, y]
+            if s < 80 or v < 90:
+                continue
+            r, g, b = rgb_px[x, y]
+            platform = _classify_platform_color(h, s, v, r, g, b)
+            if platform is not None:
+                counts[platform] += 1
+    if not counts:
+        return None, 0
+    best = max(counts, key=counts.get)
+    return (best, counts[best]) if counts[best] > 0 else (None, 0)
+
+
 def _color_fallback(image: Image.Image) -> str | None:
     """Hue-based platform classification used when no references are provided."""
     rgb = image.convert("RGB")
