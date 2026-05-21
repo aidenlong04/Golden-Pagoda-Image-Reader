@@ -46,8 +46,10 @@ The bot ships with a Docker image and a systemd unit. To deploy to a fresh
 Ubuntu 22.04/24.04 server:
 
 ```bash
-./scripts/deploy_hetzner.sh root@<server-ip> ~/.ssh/hetzner
+./scripts/deploy_hetzner.sh nomekui@<server-ip> ~/.ssh/hetzner
 ```
+
+The remote user must be in the `docker` and `sudo` groups (NOPASSWD).
 
 The script is idempotent — re-run it any time you push new code to redeploy.
 It will:

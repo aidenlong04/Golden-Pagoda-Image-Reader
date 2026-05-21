@@ -32,17 +32,17 @@ jobs:
             --exclude '*.pyc' \
             --exclude '.venv' \
             --exclude '.env' \
-            ./ "root@${{ secrets.HETZNER_HOST }}:/opt/golden-pagoda/"
+            ./ "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}:/opt/golden-pagoda/"
 
       - name: Build image and restart service
         run: |
-          ssh -i ~/.ssh/hetzner "root@${{ secrets.HETZNER_HOST }}" '
+          ssh -i ~/.ssh/hetzner "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
             set -e
             cd /opt/golden-pagoda
-            install -m 0644 scripts/golden-pagoda.service /etc/systemd/system/golden-pagoda.service
-            systemctl daemon-reload
+            sudo install -m 0644 scripts/golden-pagoda.service /etc/systemd/system/golden-pagoda.service
+            sudo systemctl daemon-reload
             docker build -t golden-pagoda:latest . | tail -3
-            systemctl restart golden-pagoda
+            sudo systemctl restart golden-pagoda
             sleep 5
             systemctl is-active golden-pagoda
             docker logs golden-pagoda --tail 20
