@@ -445,6 +445,7 @@ def detect_platform(
     if best_platform is None and fallback_platform is not None:
         sorted_fb = sorted(fallback_scores.values(), reverse=True)
         runner_up = sorted_fb[1] if len(sorted_fb) > 1 else 0.0
+        gap = fallback_score_value - runner_up
         if fallback_score_value >= 0.35 and runner_up < 0.30:
             best_platform = fallback_platform
             best_scores = fallback_scores
@@ -454,6 +455,28 @@ def detect_platform(
                 best_platform,
                 fallback_score_value,
                 runner_up,
+            )
+        # White-glyph gate: PC (Windows) and Mobile (Apple) icons are tiny
+        # white-on-dark glyphs and routinely score in the 0.20-0.30 band on
+        # downscaled uploads — well below the strict gate but still clearly
+        # the leader. Accept when the leader is PC/Mobile with any margin
+        # over the runner-up. Colored-platform leaders (Xbox/PS/Switch)
+        # still require the strict gate because their saturated colour
+        # signal is unambiguous when truly present.
+        elif (
+            fallback_platform in (PLATFORM_PC, PLATFORM_MOBILE)
+            and fallback_score_value >= 0.20
+            and gap >= 0.01
+        ):
+            best_platform = fallback_platform
+            best_scores = fallback_scores
+            best_score_value = fallback_score_value
+            logger.info(
+                "Platform accepted via white-glyph gate: %s score=%.3f runner_up=%.3f gap=%.3f",
+                best_platform,
+                fallback_score_value,
+                runner_up,
+                gap,
             )
 
     # Always expose the best observed scores so analytics/logs are useful
