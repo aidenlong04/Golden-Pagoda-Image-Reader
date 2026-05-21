@@ -1484,10 +1484,10 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             f"</clan-emblems:{cmd_id}>" if cmd_id else "`/clan-emblems`"
         )
         body = (
-            f"### \U0001F3F0  Assign Emblems\n"
+            f"### <:GoldenPagoda_Emblem:1416905638428020877>  Assign Emblems\n"
             f"Click {mention} to set or clear a clan emoji.\n"
             f"-# Tip: pass the role and a custom emoji like "
-            f"`<:Name:1234567890>`. Leave the emoji blank to clear."
+            f"``<:Name:1234567890>``. Leave the emoji blank to clear."
         )
         container = {
             "type": 17,
