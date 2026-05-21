@@ -69,6 +69,9 @@ jobs:
             systemctl is-active golden-pagoda
             docker logs golden-pagoda --tail 20
             # Reclaim build cache & dangling images (keeps disk healthy on CX22).
-            docker image prune -f >/dev/null
-            docker builder prune -f --filter until=24h >/dev/null || true
+            # Build cache adds up fast on subsequent deploys — drop everything
+            # not used by the running image. Layers from the just-built image
+            # are pinned (in use) so this is safe.
+            docker image prune -af >/dev/null || true
+            docker builder prune -af >/dev/null || true
           '

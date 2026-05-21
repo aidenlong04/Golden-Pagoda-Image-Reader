@@ -68,12 +68,12 @@ esac
 
 # Block on the docker event stream. The pipeline exits if dockerd dies;
 # systemd's Restart=always re-execs us.
-"$DOCKER" events \
-    --filter container="$CONTAINER" \
-    --filter event=health_status \
-    --filter event=die \
-    --format '{{.Action}}' \
-| while IFS= read -r ev; do
+#
+# We use process substitution (< <(...)) instead of a pipe so the while-loop
+# runs in the *parent* shell — that way the cooldown/window state mutated
+# during the startup sanity check above carries into the event loop (a pipe
+# would put the loop in a subshell with a fresh copy of those variables).
+while IFS= read -r ev; do
     case "$ev" in
         "health_status: unhealthy")
             maybe_restart "health=unhealthy"
@@ -85,4 +85,8 @@ esac
             [[ "$running" != "true" ]] && maybe_restart "container-died"
             ;;
     esac
-done
+done < <("$DOCKER" events \
+    --filter container="$CONTAINER" \
+    --filter event=health_status \
+    --filter event=die \
+    --format '{{.Action}}')
