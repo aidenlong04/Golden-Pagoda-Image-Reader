@@ -865,13 +865,12 @@ def _pass_components(
     emoji = (clan_emoji or "").strip() or CLAN_EMOJI
     display_clan = _strip_clan_tag(clan) if clan else None
     clan_part = f"{emoji} **{display_clan}**" if display_clan else f"{emoji} *Unaffiliated*"
-    plat_emoji = _platform_glyph(platform)
-    plat_part = (
-        f"**{platform}** {plat_emoji}" if platform else f"*Unknown* {plat_emoji}"
-    )
     display_profile = _strip_clan_tag(profile)
     header = {"type": 10, "content": f"### \u2705  `{display_profile}`"}
-    inner_lines = [clan_part, f"> {plat_part}"]
+    inner_lines = [clan_part]
+    if platform:
+        plat_emoji = _platform_glyph(platform)
+        inner_lines.append(f"> **{platform}** {plat_emoji}")
     if mastery_rank:
         inner_lines.append(f"-# > {mastery_rank}")
     inner = "\n".join(inner_lines)
