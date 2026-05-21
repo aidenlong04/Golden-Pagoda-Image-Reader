@@ -706,7 +706,8 @@ def _pass_components(
     plat_part = (
         f"**{platform}** {plat_emoji}" if platform else f"*Unknown* {plat_emoji}"
     )
-    header_lines = [f"### \u2705  `{profile}`"]
+    display_profile = re.sub(r"#\d+\s*$", "", profile).strip()
+    header_lines = [f"### \u2705  `{display_profile}`"]
     if mastery_rank:
         header_lines.append(f"-# > {mastery_rank}")
     header = {"type": 10, "content": "\n".join(header_lines)}
