@@ -876,7 +876,7 @@ def _resolve_pass_link_buttons(
 def _fail_components(headline: str, reason: str, *, image_url: str | None = None) -> list[dict]:
     header = {
         "type": 10,
-        "content": f"### \u274C  Verification Failed\n-# {headline}",
+        "content": "### \u274C  Verification Failed",
     }
     children: list[dict] = [
         {"type": 10, "content": f"-# {reason}"},
