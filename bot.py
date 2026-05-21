@@ -527,22 +527,40 @@ def _ocr_via_api(
     image_bytes, filename, content_type = _shrink_for_ocr(
         image_bytes, filename, content_type
     )
-    response = requests.post(
-        OCR_API_URL,
-        headers={"apikey": OCR_API_KEY},
-        data={
-            "OCREngine": OCR_ENGINE,
-            "language": OCR_LANGUAGE,
-            "scale": "true",
-            "isTable": "false",
-            "detectOrientation": "true",
-            "isOverlayRequired": "true",
-        },
-        files={"file": (filename, image_bytes, content_type or "image/png")},
-        timeout=60,
-    )
-    response.raise_for_status()
-    payload = response.json()
+    # OCR.space returns transient 5xx; one quick retry usually clears it.
+    last_err: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            response = requests.post(
+                OCR_API_URL,
+                headers={"apikey": OCR_API_KEY},
+                data={
+                    "OCREngine": OCR_ENGINE,
+                    "language": OCR_LANGUAGE,
+                    "scale": "true",
+                    "isTable": "false",
+                    "detectOrientation": "true",
+                    "isOverlayRequired": "true",
+                },
+                files={"file": (filename, image_bytes, content_type or "image/png")},
+                timeout=60,
+            )
+            if 500 <= response.status_code < 600 and attempt == 1:
+                logger.info("OCR.space %d on attempt 1; retrying once", response.status_code)
+                time.sleep(1.0)
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            break
+        except (requests.HTTPError, requests.ConnectionError, requests.Timeout) as e:
+            last_err = e
+            if attempt == 1:
+                logger.info("OCR.space %s on attempt 1; retrying once", e.__class__.__name__)
+                time.sleep(1.0)
+                continue
+            raise
+    else:
+        raise last_err if last_err else RuntimeError("OCR.space failed")
     if payload.get("IsErroredOnProcessing"):
         raise RuntimeError(f"OCR API error: {payload.get('ErrorMessage') or payload}")
     parsed = payload.get("ParsedResults") or []
@@ -578,12 +596,20 @@ def _ocr_via_tesseract(
     return text, []
 
 
+# Tracks which OCR backend serviced the most recent _ocr() call so the
+# caller can record an accurate engine label in analytics.
+_LAST_OCR_ENGINE: str = "ocr.space"
+
+
 def _ocr(
     image_bytes: bytes, filename: str, content_type: str
 ) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]]:
+    global _LAST_OCR_ENGINE
     if OCR_API_KEY:
         try:
-            return _ocr_via_api(image_bytes, filename, content_type)
+            result = _ocr_via_api(image_bytes, filename, content_type)
+            _LAST_OCR_ENGINE = "ocr.space"
+            return result
         except Exception as api_err:
             if pytesseract is None:
                 raise
@@ -591,11 +617,13 @@ def _ocr(
                 "OCR.space failed (%s); falling back to local Tesseract",
                 api_err.__class__.__name__,
             )
+            _LAST_OCR_ENGINE = "tesseract"
             return _ocr_via_tesseract(image_bytes)
     if pytesseract is None:
         raise RuntimeError(
             "No OCR backend available: set OCR_API_KEY or install pytesseract."
         )
+    _LAST_OCR_ENGINE = "tesseract"
     return _ocr_via_tesseract(image_bytes)
 
 
@@ -1054,6 +1082,7 @@ async def on_message(message: discord.Message) -> None:
             attachment.content_type or "image/png",
         )
         ocr_text = ocr_text_raw.strip()
+        ocr_engine = _LAST_OCR_ENGINE
     except Exception:
         logger.exception("OCR failed for uploaded image")
         analytics.record_verification(
