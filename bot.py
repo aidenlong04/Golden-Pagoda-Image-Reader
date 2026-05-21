@@ -715,10 +715,12 @@ def _pass_components(
 
 
 def _fail_components(headline: str, reason: str, *, image_url: str | None = None) -> list[dict]:
+    header = {
+        "type": 10,
+        "content": f"### \u274C  Verification Failed\n-# > {headline}",
+    }
     children: list[dict] = [
-        {"type": 10, "content": f"## Verification Failed\n{_quote(headline)}"},
-        {"type": 14, "divider": True, "spacing": 1},
-        {"type": 10, "content": f"```\n{reason}\n```"},
+        {"type": 10, "content": reason},
     ]
     if image_url:
         children.append(
@@ -728,20 +730,23 @@ def _fail_components(headline: str, reason: str, *, image_url: str | None = None
             }
         )
     return [
+        header,
         {
             "type": 17,
             "accent_color": ACCENT_FAIL,
             "components": children,
-        }
+        },
     ]
 
 
 def _incomplete_components(reason: str, *, image_url: str | None = None) -> list[dict]:
     outreach = " / ".join(f"<@&{rid}>" for rid in OUTREACH_ROLE_IDS) or "staff"
+    header = {
+        "type": 10,
+        "content": "### \u26A0\uFE0F  Verification Incomplete\n-# > Manual review required",
+    }
     children: list[dict] = [
-        {"type": 10, "content": f"## Verification Incomplete\n{_quote('Manual review required')}"},
-        {"type": 14, "divider": True, "spacing": 1},
-        {"type": 10, "content": f"```\n{reason}\n```"},
+        {"type": 10, "content": reason},
         {
             "type": 10,
             "content": f"{outreach} will reach out to verify.",
@@ -749,18 +754,19 @@ def _incomplete_components(reason: str, *, image_url: str | None = None) -> list
     ]
     if image_url:
         children.insert(
-            3,
+            1,
             {
                 "type": 12,
                 "items": [{"media": {"url": image_url}}],
             },
         )
     return [
+        header,
         {
             "type": 17,
             "accent_color": ACCENT_INCOMPLETE,
             "components": children,
-        }
+        },
     ]
 
 
