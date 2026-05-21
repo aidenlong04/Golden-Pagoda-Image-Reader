@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Golden Pagoda ops helper — small functions for status / restart / deploy / health.
+#
+# Source this file:    source scripts/ops.sh
+# Then call:           gp-status  |  gp-restart  |  gp-deploy  |  gp-health  |  gp-logs
+#
+# Or invoke directly:  scripts/ops.sh <status|restart|deploy|health|logs> [args...]
+#
+# Connects to the Hetzner host over SSH using $GP_HOST and $GP_KEY (with sane defaults).
+
+GP_HOST="${GP_HOST:-nomekui@5.78.211.130}"
+GP_KEY="${GP_KEY:-$HOME/.ssh/hetzner}"
+GP_SERVICE="${GP_SERVICE:-golden-pagoda}"
+GP_CONTAINER="${GP_CONTAINER:-golden-pagoda}"
+
+_gp_ssh() {
+    ssh -i "$GP_KEY" -o StrictHostKeyChecking=accept-new "$GP_HOST" "$@"
+}
+
+gp-status() {
+    echo "── systemd ──────────────────────────────────────"
+    _gp_ssh "systemctl is-active $GP_SERVICE; systemctl is-enabled $GP_SERVICE; sudo systemctl status $GP_SERVICE --no-pager -n 5 || true"
+    echo
+    echo "── docker ───────────────────────────────────────"
+    _gp_ssh "sudo docker ps --filter name=^/${GP_CONTAINER}\$ --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}\t{{.Image}}'"
+}
+
+gp-restart() {
+    echo ">> restarting $GP_SERVICE on $GP_HOST"
+    _gp_ssh "sudo systemctl restart $GP_SERVICE"
+    sleep 3
+    gp-status
+}
+
+gp-deploy() {
+    local repo_root
+    repo_root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+    echo ">> manual deploy from $repo_root → $GP_HOST"
+    "$repo_root/scripts/deploy_hetzner.sh" "$GP_HOST" "$GP_KEY"
+}
+
+gp-health() {
+    echo "── container inspect ────────────────────────────"
+    _gp_ssh "sudo docker inspect --format='State={{.State.Status}} Started={{.State.StartedAt}} Restarts={{.RestartCount}} ExitCode={{.State.ExitCode}}' $GP_CONTAINER 2>/dev/null || echo 'container not found'"
+    echo
+    echo "── recent errors (last 200 log lines) ───────────"
+    _gp_ssh "sudo docker logs --tail 200 $GP_CONTAINER 2>&1 | grep -iE 'error|traceback|exception|fatal|critical' | tail -10 || echo '(none)'"
+    echo
+    echo "── disk / memory ────────────────────────────────"
+    _gp_ssh "df -h /opt /var/lib/docker | tail -2; free -h | head -2"
+}
+
+gp-logs() {
+    local n="${1:-50}"
+    _gp_ssh "sudo docker logs --tail $n -f $GP_CONTAINER"
+}
+
+# Allow direct invocation:  scripts/ops.sh <cmd> [args...]
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+    cmd="${1:-status}"
+    shift || true
+    case "$cmd" in
+        status)  gp-status ;;
+        restart) gp-restart ;;
+        deploy)  gp-deploy ;;
+        health)  gp-health ;;
+        logs)    gp-logs "$@" ;;
+        *) echo "usage: $0 {status|restart|deploy|health|logs [N]}" >&2; exit 2 ;;
+    esac
+fi
