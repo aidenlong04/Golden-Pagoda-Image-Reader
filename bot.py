@@ -286,26 +286,26 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 BOT_START_TIME = time.time()
-HEARTBEAT_PATH = os.getenv("HEARTBEAT_PATH", "/tmp/gp_heartbeat")
-HEARTBEAT_INTERVAL = _int_env("HEARTBEAT_INTERVAL", 20)
+HEALTH_PATH = os.getenv("HEALTH_PATH", "/tmp/gp_health")
+HEALTH_INTERVAL = _int_env("HEALTH_INTERVAL", 20)
 
 
-async def _heartbeat_task() -> None:
+async def _health_task() -> None:
     while True:
         try:
-            with open(HEARTBEAT_PATH, "w") as fh:
+            with open(HEALTH_PATH, "w") as fh:
                 fh.write(str(int(time.time())))
         except OSError:
-            logger.exception("heartbeat write failed")
-        await asyncio.sleep(HEARTBEAT_INTERVAL)
+            logger.exception("health write failed")
+        await asyncio.sleep(HEALTH_INTERVAL)
 
 
 @client.event
 async def on_ready() -> None:
     logger.info("Logged in as %s", client.user)
-    if not getattr(client, "_heartbeat_started", False):
-        client.loop.create_task(_heartbeat_task())
-        client._heartbeat_started = True  # type: ignore[attr-defined]
+    if not getattr(client, "_health_started", False):
+        client.loop.create_task(_health_task())
+        client._health_started = True  # type: ignore[attr-defined]
     _sync_clan_slots_from_guilds()
     _sync_platform_roles_from_guilds()
     try:
@@ -1234,9 +1234,9 @@ async def preview_responses(interaction: discord.Interaction) -> None:
 EPHEMERAL_FLAG = 1 << 6  # 64
 
 
-def _heartbeat_age() -> int | None:
+def _health_age() -> int | None:
     try:
-        return int(time.time() - os.path.getmtime(HEARTBEAT_PATH))
+        return int(time.time() - os.path.getmtime(HEALTH_PATH))
     except OSError:
         return None
 
@@ -1261,7 +1261,7 @@ def _status_page_bot(interaction: discord.Interaction) -> str:
     user = client.user
     latency_ms = int(client.latency * 1000) if client.latency >= 0 else -1
     uptime = _fmt_uptime(time.time() - BOT_START_TIME)
-    hb = _heartbeat_age()
+    hb = _health_age()
     hb_line = f"{hb}s ago" if hb is not None else "*missing*"
     guilds = len(client.guilds)
     members = sum(g.member_count or 0 for g in client.guilds)
@@ -1270,7 +1270,7 @@ def _status_page_bot(interaction: discord.Interaction) -> str:
         f"-# User: `{user}` (`{getattr(user, 'id', '?')}`)\n"
         f"-# Latency: `{latency_ms} ms`\n"
         f"-# Uptime: `{uptime}`\n"
-        f"-# Heartbeat: `{hb_line}`\n"
+        f"-# Health: `{hb_line}`\n"
         f"-# Guilds: `{guilds}` \u2022 Members: `{members}`"
     )
 
