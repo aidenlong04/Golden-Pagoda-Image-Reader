@@ -1486,8 +1486,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         body = (
             f"### <:GoldenPagoda_Emblem:1416905638428020877>  Assign Emblems\n"
             f"Click {mention} to set or clear a clan emoji.\n"
-            f"-# Tip: pass the role and a custom emoji like "
-            f"``<:Name:1234567890>``. Leave the emoji blank to clear."
+            f"-# > Select clan member role and then input clan emblem emoji."
         )
         container = {
             "type": 17,
