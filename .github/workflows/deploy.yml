@@ -35,6 +35,8 @@ jobs:
             --exclude '*.pyc' \
             --exclude '.venv' \
             --exclude '.env' \
+            --exclude 'data' \
+            --exclude 'icons' \
             ./ "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}:/opt/golden-pagoda/"
 
       - name: Build image and restart service
