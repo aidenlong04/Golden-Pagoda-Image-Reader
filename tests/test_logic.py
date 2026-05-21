@@ -113,6 +113,33 @@ class DetectPlatformFromImageTests(unittest.TestCase):
         img = Image.new("RGB", (200, 200), (0, 0, 0))
         self.assertIsNone(detect_platform_from_image(img))
 
+    def test_rejects_purple_blue_as_not_playstation(self) -> None:
+        img = self._solid_top_bar((120, 60, 180))
+        result = detect_platform_from_image(img)
+        self.assertNotEqual(result, PLATFORM_PLAYSTATION)
+
+    def test_rejects_cyan_as_not_playstation(self) -> None:
+        img = self._solid_top_bar((0, 180, 200))
+        result = detect_platform_from_image(img)
+        self.assertNotEqual(result, PLATFORM_PLAYSTATION)
+
+    def test_rejects_orange_red_as_not_switch(self) -> None:
+        img = self._solid_top_bar((240, 80, 20))
+        result = detect_platform_from_image(img)
+        self.assertNotEqual(result, PLATFORM_SWITCH)
+
+    def test_rejects_pink_as_not_switch(self) -> None:
+        img = self._solid_top_bar((255, 100, 120))
+        result = detect_platform_from_image(img)
+        self.assertNotEqual(result, PLATFORM_SWITCH)
+
+    def test_insufficient_saturated_pixels_returns_none(self) -> None:
+        img = Image.new("RGB", (200, 200), (0, 0, 0))
+        for y in range(0, 8):
+            for x in range(60, 64):
+                img.putpixel((x, y), (0, 55, 145))
+        self.assertIsNone(detect_platform_from_image(img))
+
 
 if __name__ == "__main__":
     unittest.main()

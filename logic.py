@@ -164,10 +164,10 @@ def _icon_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
 
     def is_fg(x: int, y: int) -> bool:
         _, s, v = hsv_px[x, y]
-        return (s >= 70 and v >= 90) or v >= 220
+        return (s >= 80 and v >= 100) or v >= 230
 
     col_counts = [sum(1 for y in range(sh) if is_fg(x, y)) for x in range(sw)]
-    threshold = max(2, sh // 6)
+    threshold = max(3, sh // 5)
 
     runs: list[tuple[int, int]] = []
     start: int | None = None
@@ -183,10 +183,11 @@ def _icon_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
     if not runs:
         return None
 
-    # Prefer runs that are roughly square (icons), not long (text). Pick the
-    # rightmost square-ish run since the title icon sits to the right of text.
-    square = [r for r in runs if (r[1] - r[0] + 1) <= sh * 1.6]
+    square = [r for r in runs if (r[1] - r[0] + 1) <= sh * 1.5]
     runs = square or runs
+    runs_right_half = [r for r in runs if r[0] >= sw // 3]
+    if runs_right_half:
+        runs = runs_right_half
     x0, x1 = runs[-1]
 
     y_min, y_max = sh, -1
@@ -258,14 +259,30 @@ def detect_platform_from_image(
     if references:
         size = (32, 32)
         cand_sil = _silhouette(candidate, size)
-        best_key: str | None = None
-        best_score = 1.0
+        scores: dict[str, float] = {}
         for key, ref in references.items():
-            score = _silhouette_score(cand_sil, _silhouette(ref, size))
-            if score < best_score:
-                best_score = score
-                best_key = key
-        if best_key is not None and best_score <= 0.30:
+            scores[key] = _silhouette_score(cand_sil, _silhouette(ref, size))
+        
+        sorted_platforms = sorted(scores.items(), key=lambda x: x[1])
+        if not sorted_platforms:
+            return _color_fallback(image)
+        
+        best_key, best_score = sorted_platforms[0]
+        
+        per_platform_thresholds = {
+            PLATFORM_PLAYSTATION: 0.20,
+            PLATFORM_SWITCH: 0.22,
+            PLATFORM_PC: 0.25,
+            PLATFORM_XBOX: 0.25,
+            PLATFORM_MOBILE: 0.25,
+        }
+        threshold = per_platform_thresholds.get(best_key, 0.25)
+        
+        if best_score <= threshold:
+            if len(sorted_platforms) > 1:
+                second_score = sorted_platforms[1][1]
+                if second_score - best_score < 0.08:
+                    return _color_fallback(image)
             return best_key
 
     return _color_fallback(image)
@@ -327,7 +344,7 @@ def _vote_platform_color(crop: Image.Image) -> tuple[str | None, int]:
     for y in range(ch):
         for x in range(cw):
             h, s, v = hsv_px[x, y]
-            if s < 80 or v < 90:
+            if s < 90 or v < 100:
                 continue
             r, g, b = rgb_px[x, y]
             platform = _classify_platform_color(h, s, v, r, g, b)
@@ -356,7 +373,7 @@ def _color_fallback(image: Image.Image) -> str | None:
     for y in range(sh):
         for x in range(sw):
             h, s, v = hsv_px[x, y]
-            if s < 90 or v < 90:
+            if s < 100 or v < 100:
                 continue
             r, g, b = rgb_px[x, y]
             platform = _classify_platform_color(h, s, v, r, g, b)
@@ -364,7 +381,7 @@ def _color_fallback(image: Image.Image) -> str | None:
                 counts[platform] += 1
 
     best = max(counts, key=counts.get)
-    return best if counts[best] >= 25 else None
+    return best if counts[best] >= 50 else None
 
 
 def _classify_platform_color(
@@ -373,14 +390,15 @@ def _classify_platform_color(
     """Classify a saturated pixel into a Warframe platform brand colour."""
     hue = (h / 255.0) * 360.0
 
-    if 90 <= hue <= 160 and g > r and g > b:
+    if 90 <= hue <= 160 and g > r * 1.2 and g > b * 1.2:
         return PLATFORM_XBOX
-    if (hue <= 15 or hue >= 345) and r > g and r > b:
+    if (hue <= 10 or hue >= 350) and r > g * 1.5 and r > b * 1.4 and g < 40 and b < 50:
         return PLATFORM_SWITCH
-    if 180 <= hue <= 260 and b >= r:
-        if v >= 200 and hue <= 220:
+    if 190 <= hue <= 230 and b >= r:
+        if v >= 190 and hue <= 215:
             return PLATFORM_PC
-        return PLATFORM_PLAYSTATION
+        if v < 180 and 200 <= hue <= 230:
+            return PLATFORM_PLAYSTATION
     return None
 
 
