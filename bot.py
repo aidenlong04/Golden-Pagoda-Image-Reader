@@ -1162,6 +1162,10 @@ async def clan_emblems(
     except Exception:
         logger.exception("Failed to persist %s to %s", env_key, ENV_FILE_PATH)
 
+    logger.info(
+        "clan-emblems: slot=%s role=%s emoji=%r persisted=%s env=%s",
+        slot.slot, role.name, normalized, persisted, ENV_FILE_PATH,
+    )
     display = normalized if normalized else "*(cleared)*"
     suffix = "" if persisted else " (in-memory only — `.env` not writable)"
     await interaction.response.send_message(
@@ -1288,31 +1292,42 @@ def _status_page_bot(interaction: discord.Interaction) -> str:
 
 
 def _status_page_roles(interaction: discord.Interaction) -> str:
-    lines = ["**Clan slots**"]
+    head, tail = _status_page_roles_split(interaction)
+    return f"{head}\n\n{tail}"
+
+
+def _status_page_roles_split(
+    interaction: discord.Interaction,
+) -> tuple[str, str]:
+    """Return (clan_slots_section, platform+special_roles_section).
+
+    Used by `_status_components` to wedge the "Assign Emblems" button
+    directly under the Clan slots block, between the two text blobs.
+    """
+    clan_lines = ["**Clan slots**"]
     for s in CLAN_SLOTS:
         name = s.clan_name or "*(unset)*"
         rid = s.role_id or 0
         emoji = s.emoji or ""
         mention = f"<@&{rid}>" if rid else "*(no role)*"
-        lines.append(f"-# {emoji} `{s.slot}` {name} \u2192 {mention}")
+        clan_lines.append(f"-# {emoji} `{s.slot}` {name} \u2192 {mention}")
 
-    lines.append("")
-    lines.append("**Platform roles**")
+    rest_lines = ["**Platform roles**"]
     for plat in PLATFORM_ROLE_ID_ENV_KEYS:
         rid = PLATFORM_ROLE_IDS.get(plat) or 0
         glyph = _platform_glyph(plat)
         mention = f"<@&{rid}>" if rid else "*(unset)*"
-        lines.append(f"-# {glyph} {plat} \u2192 {mention}")
+        rest_lines.append(f"-# {glyph} {plat} \u2192 {mention}")
 
-    lines.append("")
-    lines.append("**Special roles**")
+    rest_lines.append("")
+    rest_lines.append("**Special roles**")
     inc = f"<@&{INCOMPLETE_ROLE_ID}>" if INCOMPLETE_ROLE_ID else "*(unset)*"
     rem = f"<@&{VERIFY_REMOVE_ROLE_ID}>" if VERIFY_REMOVE_ROLE_ID else "*(unset)*"
     out = ", ".join(f"<@&{rid}>" for rid in OUTREACH_ROLE_IDS) or "*(none)*"
-    lines.append(f"-# Incomplete: {inc}")
-    lines.append(f"-# Remove on pass: {rem}")
-    lines.append(f"-# Outreach: {out}")
-    return "\n".join(lines)
+    rest_lines.append(f"-# Incomplete: {inc}")
+    rest_lines.append(f"-# Remove on pass: {rem}")
+    rest_lines.append(f"-# Outreach: {out}")
+    return "\n".join(clan_lines), "\n".join(rest_lines)
 
 
 def _status_page_channels(interaction: discord.Interaction) -> str:
@@ -1364,7 +1379,6 @@ def _status_components(interaction: discord.Interaction, page: int) -> list[dict
     page = max(0, min(page, len(_STATUS_PAGES) - 1))
     key, title, _desc, builder = _STATUS_PAGES[page]
     snap = analytics.summary()  # cheap; reused for stats pages, ignored for live ones
-    body = builder(interaction, snap)
     header = {
         "type": 10,
         "content": (
@@ -1384,20 +1398,30 @@ def _status_components(interaction: discord.Interaction, page: int) -> list[dict
         {"type": 2, "style": 1, "label": "\U0001F504 Refresh",
          "custom_id": f"status:{page}"},
     ]
-    container_components: list[dict] = [
-        {"type": 10, "content": body},
-        {"type": 1, "components": nav_buttons},
-    ]
-    # Page-specific action row: Assign Emblems on the Roles page.
     if key == "roles":
-        container_components.append({
+        # Wedge the Assign Emblems button between Clan slots and the rest
+        # of the Roles page so it lives directly under the clan listing.
+        clan_text, rest_text = _status_page_roles_split(interaction)
+        assign_row = {
             "type": 1,
             "components": [
                 {"type": 2, "style": 1,
                  "label": "Assign Emblems",
                  "custom_id": "status:assign_emblems"},
             ],
-        })
+        }
+        container_components = [
+            {"type": 10, "content": clan_text},
+            assign_row,
+            {"type": 10, "content": rest_text},
+            {"type": 1, "components": nav_buttons},
+        ]
+    else:
+        body = builder(interaction, snap)
+        container_components = [
+            {"type": 10, "content": body},
+            {"type": 1, "components": nav_buttons},
+        ]
     container = {
         "type": 17,
         "accent_color": ACCENT_PASS,
