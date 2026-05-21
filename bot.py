@@ -163,7 +163,7 @@ OUTREACH_ROLE_IDS: list[int] = [
 ]
 
 # Auto-delete bot replies after this many seconds (0 = keep forever).
-REPLY_TTL_SECONDS = _int_env("REPLY_TTL_SECONDS", 120)
+REPLY_TTL_SECONDS = _int_env("REPLY_TTL_SECONDS", 180)
 
 # URL of an image shown in the failure card when the platform icon can't be
 # detected (helps the user spot where the icon should appear).
@@ -914,7 +914,14 @@ def _resolve_pass_link_buttons(
             (c for c in guild.categories if clean and clean in c.name.lower()),
             None,
         )
-        if category is not None:
+        if category is None:
+            logger.info(
+                "No clan category matched for clan=%r (clean=%r); available=%s",
+                clan_name,
+                clean,
+                [c.name for c in guild.categories],
+            )
+        else:
             general = next(
                 (
                     ch
@@ -923,7 +930,13 @@ def _resolve_pass_link_buttons(
                 ),
                 None,
             )
-            if general is not None:
+            if general is None:
+                logger.info(
+                    "Clan category %r matched but no #general channel found; available=%s",
+                    category.name,
+                    [ch.name for ch in category.text_channels],
+                )
+            else:
                 buttons.append(
                     ("Clan General Chat", _channel_url(guild.id, general.id))
                 )
