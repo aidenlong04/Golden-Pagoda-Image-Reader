@@ -207,6 +207,18 @@ def _slot_field_value(slot: ClanSlot, field: str) -> str:
     return ""
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write to ``path`` atomically: stage in a sibling tempfile, then rename.
+
+    Prevents a half-written .env if the process is killed mid-write (e.g.
+    OOM under the 512m container cap), which would leave the bot unable
+    to start on next boot.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content)
+    os.replace(tmp, path)
+
+
 def _update_env_clan_slots(slots: list[ClanSlot]) -> bool:
     """Rewrite the CLAN_ROLE_{i}_NAME/_ID/_EMOJI entries in the .env file in place."""
     if not ENV_FILE_PATH.exists():
@@ -241,7 +253,7 @@ def _update_env_clan_slots(slots: list[ClanSlot]) -> bool:
             lines.append("")
         lines.extend(missing)
 
-    ENV_FILE_PATH.write_text("\n".join(lines) + "\n")
+    _atomic_write_text(ENV_FILE_PATH, "\n".join(lines) + "\n")
     return True
 
 
@@ -281,7 +293,7 @@ def _update_env_platform_ids(ids: dict[str, int | None]) -> bool:
             lines.append("")
         lines.extend(missing)
 
-    ENV_FILE_PATH.write_text("\n".join(lines) + "\n")
+    _atomic_write_text(ENV_FILE_PATH, "\n".join(lines) + "\n")
     return True
 
 

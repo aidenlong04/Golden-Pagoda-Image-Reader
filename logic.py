@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -292,7 +291,6 @@ def _score_candidate(
             if s >= 80:
                 cand_sat_sum += s
                 cand_sat_pixels += 1
-                hue = (h_val / 255.0) * 360.0
                 r, g, b = rgb_px[x, y]
                 platform = _classify_platform_color(h_val, s, v, r, g, b)
                 if platform:
@@ -416,27 +414,6 @@ def detect_platform(
     return best_platform, best_scores
 
 
-def _silhouette(image: Image.Image, size: tuple[int, int]) -> list[int]:
-    """Return a binary silhouette (0/1 per pixel) of the icon at the given size."""
-    img = image.convert("RGBA").resize(size, Image.LANCZOS)
-    px = img.load()
-    w, h = size
-    out: list[int] = []
-    for y in range(h):
-        for x in range(w):
-            r, g, b, a = px[x, y]
-            v = max(r, g, b)
-            out.append(1 if a >= 128 and v >= 60 else 0)
-    return out
-
-
-def _silhouette_score(a: list[int], b: list[int]) -> float:
-    if not a or len(a) != len(b):
-        return 1.0
-    diff = sum(1 for x, y in zip(a, b, strict=True) if x != y)
-    return diff / len(a)
-
-
 def detect_platform_from_image(
     image: Image.Image,
     references: dict[str, Image.Image] | None = None,
@@ -459,55 +436,6 @@ def detect_platform_near_anchor(
     """
     platform, _ = detect_platform(image, anchor_bbox)
     return platform
-
-
-def _vote_platform_color(crop: Image.Image) -> tuple[str | None, int]:
-    hsv = crop.convert("HSV")
-    hsv_px = hsv.load()
-    rgb_px = crop.load()
-    cw, ch = crop.size
-    counts = {p: 0 for p in ALL_PLATFORMS}
-    for y in range(ch):
-        for x in range(cw):
-            h, s, v = hsv_px[x, y]
-            if s < 90 or v < 100:
-                continue
-            r, g, b = rgb_px[x, y]
-            platform = _classify_platform_color(h, s, v, r, g, b)
-            if platform is not None:
-                counts[platform] += 1
-    if not counts:
-        return None, 0
-    best = max(counts, key=counts.get)
-    return (best, counts[best]) if counts[best] > 0 else (None, 0)
-
-
-def _color_fallback(image: Image.Image) -> str | None:
-    """Hue-based platform classification used when no references are provided."""
-    rgb = image.convert("RGB")
-    width, height = rgb.size
-    if width == 0 or height == 0:
-        return None
-
-    top_strip = rgb.crop((0, 0, width, max(1, int(height * 0.10))))
-    hsv = top_strip.convert("HSV")
-    hsv_px = hsv.load()
-    rgb_px = top_strip.load()
-    sw, sh = top_strip.size
-
-    counts = {p: 0 for p in ALL_PLATFORMS}
-    for y in range(sh):
-        for x in range(sw):
-            h, s, v = hsv_px[x, y]
-            if s < 100 or v < 100:
-                continue
-            r, g, b = rgb_px[x, y]
-            platform = _classify_platform_color(h, s, v, r, g, b)
-            if platform is not None:
-                counts[platform] += 1
-
-    best = max(counts, key=counts.get)
-    return best if counts[best] >= 50 else None
 
 
 def _classify_platform_color(
