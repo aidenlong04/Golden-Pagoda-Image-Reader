@@ -1048,5 +1048,69 @@ async def clan_emblems(
     )
 
 
+PREVIEW_CHANNEL_ID = 1378199771428163765
+
+
+@tree.command(
+    name="preview-responses",
+    description="(temp) Post pass/fail/incomplete sample responses to the test channel.",
+)
+@app_commands.default_permissions(manage_guild=True)
+async def preview_responses(interaction: discord.Interaction) -> None:
+    from discord.http import Route
+
+    sample_clan = CLAN_SLOTS[0].clan_name if CLAN_SLOTS and CLAN_SLOTS[0].clan_name else "Golden Tenno"
+    sample_emoji = (CLAN_SLOTS[0].emoji if CLAN_SLOTS else None) or CLAN_EMOJI
+
+    samples = [
+        _pass_components(
+            "GoldenTenno#200",
+            "PC",
+            sample_clan,
+            [],
+            clan_emoji=sample_emoji,
+            mastery_rank="MR 30",
+        ),
+        _fail_components(
+            "Profile name not found",
+            "Could not read your in-game name from the screenshot. "
+            "Please post a clear shot of your Warframe profile page.",
+        ),
+        _incomplete_components(
+            f"No role for clan **{sample_clan}**.",
+        ),
+    ]
+
+    route = Route(
+        "POST",
+        "/channels/{channel_id}/messages",
+        channel_id=PREVIEW_CHANNEL_ID,
+    )
+    sent = 0
+    errors: list[str] = []
+    tasks = [
+        client.http.request(
+            route,
+            json={
+                "flags": COMPONENTS_V2_FLAG,
+                "components": components,
+                "allowed_mentions": {"parse": []},
+            },
+        )
+        for components in samples
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for r in results:
+        if isinstance(r, Exception):
+            errors.append(str(r))
+        else:
+            sent += 1
+
+    msg = f"\u2705 Posted {sent}/{len(samples)} samples to <#{PREVIEW_CHANNEL_ID}>."
+    if errors:
+        msg += "\n" + "\n".join(f"\u274C {e}" for e in errors)
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
 if __name__ == "__main__":
     client.run(DISCORD_TOKEN)
