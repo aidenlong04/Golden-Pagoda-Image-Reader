@@ -701,17 +701,18 @@ def _pass_components(
     mastery_rank: str | None = None,
 ) -> list[dict]:
     emoji = (clan_emoji or "").strip() or CLAN_EMOJI
-    clan_part = f"{emoji} **{clan}**" if clan else f"{emoji} *Unaffiliated*"
+    display_clan = _strip_clan_tag(clan) if clan else None
+    clan_part = f"{emoji} **{display_clan}**" if display_clan else f"{emoji} *Unaffiliated*"
     plat_emoji = _platform_glyph(platform)
     plat_part = (
         f"**{platform}** {plat_emoji}" if platform else f"*Unknown* {plat_emoji}"
     )
-    display_profile = re.sub(r"#\d+\s*$", "", profile).strip()
-    header_lines = [f"### \u2705  `{display_profile}`"]
+    display_profile = _strip_clan_tag(profile)
+    header = {"type": 10, "content": f"### \u2705  `{display_profile}`"}
+    inner_lines = [clan_part, f"> {plat_part}"]
     if mastery_rank:
-        header_lines.append(f"-# > {mastery_rank}")
-    header = {"type": 10, "content": "\n".join(header_lines)}
-    inner = f"{clan_part}\n> {plat_part}"
+        inner_lines.append(f"-# > {mastery_rank}")
+    inner = "\n".join(inner_lines)
     return [header, _container(ACCENT_PASS, inner)]
 
 
@@ -941,7 +942,7 @@ async def on_message(message: discord.Message) -> None:
             clan_emoji = slot.emoji
         role = _find_clan_role(message.guild, clan_name)
         if role is None:
-            issues.append(f"No role for clan {clan_name}.")
+            issues.append(f"No role for clan **{_strip_clan_tag(clan_name)}**.")
             passed = False
         else:
             _, status = await _add_role(member, role, "Screenshot clan verification")
