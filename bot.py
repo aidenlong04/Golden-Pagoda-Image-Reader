@@ -842,6 +842,22 @@ _PLATFORM_EMOJI_ENV = {
 }
 
 CLAN_EMOJI = os.getenv("CLAN_EMOJI", "").strip() or "\U0001F6E1\uFE0F"  # 🛡️
+ALLIANCE_EMOJI_RAW = os.getenv("ALLIANCE_EMOJI", "<:GoldenPagoda_Emblem:1416905638428020877>").strip()
+
+
+def _emoji_to_button_payload(raw: str) -> dict | None:
+    """Parse a `<:name:id>` (or `<a:name:id>`) string into the Discord
+    button-emoji payload `{"id": str, "name": str, "animated": bool}`.
+    Returns None for unicode emojis (callers can just prefix the label)."""
+    if not raw:
+        return None
+    m = re.match(r"^<(a?):([A-Za-z0-9_]{2,}):(\d{15,25})>$", raw)
+    if not m:
+        return None
+    return {"id": m.group(3), "name": m.group(2), "animated": m.group(1) == "a"}
+
+
+ALLIANCE_EMOJI_PAYLOAD = _emoji_to_button_payload(ALLIANCE_EMOJI_RAW)
 
 
 def _platform_glyph(platform: str | None) -> str:
@@ -876,15 +892,13 @@ def _pass_components(
     inner = "\n".join(inner_lines)
     container_children: list[dict] = [{"type": 10, "content": inner}]
     if link_buttons:
-        container_children.append(
-            {
-                "type": 1,
-                "components": [
-                    {"type": 2, "style": 5, "label": label, "url": url}
-                    for label, url in link_buttons[:5]
-                ],
-            }
-        )
+        button_payloads: list[dict] = []
+        for label, url in link_buttons[:5]:
+            btn: dict = {"type": 2, "style": 5, "label": label, "url": url}
+            if label == "Clan Chat" and ALLIANCE_EMOJI_PAYLOAD is not None:
+                btn["emoji"] = ALLIANCE_EMOJI_PAYLOAD
+            button_payloads.append(btn)
+        container_children.append({"type": 1, "components": button_payloads})
     container = {
         "type": 17,
         "accent_color": ACCENT_PASS,
@@ -945,16 +959,13 @@ def _resolve_pass_link_buttons(
                 )
             else:
                 buttons.append(
-                    ("Clan General Chat", _channel_url(guild.id, general.id))
+                    ("Clan Chat", _channel_url(guild.id, general.id))
                 )
 
     info = guild.get_channel(PASS_INFO_CHANNEL_ID)
     if info is not None:
         label = f"#{info.name}"
         buttons.append((label, _channel_url(guild.id, info.id)))
-    extra = guild.get_channel(PASS_EXTRA_CHANNEL_ID)
-    if extra is not None:
-        buttons.append((f"#{extra.name}", _channel_url(guild.id, extra.id)))
     return buttons
 
 
