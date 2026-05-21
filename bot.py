@@ -881,7 +881,14 @@ def _pass_components(
     emoji = (clan_emoji or "").strip() or CLAN_EMOJI
     display_clan = _strip_clan_tag(clan) if clan else None
     clan_part = f"{emoji} **{display_clan}**" if display_clan else f"{emoji} *Unaffiliated*"
-    display_profile = _strip_clan_tag(profile)
+    # Profile names normally render without the #NNN discriminator for
+    # cleaner display. The "Tenno #<member_count>" fallback (used when
+    # OCR can't read the real handle) intentionally keeps the suffix so
+    # the response shows something unique per server.
+    if profile.startswith("Tenno #"):
+        display_profile = profile
+    else:
+        display_profile = _strip_clan_tag(profile)
     header = {"type": 10, "content": f"### \u2705  `{display_profile}`"}
     inner_lines = [clan_part]
     if platform:
