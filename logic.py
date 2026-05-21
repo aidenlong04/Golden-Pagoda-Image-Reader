@@ -392,20 +392,59 @@ def detect_platform(
         _REFERENCE_FEATURES = _extract_reference_features(references)
     
     candidates = _candidate_rois(image, anchor_bbox)
-    
+
     best_platform: str | None = None
     best_scores: dict[str, float] = {}
     best_score_value = -1.0
     winning_roi: Image.Image | None = None
-    
+    # Track the best candidate even when it fails the confidence gate so we
+    # can (a) surface real scores in analytics, (b) optionally accept a
+    # relaxed-gate match when no candidate clears the strict gate.
+    fallback_scores: dict[str, float] = {}
+    fallback_platform: str | None = None
+    fallback_score_value = -1.0
+
     for candidate in candidates:
         platform, scores = _score_candidate(candidate, _REFERENCE_FEATURES)
-        max_score = max(scores.values()) if scores else 0.0
-        if platform and max_score > best_score_value:
+        if not scores:
+            continue
+        sorted_scores = sorted(scores.values(), reverse=True)
+        cand_top = sorted_scores[0]
+        if platform and cand_top > best_score_value:
             best_platform = platform
             best_scores = scores
-            best_score_value = max_score
+            best_score_value = cand_top
             winning_roi = candidate
+        # Independent of gating, remember the strongest scores seen so the
+        # caller has telemetry even on failure.
+        if cand_top > fallback_score_value:
+            fallback_score_value = cand_top
+            fallback_scores = scores
+            fallback_platform = max(scores.items(), key=lambda kv: kv[1])[0]
+
+    # Relaxed-gate fallback: if the strict gate rejected everything but a
+    # candidate scored confidently (top >=0.35 AND runner-up <0.30), accept
+    # it. The strict 0.45 gate is tuned for crisp title-bar crops; downscaled
+    # or noisy uploads often land just below it while still being
+    # unambiguous (clear separation from the next-best platform).
+    if best_platform is None and fallback_platform is not None:
+        sorted_fb = sorted(fallback_scores.values(), reverse=True)
+        runner_up = sorted_fb[1] if len(sorted_fb) > 1 else 0.0
+        if fallback_score_value >= 0.35 and runner_up < 0.30:
+            best_platform = fallback_platform
+            best_scores = fallback_scores
+            best_score_value = fallback_score_value
+            logger.info(
+                "Platform accepted via relaxed gate: %s score=%.3f runner_up=%.3f",
+                best_platform,
+                fallback_score_value,
+                runner_up,
+            )
+
+    # Always expose the best observed scores so analytics/logs are useful
+    # even when detection failed outright.
+    if not best_scores and fallback_scores:
+        best_scores = fallback_scores
     
     if _PLATFORM_DEBUG_DIR and winning_roi:
         try:
