@@ -11,6 +11,7 @@ from logic import (
     detect_platform_from_image,
     find_clan_slot,
     parse_clan_name,
+    parse_mastery_rank,
     parse_profile_name,
 )
 
@@ -38,6 +39,19 @@ class ParseClanNameTests(unittest.TestCase):
 
     def test_returns_none_without_header(self) -> None:
         self.assertIsNone(parse_clan_name("nothing relevant"))
+
+
+class ParseMasteryRankTests(unittest.TestCase):
+    def test_extracts_numeric_rank(self) -> None:
+        text = "MASTERY RANK\n12\nCLAN\nGolden Pagoda"
+        self.assertEqual(parse_mastery_rank(text), "MR 12")
+
+    def test_extracts_unranked(self) -> None:
+        text = "MASTERY RANK\nUNRANKED\nCLAN"
+        self.assertEqual(parse_mastery_rank(text), "Unranked")
+
+    def test_returns_none_when_missing(self) -> None:
+        self.assertIsNone(parse_mastery_rank("no header here"))
 
 
 class FindClanSlotTests(unittest.TestCase):

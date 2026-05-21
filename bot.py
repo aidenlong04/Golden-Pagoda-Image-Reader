@@ -31,6 +31,7 @@ from logic import (
     find_clan_slot,
     load_default_references,
     parse_clan_name,
+    parse_mastery_rank,
     parse_profile_name,
 )
 
@@ -697,18 +698,20 @@ def _pass_components(
     role_lines: list[str],  # noqa: ARG001 — kept for API parity / preview
     *,
     clan_emoji: str | None = None,
+    mastery_rank: str | None = None,
 ) -> list[dict]:
-    plat = (
-        f"{_platform_glyph(platform)} **{platform}**" if platform
-        else f"{_platform_glyph(None)} *Unknown*"
-    )
     emoji = (clan_emoji or "").strip() or CLAN_EMOJI
     clan_part = f"{emoji} **{clan}**" if clan else f"{emoji} *Unaffiliated*"
-    body = (
-        f"### \u2705  `{profile}`\n"
-        f"{clan_part}  \u2022  {plat}"
+    plat_emoji = _platform_glyph(platform)
+    plat_part = (
+        f"**{platform}** {plat_emoji}" if platform else f"*Unknown* {plat_emoji}"
     )
-    return [_container(ACCENT_PASS, body)]
+    header_lines = [f"### \u2705  `{profile}`"]
+    if mastery_rank:
+        header_lines.append(f"-# > {mastery_rank}")
+    header = {"type": 10, "content": "\n".join(header_lines)}
+    inner = f"{clan_part}  \u2022  {plat_part}"
+    return [header, _container(ACCENT_PASS, inner)]
 
 
 def _fail_components(headline: str, reason: str, *, image_url: str | None = None) -> list[dict]:
@@ -889,6 +892,7 @@ async def on_message(message: discord.Message) -> None:
 
     profile_name = parse_profile_name(ocr_text)
     clan_name = parse_clan_name(ocr_text)
+    mastery_rank = parse_mastery_rank(ocr_text)
 
     anchor_bbox = _profile_name_bbox(ocr_words) if profile_name else None
     platform: str | None = None
@@ -947,6 +951,7 @@ async def on_message(message: discord.Message) -> None:
             _pass_components(
                 profile_name, platform, clan_name, role_lines,
                 clan_emoji=clan_emoji,
+                mastery_rank=mastery_rank,
             ),
         )
     else:
