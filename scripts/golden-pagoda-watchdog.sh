@@ -72,7 +72,7 @@ esac
     --filter container="$CONTAINER" \
     --filter event=health_status \
     --filter event=die \
-    --format '{{.Status}}' \
+    --format '{{.Action}}' \
 | while IFS= read -r ev; do
     case "$ev" in
         "health_status: unhealthy")
