@@ -711,7 +711,7 @@ def _pass_components(
     if mastery_rank:
         header_lines.append(f"-# > {mastery_rank}")
     header = {"type": 10, "content": "\n".join(header_lines)}
-    inner = f"> {clan_part}  \u2022  {plat_part}"
+    inner = f"{clan_part}\n> {plat_part}"
     return [header, _container(ACCENT_PASS, inner)]
 
 
