@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import discord
@@ -311,6 +312,11 @@ HEALTH_INTERVAL = _int_env("HEALTH_INTERVAL", 20)
 # Populated after tree.sync(); used to render clickable slash-command mentions
 # (`</name:id>`) inside ephemeral replies fired from component buttons.
 _COMMAND_IDS: dict[str, int] = {}
+
+# Strong refs for fire-and-forget tasks. asyncio docs warn that
+# create_task() return values must be kept alive or the task may be
+# garbage-collected mid-await. We discard each task once it completes.
+_BG_TASKS: set[asyncio.Task] = set()
 
 
 async def _health_task() -> None:
@@ -946,9 +952,11 @@ async def _send_v2(
             logger.exception("plain-text fallback also failed")
 
     if sent_id and REPLY_TTL_SECONDS > 0:
-        asyncio.create_task(
+        task = asyncio.create_task(
             _delete_after(reply_to.channel.id, sent_id, REPLY_TTL_SECONDS)
         )
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
 
 
 async def _delete_after(channel_id: int, message_id: int, delay: float) -> None:
@@ -1381,7 +1389,7 @@ def _status_page_misc(interaction: discord.Interaction) -> str:
     )
 
 
-_STATUS_PAGES: list[tuple[str, str, str, callable]] = [  # type: ignore[type-arg]
+_STATUS_PAGES: list[tuple[str, str, str, Callable]] = [
     ("bot",       "\U0001F916 Bot",          "Bot identity, latency, uptime.",  lambda i, _s: _status_page_bot(i)),
     ("roles",     "\U0001F6E1\uFE0F Roles",  "Configured roles + slot map.",    lambda i, _s: _status_page_roles(i)),
     ("channels",  "\U0001F4FA Channels",     "Target/info/preview channels.",   lambda i, _s: _status_page_channels(i)),
