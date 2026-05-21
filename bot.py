@@ -346,13 +346,16 @@ async def on_ready() -> None:
         logger.exception("Failed to sync slash commands")
 
 
-def _sync_platform_roles_from_guilds() -> None:
+def _sync_platform_roles_from_guilds() -> list[str]:
     """Resolve each platform's role ID against the server's role list and
     write the IDs back to .env. Runs on every reconnect.
+
+    Returns a list of human-readable change descriptions (empty if nothing
+    changed).
     """
     if not client.guilds:
-        return
-    changed = False
+        return []
+    changes: list[str] = []
     for platform, aliases in PLATFORM_ROLE_ALIASES.items():
         current = PLATFORM_ROLE_IDS.get(platform)
         resolved: discord.Role | None = None
@@ -377,22 +380,26 @@ def _sync_platform_roles_from_guilds() -> None:
                 resolved.name,
             )
             PLATFORM_ROLE_IDS[platform] = resolved.id
-            changed = True
-    if changed:
+            changes.append(f"{platform}: id {current} → {resolved.id} ({resolved.name})")
+    if changes:
         try:
             _update_env_platform_ids(PLATFORM_ROLE_IDS)
         except Exception:
             logger.exception("Failed to update %s", ENV_FILE_PATH)
+    return changes
 
 
-def _sync_clan_slots_from_guilds() -> None:
+def _sync_clan_slots_from_guilds() -> list[str]:
     """For each guild the bot is in, resolve clan slot names/IDs against the
     server's role list and update the slot cache + .env file. Runs every
     time the bot reconnects — zero manual intervention required.
+
+    Returns a list of human-readable change descriptions (empty if nothing
+    changed).
     """
     if not client.guilds:
-        return
-    changed = False
+        return []
+    changes: list[str] = []
     for slot in CLAN_SLOTS:
         resolved: discord.Role | None = None
         for guild in client.guilds:
@@ -420,14 +427,19 @@ def _sync_clan_slots_from_guilds() -> None:
                 resolved.name,
                 resolved.id,
             )
+            old_name = slot.clan_name
+            old_id = slot.role_id
             slot.clan_name = resolved.name
             slot.role_id = resolved.id
-            changed = True
-    if changed:
+            changes.append(
+                f"slot {slot.slot}: {old_name!r}/{old_id} → {resolved.name!r}/{resolved.id}"
+            )
+    if changes:
         try:
             _update_env_clan_slots(CLAN_SLOTS)
         except Exception:
             logger.exception("Failed to update %s", ENV_FILE_PATH)
+    return changes
 
 
 # ---------- Role lookup helpers --------------------------------------------
@@ -1148,13 +1160,49 @@ def _normalize_emoji_input(raw: str) -> str | None:
 @app_commands.describe(
     role="The clan role to set the emoji for.",
     emoji="A custom emoji (<:name:id>) or unicode emoji. Leave blank to clear.",
+    resync_clans="Re-resolve clan + platform role names/IDs from the server (ignores role/emoji).",
 )
 @app_commands.default_permissions(manage_guild=True)
 async def clan_emblems(
     interaction: discord.Interaction,
-    role: discord.Role,
+    role: discord.Role | None = None,
     emoji: str = "",
+    resync_clans: bool = False,
 ) -> None:
+    if resync_clans:
+        clan_changes = _sync_clan_slots_from_guilds()
+        platform_changes = _sync_platform_roles_from_guilds()
+        logger.info(
+            "clan-emblems resync: clan_changes=%d platform_changes=%d",
+            len(clan_changes), len(platform_changes),
+        )
+        if not clan_changes and not platform_changes:
+            await interaction.response.send_message(
+                "✅ Resync complete — no changes (everything was already up to date).",
+                ephemeral=True,
+            )
+            return
+        lines = ["✅ **Resync complete**"]
+        if clan_changes:
+            lines.append("")
+            lines.append("**Clans**")
+            for c in clan_changes:
+                lines.append(f"- `{c}`")
+        if platform_changes:
+            lines.append("")
+            lines.append("**Platforms**")
+            for c in platform_changes:
+                lines.append(f"- `{c}`")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        return
+
+    if role is None:
+        await interaction.response.send_message(
+            "❌ Provide a `role` to set its emoji, or pass `resync_clans:true` to re-sync names/IDs.",
+            ephemeral=True,
+        )
+        return
+
     slot = next((s for s in CLAN_SLOTS if s.role_id == role.id), None)
     if slot is None:
         await interaction.response.send_message(
