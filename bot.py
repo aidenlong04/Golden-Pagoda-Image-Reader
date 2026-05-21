@@ -38,8 +38,27 @@ from logic import (
 )
 import analytics
 
-logging.basicConfig(level=logging.INFO)
+# Single root handler — discord.py's own setup_logging is disabled in
+# client.run() below (log_handler=None) so every record is emitted exactly
+# once. LOG_LEVEL is env-tunable (default INFO) for cheap runtime tuning.
+logging.basicConfig(
+    level=(os.getenv("LOG_LEVEL") or "INFO").upper(),
+    format="%(asctime)s %(levelname)-7s %(name)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 logger = logging.getLogger(__name__)
+
+# Quiet chatty third-party loggers so journald/json-file stay lean.
+for _name, _lvl in (
+    ("discord.http",          logging.WARNING),
+    ("discord.gateway",       logging.WARNING),
+    ("discord.state",         logging.WARNING),
+    ("urllib3",               logging.WARNING),
+    ("urllib3.connectionpool",logging.WARNING),
+    ("PIL",                   logging.WARNING),
+    ("PIL.PngImagePlugin",    logging.WARNING),
+):
+    logging.getLogger(_name).setLevel(_lvl)
 
 # Silence the harmless "PyNaCl/davey not installed" warnings emitted on every
 # connect (we don't use voice).
@@ -1637,4 +1656,7 @@ def _stats_page_ocr(s: dict) -> str:
 
 
 if __name__ == "__main__":
-    client.run(DISCORD_TOKEN)
+    # log_handler=None disables discord.py's own setup_logging so we don't
+    # get duplicate handlers on the root + `discord` loggers (which would
+    # double every log line emitted by discord.py).
+    client.run(DISCORD_TOKEN, log_handler=None)
