@@ -16,7 +16,7 @@ Discord bot ("**Oda Helper**") that OCRs Warframe profile screenshots, verifies 
 - **SSH keys** (in codespace): `~/.ssh/hetzner` (interactive), `~/.ssh/gha_deploy` (workflow).
 - **GitHub secrets**: `HETZNER_HOST`, `HETZNER_USER`, `HETZNER_SSH_KEY` (base64-encoded private key — workflow `base64 -d`s it).
 - **systemd unit**: `scripts/golden-pagoda.service` → `/etc/systemd/system/golden-pagoda.service`. Hardened: `--init`, `--memory=512m`, `--cpus=1`, `--pids-limit=256`, json-file log rotation (10m × 3 files), `SuccessExitStatus=0 137 143`.
-- **Watchdog**: `scripts/golden-pagoda-watchdog.{sh,service,timer}` polls `docker inspect ... .State.Health.Status` every 60s and restarts on `unhealthy`.
+- **Watchdog**: `scripts/golden-pagoda-watchdog.{sh,service}` is a long-running `simple` systemd service that blocks on `docker events --filter container=golden-pagoda --filter event=health_status --filter event=die` and restarts `golden-pagoda.service` on `health_status: unhealthy` or container death. Cooldown (60s) + sliding-window cap (5 restarts / 10 min) prevent thrash. Idle CPU/RAM ~zero.
 - **Server `.env`**: `/opt/golden-pagoda/.env` (NOT in git — gitignored). Edit with `sudo` then `sudo systemctl restart golden-pagoda`.
 - **Data volume**: `/opt/golden-pagoda/data/` ↔ container `/app/data/`. Owned `10001:10001` (workflow + `ExecStartPre` chown it idempotently).
 - **Logs**: `sudo docker logs --tail 50 golden-pagoda` or `sudo journalctl -u golden-pagoda -f`.

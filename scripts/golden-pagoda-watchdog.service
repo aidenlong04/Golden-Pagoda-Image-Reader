@@ -1,7 +1,33 @@
 [Unit]
-Description=Golden Pagoda container health watchdog
+Description=Golden Pagoda container health watchdog (event-driven)
 After=docker.service golden-pagoda.service
+Requires=docker.service
+PartOf=golden-pagoda.service
 
 [Service]
-Type=oneshot
+Type=simple
 ExecStart=/opt/golden-pagoda/scripts/golden-pagoda-watchdog.sh
+Restart=always
+RestartSec=10s
+
+# Watchdog is mostly idle (blocked on docker events). Cap any drift.
+MemoryMax=32M
+TasksMax=16
+CPUQuota=10%
+
+# Lightweight hardening. We still need /run/systemd (D-Bus) for systemctl
+# and /var/run/docker.sock for docker, both under /run.
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHome=true
+PrivateTmp=true
+
+# Avoid runaway log spam: only the script's `logger` calls hit syslog.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
