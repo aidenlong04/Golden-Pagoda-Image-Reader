@@ -25,15 +25,37 @@ _PROFILE_NAME_RE = re.compile(r"(?:\[[A-Za-z0-9]+\])?[A-Za-z0-9_\-\.]{2,}#\d{2,4
 
 
 def parse_profile_name(ocr_text: str) -> str | None:
-    """Find the first profile-name token in OCR text."""
+    """Find the first profile-name token in OCR text.
+
+    Prefers matches that appear *before* the CLAN header so the parser
+    can't accidentally return the clan-name discriminator (e.g. for
+    clan "Golden Tenno#200" the regex would otherwise match "Tenno#200"
+    as a profile handle).
+    """
     if not ocr_text:
         return None
-    for line in ocr_text.splitlines():
+
+    # Split off everything from the CLAN header onward — the player's own
+    # handle always appears earlier in the title bar.
+    header_match = _CLAN_HEADER_RE.search(ocr_text)
+    head = ocr_text[: header_match.start()] if header_match else ocr_text
+
+    for line in head.splitlines():
         match = _PROFILE_NAME_RE.search(line)
         if match:
             return match.group(0).strip()
-    match = _PROFILE_NAME_RE.search(ocr_text)
-    return match.group(0).strip() if match else None
+    match = _PROFILE_NAME_RE.search(head)
+    if match:
+        return match.group(0).strip()
+
+    # Fallback: scan the full text only if the pre-header region yielded
+    # nothing (handles OCR that drops the header line entirely).
+    if header_match is not None:
+        for line in ocr_text.splitlines():
+            match = _PROFILE_NAME_RE.search(line)
+            if match:
+                return match.group(0).strip()
+    return None
 
 
 # --- Clan name --------------------------------------------------------------
