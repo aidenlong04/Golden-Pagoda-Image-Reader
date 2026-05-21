@@ -305,24 +305,39 @@ def _score_candidate(
                 white_pixel_count += 1
     
     cand_mean_sat = cand_sat_sum / cand_sat_pixels if cand_sat_pixels > 0 else 0
-    
+
+    # Warframe's PC (Windows) and Mobile (Apple) icons are rendered WHITE
+    # on a dark title bar, so their saturated-colour pixel count is ~0.
+    # Treat the candidate as a "white-on-dark glyph" when white pixels
+    # dominate any colored signal — IoU shape-match then distinguishes
+    # Windows-logo vs Apple-silhouette.
+    white_dominant = white_pixel_count > 0 and white_pixel_count >= max(
+        platform_color_counts.values()
+    )
+
     if cand_mean_sat >= 80:
         color_weight, shape_weight = 0.70, 0.30
+    elif white_dominant:
+        # White glyph: lean harder on shape (IoU) since both PC and Mobile
+        # tie on colour and only the silhouette tells them apart.
+        color_weight, shape_weight = 0.20, 0.80
     else:
         color_weight, shape_weight = 0.30, 0.70
-    
+
     total_pixels = cw * ch
     scores: dict[str, float] = {}
     for platform, feat in features.items():
         iou = _iou(cand_mask, feat["mask"])
-        
+
         color_pixel_count = platform_color_counts.get(platform, 0)
-        
-        if white_pixel_count > color_pixel_count and platform in (PLATFORM_PC, PLATFORM_MOBILE):
+
+        # Unconditionally attribute white pixels to PC and Mobile. Both
+        # icons are white-on-dark; IoU above breaks the tie via shape.
+        if platform in (PLATFORM_PC, PLATFORM_MOBILE):
             color_pixel_count += white_pixel_count
-        
+
         color_score = color_pixel_count / total_pixels if total_pixels > 0 else 0.0
-        
+
         fused = color_weight * color_score + shape_weight * iou
         scores[platform] = fused
     
