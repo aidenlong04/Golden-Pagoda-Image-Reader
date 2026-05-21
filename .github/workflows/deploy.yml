@@ -43,6 +43,9 @@ jobs:
             set -e
             cd /opt/golden-pagoda
             sudo mkdir -p /opt/golden-pagoda/data /opt/golden-pagoda/icons
+            # Container runs as uid 10001 (bot); the bind-mounted data dir
+            # must be writable by that uid, otherwise sqlite3.connect fails.
+            sudo chown -R 10001:10001 /opt/golden-pagoda/data
             # Daemon-wide log rotation defaults so any transient container is bounded.
             if [ ! -f /etc/docker/daemon.json ]; then
                 echo "{\"log-driver\":\"json-file\",\"log-opts\":{\"max-size\":\"10m\",\"max-file\":\"3\"}}" \
