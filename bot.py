@@ -289,6 +289,10 @@ BOT_START_TIME = time.time()
 HEALTH_PATH = os.getenv("HEALTH_PATH", "/tmp/gp_health")
 HEALTH_INTERVAL = _int_env("HEALTH_INTERVAL", 20)
 
+# Populated after tree.sync(); used to render clickable slash-command mentions
+# (`</name:id>`) inside ephemeral replies fired from component buttons.
+_COMMAND_IDS: dict[str, int] = {}
+
 
 async def _health_task() -> None:
     while True:
@@ -311,6 +315,9 @@ async def on_ready() -> None:
     try:
         synced = await tree.sync()
         logger.info("Synced %d slash command(s)", len(synced))
+        _COMMAND_IDS.clear()
+        for cmd in synced:
+            _COMMAND_IDS[cmd.name] = cmd.id
     except Exception:
         logger.exception("Failed to sync slash commands")
 
@@ -1355,7 +1362,7 @@ _STATUS_PAGE_INDEX: dict[str, int] = {key: idx for idx, (key, *_rest) in enumera
 
 def _status_components(interaction: discord.Interaction, page: int) -> list[dict]:
     page = max(0, min(page, len(_STATUS_PAGES) - 1))
-    _key, title, _desc, builder = _STATUS_PAGES[page]
+    key, title, _desc, builder = _STATUS_PAGES[page]
     snap = analytics.summary()  # cheap; reused for stats pages, ignored for live ones
     body = builder(interaction, snap)
     header = {
@@ -1377,13 +1384,24 @@ def _status_components(interaction: discord.Interaction, page: int) -> list[dict
         {"type": 2, "style": 1, "label": "\U0001F504 Refresh",
          "custom_id": f"status:{page}"},
     ]
+    container_components: list[dict] = [
+        {"type": 10, "content": body},
+        {"type": 1, "components": nav_buttons},
+    ]
+    # Page-specific action row: Assign Emblems on the Roles page.
+    if key == "roles":
+        container_components.append({
+            "type": 1,
+            "components": [
+                {"type": 2, "style": 1,
+                 "label": "Assign Emblems",
+                 "custom_id": "status:assign_emblems"},
+            ],
+        })
     container = {
         "type": 17,
         "accent_color": ACCENT_PASS,
-        "components": [
-            {"type": 10, "content": body},
-            {"type": 1, "components": nav_buttons},
-        ],
+        "components": container_components,
     }
     return [header, container]
 
@@ -1459,6 +1477,27 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             await _interaction_callback(interaction, 6, [])  # DEFERRED_UPDATE
         except Exception:
             logger.exception("noop ack failed")
+        return
+    if parts[1] == "assign_emblems":
+        cmd_id = _COMMAND_IDS.get("clan-emblems")
+        mention = (
+            f"</clan-emblems:{cmd_id}>" if cmd_id else "`/clan-emblems`"
+        )
+        body = (
+            f"### \U0001F3F0  Assign Emblems\n"
+            f"Click {mention} to set or clear a clan emoji.\n"
+            f"-# Tip: pass the role and a custom emoji like "
+            f"`<:Name:1234567890>`. Leave the emoji blank to clear."
+        )
+        container = {
+            "type": 17,
+            "accent_color": ACCENT_PASS,
+            "components": [{"type": 10, "content": body}],
+        }
+        try:
+            await _interaction_callback(interaction, 4, [container])  # CHANNEL_MESSAGE_WITH_SOURCE
+        except Exception:
+            logger.exception("assign_emblems hint failed")
         return
     try:
         page = int(parts[1])
