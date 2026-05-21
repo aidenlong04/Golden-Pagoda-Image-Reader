@@ -1,0 +1,7 @@
+[Unit]
+Description=Golden Pagoda container health watchdog
+After=docker.service golden-pagoda.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/golden-pagoda/scripts/golden-pagoda-watchdog.sh

@@ -5,6 +5,7 @@ import io
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 import discord
@@ -282,10 +283,27 @@ intents.members = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
+BOT_START_TIME = time.time()
+HEARTBEAT_PATH = os.getenv("HEARTBEAT_PATH", "/tmp/gp_heartbeat")
+HEARTBEAT_INTERVAL = _int_env("HEARTBEAT_INTERVAL", 20)
+
+
+async def _heartbeat_task() -> None:
+    while True:
+        try:
+            with open(HEARTBEAT_PATH, "w") as fh:
+                fh.write(str(int(time.time())))
+        except OSError:
+            logger.exception("heartbeat write failed")
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
 
 @client.event
 async def on_ready() -> None:
     logger.info("Logged in as %s", client.user)
+    if not getattr(client, "_heartbeat_started", False):
+        client.loop.create_task(_heartbeat_task())
+        client._heartbeat_started = True  # type: ignore[attr-defined]
     _sync_clan_slots_from_guilds()
     _sync_platform_roles_from_guilds()
     try:
@@ -1177,6 +1195,240 @@ async def preview_responses(interaction: discord.Interaction) -> None:
     if errors:
         msg += "\n" + "\n".join(f"\u274C {e}" for e in errors)
     await interaction.response.send_message(msg, ephemeral=True)
+
+
+# ---------- /status (paginated, ephemeral, V2) ------------------------------
+
+
+EPHEMERAL_FLAG = 1 << 6  # 64
+
+
+def _heartbeat_age() -> int | None:
+    try:
+        return int(time.time() - os.path.getmtime(HEARTBEAT_PATH))
+    except OSError:
+        return None
+
+
+def _fmt_uptime(seconds: float) -> str:
+    seconds = int(seconds)
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    parts.append(f"{s}s")
+    return " ".join(parts)
+
+
+def _status_page_bot(interaction: discord.Interaction) -> str:
+    user = client.user
+    latency_ms = int(client.latency * 1000) if client.latency >= 0 else -1
+    uptime = _fmt_uptime(time.time() - BOT_START_TIME)
+    hb = _heartbeat_age()
+    hb_line = f"{hb}s ago" if hb is not None else "*missing*"
+    guilds = len(client.guilds)
+    members = sum(g.member_count or 0 for g in client.guilds)
+    return (
+        f"**Bot**\n"
+        f"-# User: `{user}` (`{getattr(user, 'id', '?')}`)\n"
+        f"-# Latency: `{latency_ms} ms`\n"
+        f"-# Uptime: `{uptime}`\n"
+        f"-# Heartbeat: `{hb_line}`\n"
+        f"-# Guilds: `{guilds}` \u2022 Members: `{members}`"
+    )
+
+
+def _status_page_roles(interaction: discord.Interaction) -> str:
+    guild = interaction.guild
+    lines = ["**Clan slots**"]
+    for s in CLAN_SLOTS:
+        name = s.clan_name or "*(unset)*"
+        rid = s.role_id or 0
+        emoji = s.emoji or ""
+        mention = f"<@&{rid}>" if rid else "*(no role)*"
+        lines.append(f"-# {emoji} `{s.slot}` {name} \u2192 {mention}")
+
+    lines.append("")
+    lines.append("**Platform roles**")
+    for plat, key in PLATFORM_ROLE_ID_ENV_KEYS.items():
+        rid = PLATFORM_ROLE_IDS.get(plat) or 0
+        glyph = _platform_glyph(plat)
+        mention = f"<@&{rid}>" if rid else "*(unset)*"
+        lines.append(f"-# {glyph} {plat} \u2192 {mention}")
+
+    lines.append("")
+    lines.append("**Special roles**")
+    inc = f"<@&{INCOMPLETE_ROLE_ID}>" if INCOMPLETE_ROLE_ID else "*(unset)*"
+    rem = f"<@&{VERIFY_REMOVE_ROLE_ID}>" if VERIFY_REMOVE_ROLE_ID else "*(unset)*"
+    out = ", ".join(f"<@&{rid}>" for rid in OUTREACH_ROLE_IDS) or "*(none)*"
+    lines.append(f"-# Incomplete: {inc}")
+    lines.append(f"-# Remove on pass: {rem}")
+    lines.append(f"-# Outreach: {out}")
+    return "\n".join(lines)
+
+
+def _status_page_channels(interaction: discord.Interaction) -> str:
+    def fmt(cid: int) -> str:
+        if not cid:
+            return "*(unset)*"
+        return f"<#{cid}> `{cid}`"
+    return (
+        f"**Channels**\n"
+        f"-# Target: {fmt(TARGET_CHANNEL_ID)}\n"
+        f"-# Pass info button: {fmt(PASS_INFO_CHANNEL_ID)}\n"
+        f"-# Pass extra button: {fmt(PASS_EXTRA_CHANNEL_ID)}\n"
+        f"-# Preview channel: {fmt(PREVIEW_CHANNEL_ID)}\n"
+        f"-# Guild ID: `{GUILD_ID}`"
+    )
+
+
+def _status_page_misc(interaction: discord.Interaction) -> str:
+    ocr = "OCR.space (engine 3)" if OCR_API_KEY else (
+        "Tesseract (local)" if pytesseract else "*(none configured)*"
+    )
+    icons = len(PLATFORM_ICONS)
+    return (
+        f"**OCR / Misc**\n"
+        f"-# OCR: `{ocr}`\n"
+        f"-# Reference icons loaded: `{icons}`\n"
+        f"-# Reply TTL: `{REPLY_TTL_SECONDS}s`\n"
+        f"-# OCR max upload: `{OCR_MAX_UPLOAD_BYTES} bytes`\n"
+        f"-# Pass reaction: `:{PASS_REACTION_NAME}:` ({PASS_REACTION_ID or '-'})\n"
+        f"-# Pending reaction: `:{PENDING_REACTION_NAME}:` ({PENDING_REACTION_ID or '-'})\n"
+        f"-# Fail reaction: {FAIL_REACTION}"
+    )
+
+
+_STATUS_PAGES = [
+    ("\U0001F916 Bot", _status_page_bot),
+    ("\U0001F6E1\uFE0F Roles", _status_page_roles),
+    ("\U0001F4FA Channels", _status_page_channels),
+    ("\U0001F527 OCR / Misc", _status_page_misc),
+]
+
+
+def _status_components(interaction: discord.Interaction, page: int) -> list[dict]:
+    page = max(0, min(page, len(_STATUS_PAGES) - 1))
+    title, builder = _STATUS_PAGES[page]
+    body = builder(interaction)
+    header = {
+        "type": 10,
+        "content": f"### \U0001F4CA  Status \u2014 {title}\n-# Page {page + 1}/{len(_STATUS_PAGES)}",
+    }
+    nav_buttons = [
+        {
+            "type": 2,
+            "style": 2,
+            "label": "\u25C0 Prev",
+            "custom_id": f"status:{page - 1}",
+            "disabled": page == 0,
+        },
+        {
+            "type": 2,
+            "style": 2,
+            "label": f"{page + 1}/{len(_STATUS_PAGES)}",
+            "custom_id": "status:noop",
+            "disabled": True,
+        },
+        {
+            "type": 2,
+            "style": 2,
+            "label": "Next \u25B6",
+            "custom_id": f"status:{page + 1}",
+            "disabled": page >= len(_STATUS_PAGES) - 1,
+        },
+        {
+            "type": 2,
+            "style": 1,
+            "label": "\U0001F504 Refresh",
+            "custom_id": f"status:{page}",
+        },
+    ]
+    container = {
+        "type": 17,
+        "accent_color": ACCENT_PASS,
+        "components": [
+            {"type": 10, "content": body},
+            {"type": 1, "components": nav_buttons},
+        ],
+    }
+    return [header, container]
+
+
+async def _interaction_callback(
+    interaction: discord.Interaction,
+    callback_type: int,
+    components: list[dict],
+) -> None:
+    from discord.http import Route
+
+    route = Route(
+        "POST",
+        "/interactions/{interaction_id}/{interaction_token}/callback",
+        interaction_id=interaction.id,
+        interaction_token=interaction.token,
+    )
+    await client.http.request(
+        route,
+        json={
+            "type": callback_type,
+            "data": {
+                "flags": EPHEMERAL_FLAG | COMPONENTS_V2_FLAG,
+                "components": components,
+                "allowed_mentions": {"parse": []},
+            },
+        },
+    )
+    try:
+        interaction.response._responded = True  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+
+
+@tree.command(name="status", description="Show bot status (paginated, ephemeral).")
+@app_commands.default_permissions(manage_guild=True)
+async def status_cmd(interaction: discord.Interaction) -> None:
+    components = _status_components(interaction, 0)
+    try:
+        await _interaction_callback(interaction, 4, components)
+    except Exception:
+        logger.exception("status command failed")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "\u274C Failed to render status.", ephemeral=True
+            )
+
+
+@client.event
+async def on_interaction(interaction: discord.Interaction) -> None:
+    if interaction.type != discord.InteractionType.component:
+        return
+    data = interaction.data or {}
+    custom_id = str(data.get("custom_id", ""))
+    if not custom_id.startswith("status:"):
+        return
+    parts = custom_id.split(":", 1)
+    if len(parts) != 2 or parts[1] == "noop":
+        try:
+            await _interaction_callback(interaction, 6, [])  # DEFERRED_UPDATE
+        except Exception:
+            logger.exception("status noop ack failed")
+        return
+    try:
+        page = int(parts[1])
+    except ValueError:
+        return
+    components = _status_components(interaction, page)
+    try:
+        await _interaction_callback(interaction, 7, components)  # UPDATE_MESSAGE
+    except Exception:
+        logger.exception("status pagination failed")
 
 
 if __name__ == "__main__":

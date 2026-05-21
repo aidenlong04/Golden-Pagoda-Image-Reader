@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Golden Pagoda watchdog every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=golden-pagoda-watchdog.service
+
+[Install]
+WantedBy=timers.target

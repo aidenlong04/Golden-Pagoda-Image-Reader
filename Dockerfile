@@ -27,4 +27,8 @@ COPY . .
 RUN useradd --create-home --uid 10001 bot && chown -R bot:bot /app
 USER bot
 
+# Container is healthy iff the bot updates /tmp/gp_heartbeat within the last 90s.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+  CMD test $(( $(date +%s) - $(stat -c %Y /tmp/gp_heartbeat 2>/dev/null || echo 0) )) -lt 90 || exit 1
+
 CMD ["python", "-u", "bot.py"]

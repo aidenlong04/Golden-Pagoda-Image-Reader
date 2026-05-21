@@ -35,6 +35,13 @@ rsync -az --delete -e "$RSYNC_RSH" \
 echo ">> installing systemd unit"
 "${SSH[@]}" "$REMOTE" "sudo install -m 0644 $APP_DIR/scripts/$SERVICE.service /etc/systemd/system/$SERVICE.service && sudo systemctl daemon-reload"
 
+echo ">> installing watchdog (timer + service)"
+"${SSH[@]}" "$REMOTE" "sudo install -m 0755 $APP_DIR/scripts/golden-pagoda-watchdog.sh $APP_DIR/scripts/golden-pagoda-watchdog.sh \
+    && sudo install -m 0644 $APP_DIR/scripts/golden-pagoda-watchdog.service /etc/systemd/system/golden-pagoda-watchdog.service \
+    && sudo install -m 0644 $APP_DIR/scripts/golden-pagoda-watchdog.timer /etc/systemd/system/golden-pagoda-watchdog.timer \
+    && sudo systemctl daemon-reload \
+    && sudo systemctl enable --now golden-pagoda-watchdog.timer"
+
 echo ">> building image"
 "${SSH[@]}" "$REMOTE" "cd $APP_DIR && docker build -t golden-pagoda:latest . | tail -3"
 
