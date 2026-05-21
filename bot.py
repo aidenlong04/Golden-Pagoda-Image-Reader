@@ -65,6 +65,7 @@ def _int_env(name: str, default: int = 0) -> int:
 TARGET_CHANNEL_ID = _int_env("TARGET_CHANNEL_ID")
 GUILD_ID = _int_env("GUILD_ID", 1361846841905381629)
 PASS_INFO_CHANNEL_ID = _int_env("PASS_INFO_CHANNEL_ID", 1392582268769271950)
+PASS_EXTRA_CHANNEL_ID = _int_env("PASS_EXTRA_CHANNEL_ID", 1361846842383663268)
 
 # Platform name → list of acceptable Discord role-name aliases (case-insensitive).
 PLATFORM_ROLE_ALIASES: dict[str, tuple[str, ...]] = {
@@ -774,6 +775,9 @@ def _resolve_pass_link_buttons(
     if info is not None:
         label = f"#{info.name}"
         buttons.append((label, _channel_url(guild.id, info.id)))
+    extra = guild.get_channel(PASS_EXTRA_CHANNEL_ID)
+    if extra is not None:
+        buttons.append((f"#{extra.name}", _channel_url(guild.id, extra.id)))
     return buttons
 
 
