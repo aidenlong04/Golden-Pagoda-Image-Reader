@@ -9,6 +9,7 @@ from pathlib import Path
 
 import discord
 import requests
+from discord import app_commands
 from PIL import Image
 
 try:
@@ -170,15 +171,25 @@ def _load_clan_slots() -> list[ClanSlot]:
     return slots
 
 
+def _slot_field_value(slot: ClanSlot, field: str) -> str:
+    if field == "NAME":
+        return slot.clan_name or ""
+    if field == "ID":
+        return str(slot.role_id) if slot.role_id else ""
+    if field == "EMOJI":
+        return slot.emoji or ""
+    return ""
+
+
 def _update_env_clan_slots(slots: list[ClanSlot]) -> bool:
-    """Rewrite the CLAN_ROLE_{i}_NAME/_ID entries in the .env file in place."""
+    """Rewrite the CLAN_ROLE_{i}_NAME/_ID/_EMOJI entries in the .env file in place."""
     if not ENV_FILE_PATH.exists():
         return False
 
     by_slot = {s.slot: s for s in slots}
     lines = ENV_FILE_PATH.read_text().splitlines()
     seen: set[tuple[int, str]] = set()
-    pattern = re.compile(r"^(\s*)CLAN_ROLE_(\d+)_(NAME|ID)\s*=.*$")
+    pattern = re.compile(r"^(\s*)CLAN_ROLE_(\d+)_(NAME|ID|EMOJI)\s*=.*$")
 
     for idx, line in enumerate(lines):
         m = pattern.match(line)
@@ -188,23 +199,16 @@ def _update_env_clan_slots(slots: list[ClanSlot]) -> bool:
         slot = by_slot.get(slot_num)
         if slot is None:
             continue
-        if field == "NAME":
-            value = slot.clan_name or ""
-        else:
-            value = str(slot.role_id) if slot.role_id else ""
+        value = _slot_field_value(slot, field)
         lines[idx] = f"{indent}CLAN_ROLE_{slot_num}_{field}={value}"
         seen.add((slot_num, field))
 
     missing: list[str] = []
     for i in sorted(by_slot):
-        for field in ("NAME", "ID"):
+        for field in ("NAME", "ID", "EMOJI"):
             if (i, field) in seen:
                 continue
-            slot = by_slot[i]
-            if field == "NAME":
-                value = slot.clan_name or ""
-            else:
-                value = str(slot.role_id) if slot.role_id else ""
+            value = _slot_field_value(by_slot[i], field)
             missing.append(f"CLAN_ROLE_{i}_{field}={value}")
     if missing:
         if lines and lines[-1].strip():
@@ -272,6 +276,7 @@ intents.message_content = True
 intents.members = True
 
 client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
 
 @client.event
@@ -279,6 +284,11 @@ async def on_ready() -> None:
     logger.info("Logged in as %s", client.user)
     _sync_clan_slots_from_guilds()
     _sync_platform_roles_from_guilds()
+    try:
+        synced = await tree.sync()
+        logger.info("Synced %d slash command(s)", len(synced))
+    except Exception:
+        logger.exception("Failed to sync slash commands")
 
 
 def _sync_platform_roles_from_guilds() -> None:
@@ -943,6 +953,86 @@ async def on_message(message: discord.Message) -> None:
         await _add_incomplete_role(member)
         components = _incomplete_components(" ".join(issues))
         await _send_v2(message, components, mention_user=True, allow_role_mentions=True)
+
+
+# ---------- Slash commands --------------------------------------------------
+
+_CUSTOM_EMOJI_RE = re.compile(r"^<a?:[A-Za-z0-9_]{2,}:\d{15,25}>$")
+
+
+def _normalize_emoji_input(raw: str) -> str | None:
+    """Validate and normalize an emoji input. Accepts:
+      - Discord custom emoji: <:name:id> or <a:name:id>
+      - A bare numeric ID (assumed custom; caller must look up name)
+      - A unicode emoji string
+      - Empty string → returns "" to clear
+    Returns the canonical string to store, or None if invalid.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if _CUSTOM_EMOJI_RE.match(s):
+        return s
+    # Bare ID is ambiguous (no name), reject — user should paste full <:name:id>.
+    if s.isdigit():
+        return None
+    # Treat anything else short as a unicode emoji.
+    if len(s) <= 8:
+        return s
+    return None
+
+
+@tree.command(
+    name="clan-emblems",
+    description="Set the emoji shown next to a clan in verification messages.",
+)
+@app_commands.describe(
+    role="The clan role to set the emoji for.",
+    emoji="A custom emoji (<:name:id>) or unicode emoji. Leave blank to clear.",
+)
+@app_commands.default_permissions(manage_guild=True)
+async def clan_emblems(
+    interaction: discord.Interaction,
+    role: discord.Role,
+    emoji: str = "",
+) -> None:
+    slot = next((s for s in CLAN_SLOTS if s.role_id == role.id), None)
+    if slot is None:
+        await interaction.response.send_message(
+            f"\u274C **{role.name}** is not a configured clan role. "
+            f"Configured slots: "
+            + ", ".join(
+                f"{s.slot}={s.clan_name}" for s in CLAN_SLOTS if s.clan_name
+            ),
+            ephemeral=True,
+        )
+        return
+
+    normalized = _normalize_emoji_input(emoji)
+    if normalized is None:
+        await interaction.response.send_message(
+            "\u274C Invalid emoji. Use a custom emoji like `<:name:1234567890>` "
+            "or a unicode emoji.",
+            ephemeral=True,
+        )
+        return
+
+    slot.emoji = normalized or None
+    env_key = f"CLAN_ROLE_{slot.slot}_EMOJI"
+    os.environ[env_key] = normalized
+
+    persisted = False
+    try:
+        persisted = _update_env_clan_slots(CLAN_SLOTS)
+    except Exception:
+        logger.exception("Failed to persist %s to %s", env_key, ENV_FILE_PATH)
+
+    display = normalized if normalized else "*(cleared)*"
+    suffix = "" if persisted else " (in-memory only — `.env` not writable)"
+    await interaction.response.send_message(
+        f"\u2705 Slot **{slot.slot}** ({slot.clan_name}) emoji \u2192 {display}{suffix}",
+        ephemeral=True,
+    )
 
 
 if __name__ == "__main__":
