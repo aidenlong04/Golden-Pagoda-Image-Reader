@@ -567,19 +567,36 @@ def _ocr_via_api(
     return text, words
 
 
-def _ocr(
-    image_bytes: bytes, filename: str, content_type: str
+def _ocr_via_tesseract(
+    image_bytes: bytes,
 ) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]]:
-    if OCR_API_KEY:
-        return _ocr_via_api(image_bytes, filename, content_type)
     if pytesseract is None:
-        raise RuntimeError(
-            "No OCR backend available: set OCR_API_KEY or install pytesseract."
-        )
+        raise RuntimeError("pytesseract not installed")
     text = pytesseract.image_to_string(
         Image.open(io.BytesIO(image_bytes)), config=TESSERACT_CONFIG
     )
     return text, []
+
+
+def _ocr(
+    image_bytes: bytes, filename: str, content_type: str
+) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]]:
+    if OCR_API_KEY:
+        try:
+            return _ocr_via_api(image_bytes, filename, content_type)
+        except Exception as api_err:
+            if pytesseract is None:
+                raise
+            logger.warning(
+                "OCR.space failed (%s); falling back to local Tesseract",
+                api_err.__class__.__name__,
+            )
+            return _ocr_via_tesseract(image_bytes)
+    if pytesseract is None:
+        raise RuntimeError(
+            "No OCR backend available: set OCR_API_KEY or install pytesseract."
+        )
+    return _ocr_via_tesseract(image_bytes)
 
 
 _PROFILE_TOKEN_RE = re.compile(r"#\d{2,4}")
