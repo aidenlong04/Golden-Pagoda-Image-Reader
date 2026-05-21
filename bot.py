@@ -1408,10 +1408,7 @@ def _status_components(interaction: discord.Interaction, page: int) -> list[dict
     snap = analytics.summary()  # cheap; reused for stats pages, ignored for live ones
     header = {
         "type": 10,
-        "content": (
-            f"### \U0001F4CA  Status \u2014 {title}\n"
-            f"-# Page {page + 1}/{len(_STATUS_PAGES)}"
-        ),
+        "content": f"### \U0001F4CA  Status \u2014 {title}",
     }
     nav_buttons = [
         {"type": 2, "style": 2, "label": "\u25C0 Prev",
