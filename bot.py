@@ -1142,6 +1142,20 @@ async def on_message(message: discord.Message) -> None:
     platform, platform_scores = detect_platform(image, anchor_bbox)
 
     if not profile_name or not platform:
+        # Log a compact OCR snippet + which fields we did/didn't parse so
+        # failures can be diagnosed without having to reach into the
+        # screenshot. ocr_text is truncated to keep journal lines bounded.
+        snippet = " ".join(ocr_text.split())[:240]
+        logger.warning(
+            "Unreadable: engine=%s profile=%r clan=%r mastery=%r platform=%r scores=%s ocr=%r",
+            ocr_engine,
+            profile_name,
+            clan_name,
+            mastery_rank,
+            platform,
+            platform_scores,
+            snippet,
+        )
         analytics.record_verification(
             outcome="unreadable",
             platform=platform,
