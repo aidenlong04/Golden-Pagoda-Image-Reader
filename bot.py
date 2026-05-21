@@ -722,7 +722,7 @@ def _fail_components(headline: str, reason: str, *, image_url: str | None = None
         "content": f"### \u274C  Verification Failed\n-# {headline}",
     }
     children: list[dict] = [
-        {"type": 10, "content": reason},
+        {"type": 10, "content": f"-# {reason}"},
     ]
     if image_url:
         children.append(
@@ -748,10 +748,10 @@ def _incomplete_components(reason: str, *, image_url: str | None = None) -> list
         "content": "### \u26A0\uFE0F  Verification Incomplete\n-# Manual review required",
     }
     children: list[dict] = [
-        {"type": 10, "content": reason},
+        {"type": 10, "content": f"-# {reason}"},
         {
             "type": 10,
-            "content": f"{outreach} will reach out to verify.",
+            "content": f"-# {outreach} will reach out to verify.",
         },
     ]
     if image_url:
