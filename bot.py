@@ -1262,7 +1262,12 @@ def _status_page_bot(interaction: discord.Interaction) -> str:
     latency_ms = int(client.latency * 1000) if client.latency >= 0 else -1
     uptime = _fmt_uptime(time.time() - BOT_START_TIME)
     hb = _health_age()
-    hb_line = f"{hb}s ago" if hb is not None else "*missing*"
+    if hb is None:
+        hb_line = "\u26A0\uFE0F unhealthy (no signal)"
+    elif hb > 90:
+        hb_line = f"\u274C unhealthy ({hb}s stale)"
+    else:
+        hb_line = f"\u2705 healthy ({hb}s ago)"
     guilds = len(client.guilds)
     members = sum(g.member_count or 0 for g in client.guilds)
     return (
