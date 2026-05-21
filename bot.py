@@ -719,7 +719,7 @@ def _pass_components(
 def _fail_components(headline: str, reason: str, *, image_url: str | None = None) -> list[dict]:
     header = {
         "type": 10,
-        "content": f"### \u274C  Verification Failed\n-# > {headline}",
+        "content": f"### \u274C  Verification Failed\n-# {headline}",
     }
     children: list[dict] = [
         {"type": 10, "content": reason},
@@ -745,7 +745,7 @@ def _incomplete_components(reason: str, *, image_url: str | None = None) -> list
     outreach = " / ".join(f"<@&{rid}>" for rid in OUTREACH_ROLE_IDS) or "staff"
     header = {
         "type": 10,
-        "content": "### \u26A0\uFE0F  Verification Incomplete\n-# > Manual review required",
+        "content": "### \u26A0\uFE0F  Verification Incomplete\n-# Manual review required",
     }
     children: list[dict] = [
         {"type": 10, "content": reason},
