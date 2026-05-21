@@ -63,6 +63,8 @@ def _int_env(name: str, default: int = 0) -> int:
 
 
 TARGET_CHANNEL_ID = _int_env("TARGET_CHANNEL_ID")
+GUILD_ID = _int_env("GUILD_ID", 1361846841905381629)
+PASS_INFO_CHANNEL_ID = _int_env("PASS_INFO_CHANNEL_ID", 1392582268769271950)
 
 # Platform name → list of acceptable Discord role-name aliases (case-insensitive).
 PLATFORM_ROLE_ALIASES: dict[str, tuple[str, ...]] = {
@@ -699,6 +701,7 @@ def _pass_components(
     *,
     clan_emoji: str | None = None,
     mastery_rank: str | None = None,
+    link_buttons: list[tuple[str, str]] | None = None,
 ) -> list[dict]:
     emoji = (clan_emoji or "").strip() or CLAN_EMOJI
     display_clan = _strip_clan_tag(clan) if clan else None
@@ -713,7 +716,65 @@ def _pass_components(
     if mastery_rank:
         inner_lines.append(f"-# > {mastery_rank}")
     inner = "\n".join(inner_lines)
-    return [header, _container(ACCENT_PASS, inner)]
+    container_children: list[dict] = [{"type": 10, "content": inner}]
+    if link_buttons:
+        container_children.append(
+            {
+                "type": 1,
+                "components": [
+                    {"type": 2, "style": 5, "label": label, "url": url}
+                    for label, url in link_buttons[:5]
+                ],
+            }
+        )
+    container = {
+        "type": 17,
+        "accent_color": ACCENT_PASS,
+        "components": container_children,
+    }
+    return [header, container]
+
+
+def _channel_url(guild_id: int, channel_id: int) -> str:
+    return f"https://discord.com/channels/{guild_id}/{channel_id}"
+
+
+def _resolve_pass_link_buttons(
+    guild: discord.Guild | None, clan_name: str | None
+) -> list[tuple[str, str]]:
+    """Return [(label, url), ...] for pass response buttons:
+    1. Clan general chat — found by matching the clan's category and a 'general' channel.
+    2. Info channel — PASS_INFO_CHANNEL_ID (label = its channel name).
+    """
+    buttons: list[tuple[str, str]] = []
+    if guild is None:
+        return buttons
+
+    if clan_name:
+        clean = _strip_clan_tag(clan_name).lower().strip()
+        category = next(
+            (c for c in guild.categories if clean and clean in c.name.lower()),
+            None,
+        )
+        if category is not None:
+            general = next(
+                (
+                    ch
+                    for ch in category.text_channels
+                    if "general" in ch.name.lower()
+                ),
+                None,
+            )
+            if general is not None:
+                buttons.append(
+                    ("Clan General Chat", _channel_url(guild.id, general.id))
+                )
+
+    info = guild.get_channel(PASS_INFO_CHANNEL_ID)
+    if info is not None:
+        label = f"#{info.name}"
+        buttons.append((label, _channel_url(guild.id, info.id)))
+    return buttons
 
 
 def _fail_components(headline: str, reason: str, *, image_url: str | None = None) -> list[dict]:
@@ -960,6 +1021,7 @@ async def on_message(message: discord.Message) -> None:
                 profile_name, platform, clan_name, role_lines,
                 clan_emoji=clan_emoji,
                 mastery_rank=mastery_rank,
+                link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
             ),
         )
     else:
@@ -1070,6 +1132,7 @@ async def preview_responses(interaction: discord.Interaction) -> None:
             [],
             clan_emoji=sample_emoji,
             mastery_rank="MR 30",
+            link_buttons=_resolve_pass_link_buttons(interaction.guild, sample_clan),
         ),
         _fail_components(
             "Profile name not found",
