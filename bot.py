@@ -1141,7 +1141,11 @@ async def on_message(message: discord.Message) -> None:
     anchor_bbox = _profile_name_bbox(ocr_words) if profile_name else None
     platform, platform_scores = detect_platform(image, anchor_bbox)
 
-    if not profile_name or not platform:
+    # TEMP: platform detection is flaky on downscaled / noisy uploads.
+    # If we have a profile name AND a clan name, accept the verification
+    # without a platform role rather than blocking the user. The clan role
+    # is the more important assignment for community use.
+    if not profile_name or (not platform and not clan_name):
         # Log a compact OCR snippet + which fields we did/didn't parse so
         # failures can be diagnosed without having to reach into the
         # screenshot. ocr_text is truncated to keep journal lines bounded.
@@ -1183,13 +1187,21 @@ async def on_message(message: discord.Message) -> None:
     issues: list[str] = []
     passed = True
 
-    role = _find_platform_role(message.guild, platform)
-    if role is None:
-        issues.append(f"No role for platform **{platform}**.")
-        passed = False
+    if platform is None:
+        # TEMP fallback: platform detection failed but clan was readable.
+        # Skip platform role assignment instead of blocking the user.
+        logger.info(
+            "Passing without platform role (clan=%r, profile=%r)", clan_name, profile_name
+        )
+        role_lines.append("Platform: skipped (icon not detected)")
     else:
-        _, status = await _add_role(member, role, "Screenshot platform verification")
-        role_lines.append(f"Platform: {status}")
+        role = _find_platform_role(message.guild, platform)
+        if role is None:
+            issues.append(f"No role for platform **{platform}**.")
+            passed = False
+        else:
+            _, status = await _add_role(member, role, "Screenshot platform verification")
+            role_lines.append(f"Platform: {status}")
 
     clan_emoji: str | None = None
     if clan_name:
