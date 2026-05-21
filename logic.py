@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +15,8 @@ try:  # optional — only needed for the lazy icon downloader
     import requests  # type: ignore
 except ImportError:  # pragma: no cover
     requests = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 
 # --- Profile name -----------------------------------------------------------
@@ -101,18 +106,20 @@ ALL_PLATFORMS = (
     PLATFORM_MOBILE,
 )
 
-# Reference icons from the Warframe wiki MMF symbol set (xWhite variants).
+# Reference icons from the Warframe wiki MMF symbol set (brand-colored variants).
 # Cross-Play icon is intentionally excluded.
 PLATFORM_ICON_URLS: dict[str, str] = {
-    PLATFORM_PC: "https://wiki.warframe.com/w/Special:FilePath/IconWindows(xWhite).png",
-    PLATFORM_XBOX: "https://wiki.warframe.com/w/Special:FilePath/IconXbox(xWhite).png",
-    PLATFORM_PLAYSTATION: "https://wiki.warframe.com/w/Special:FilePath/IconPlaystation(xWhite).png",
-    PLATFORM_SWITCH: "https://wiki.warframe.com/w/Special:FilePath/IconSwitch(xWhite).png",
-    PLATFORM_MOBILE: "https://wiki.warframe.com/w/Special:FilePath/IconApple(xWhite).png",
+    PLATFORM_PC: "https://wiki.warframe.com/w/Special:FilePath/IconWindows.png",
+    PLATFORM_XBOX: "https://wiki.warframe.com/w/Special:FilePath/IconXbox.png",
+    PLATFORM_PLAYSTATION: "https://wiki.warframe.com/w/Special:FilePath/IconPlaystation.png",
+    PLATFORM_SWITCH: "https://wiki.warframe.com/w/Special:FilePath/IconSwitch.png",
+    PLATFORM_MOBILE: "https://wiki.warframe.com/w/Special:FilePath/IconApple.png",
 }
 
 _DEFAULT_ICON_DIR = Path(os.getenv("PLATFORM_ICON_DIR", "icons"))
 _REFERENCE_CACHE: dict[str, Image.Image] | None = None
+_REFERENCE_FEATURES: dict[str, dict] | None = None
+_PLATFORM_DEBUG_DIR = os.getenv("PLATFORM_DEBUG_DIR")
 
 
 def load_default_references(
@@ -133,7 +140,7 @@ def load_default_references(
 
     icons: dict[str, Image.Image] = {}
     for key, url in PLATFORM_ICON_URLS.items():
-        path = target_dir / f"{key}.png"
+        path = target_dir / f"{key}.colored.png"
         if not path.exists():
             if requests is None:
                 continue
@@ -210,6 +217,205 @@ def _icon_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
     )
 
 
+def _binarize_and_crop(
+    img: Image.Image, size: tuple[int, int] = (32, 32)
+) -> tuple[list[int], int]:
+    """Binarize an image, tight-crop to the bounding box, resize, and return mask + count."""
+    rgba = img.convert("RGBA")
+    px = rgba.load()
+    w, h = rgba.size
+    mask_img = Image.new("1", (w, h), 0)
+    mask_px = mask_img.load()
+    fg_count = 0
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = px[x, y]
+            if max(r, g, b) >= 60 and a >= 128:
+                mask_px[x, y] = 1
+                fg_count += 1
+    bbox = mask_img.getbbox()
+    if bbox is None:
+        resized = mask_img.resize(size, Image.NEAREST)
+    else:
+        cropped = mask_img.crop(bbox)
+        resized = cropped.resize(size, Image.NEAREST)
+    return list(resized.getdata()), fg_count
+
+
+def _iou(mask_a: list[int], mask_b: list[int]) -> float:
+    """Compute Intersection over Union of two binary masks."""
+    if len(mask_a) != len(mask_b):
+        return 0.0
+    intersection = sum(1 for a, b in zip(mask_a, mask_b, strict=True) if a and b)
+    union = sum(1 for a, b in zip(mask_a, mask_b, strict=True) if a or b)
+    return intersection / union if union > 0 else 0.0
+
+
+def _extract_reference_features(
+    references: dict[str, Image.Image]
+) -> dict[str, dict]:
+    """Extract binarized mask for each reference icon."""
+    features: dict[str, dict] = {}
+    for key, ref in references.items():
+        mask, fg_count = _binarize_and_crop(ref, size=(32, 32))
+        features[key] = {
+            "mask": mask,
+            "fg_count": fg_count,
+        }
+    return features
+
+
+def _score_candidate(
+    candidate_crop: Image.Image, features: dict[str, dict]
+) -> tuple[str | None, dict[str, float]]:
+    """Score a candidate icon ROI against all reference features."""
+    cw, ch = candidate_crop.size
+    if cw * ch < 100:
+        return None, {p: 0.0 for p in features}
+    cand_mask, cand_fg = _binarize_and_crop(candidate_crop, size=(32, 32))
+    if cand_fg < 50:
+        return None, {p: 0.0 for p in features}
+    hsv = candidate_crop.convert("HSV")
+    rgb = candidate_crop.convert("RGB")
+    hsv_px = hsv.load()
+    rgb_px = rgb.load()
+    cw, ch = hsv.size
+    
+    cand_sat_sum = 0
+    cand_sat_pixels = 0
+    platform_color_counts = {p: 0 for p in ALL_PLATFORMS}
+    white_pixel_count = 0
+    
+    for y in range(ch):
+        for x in range(cw):
+            h_val, s, v = hsv_px[x, y]
+            if s >= 80:
+                cand_sat_sum += s
+                cand_sat_pixels += 1
+                hue = (h_val / 255.0) * 360.0
+                r, g, b = rgb_px[x, y]
+                platform = _classify_platform_color(h_val, s, v, r, g, b)
+                if platform:
+                    platform_color_counts[platform] += 1
+            elif s < 50 and v >= 200:
+                white_pixel_count += 1
+    
+    cand_mean_sat = cand_sat_sum / cand_sat_pixels if cand_sat_pixels > 0 else 0
+    
+    if cand_mean_sat >= 80:
+        color_weight, shape_weight = 0.70, 0.30
+    else:
+        color_weight, shape_weight = 0.30, 0.70
+    
+    total_pixels = cw * ch
+    scores: dict[str, float] = {}
+    for platform, feat in features.items():
+        iou = _iou(cand_mask, feat["mask"])
+        
+        color_pixel_count = platform_color_counts.get(platform, 0)
+        
+        if white_pixel_count > color_pixel_count and platform in (PLATFORM_PC, PLATFORM_MOBILE):
+            color_pixel_count += white_pixel_count
+        
+        color_score = color_pixel_count / total_pixels if total_pixels > 0 else 0.0
+        
+        fused = color_weight * color_score + shape_weight * iou
+        scores[platform] = fused
+    
+    sorted_platforms = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    if not sorted_platforms:
+        return None, scores
+    
+    best_platform, best_score = sorted_platforms[0]
+    
+    if best_score < 0.45:
+        return None, scores
+    
+    if len(sorted_platforms) > 1:
+        runner_up_score = sorted_platforms[1][1]
+        if best_score - runner_up_score < 0.15:
+            return None, scores
+    
+    return best_platform, scores
+
+
+def _candidate_rois(
+    image: Image.Image, anchor_bbox: tuple[int, int, int, int] | None = None
+) -> list[Image.Image]:
+    """Extract candidate icon ROIs from title bar or near anchor."""
+    candidates: list[Image.Image] = []
+    
+    bbox = _icon_bbox(image)
+    if bbox is not None:
+        candidates.append(image.convert("RGBA").crop(bbox))
+    
+    if anchor_bbox is not None:
+        rgb = image.convert("RGB")
+        iw, ih = rgb.size
+        left, top, right, bottom = anchor_bbox
+        h = max(8, bottom - top)
+        pad_y = max(2, h // 4)
+        y0 = max(0, top - pad_y)
+        y1 = min(ih, bottom + pad_y)
+        box_w = max(h, 24)
+        
+        anchor_candidates: list[tuple[int, int, int, int]] = []
+        if left - 4 > 0:
+            anchor_candidates.append((max(0, left - box_w - 8), y0, max(0, left - 2), y1))
+        if right + 4 < iw:
+            anchor_candidates.append((min(iw, right + 2), y0, min(iw, right + box_w + 8), y1))
+        
+        for cx0, cy0, cx1, cy1 in anchor_candidates:
+            if cx1 - cx0 >= 6 and cy1 - cy0 >= 6:
+                candidates.append(rgb.crop((cx0, cy0, cx1, cy1)))
+    
+    return candidates
+
+
+def detect_platform(
+    image: Image.Image, anchor_bbox: tuple[int, int, int, int] | None = None
+) -> tuple[str | None, dict[str, float]]:
+    """Unified platform detection returning (platform, scores_dict)."""
+    if image is None:
+        return None, {}
+    
+    global _REFERENCE_FEATURES
+    references = load_default_references()
+    if not references:
+        return None, {}
+    
+    if _REFERENCE_FEATURES is None:
+        _REFERENCE_FEATURES = _extract_reference_features(references)
+    
+    candidates = _candidate_rois(image, anchor_bbox)
+    
+    best_platform: str | None = None
+    best_scores: dict[str, float] = {}
+    best_score_value = -1.0
+    winning_roi: Image.Image | None = None
+    
+    for candidate in candidates:
+        platform, scores = _score_candidate(candidate, _REFERENCE_FEATURES)
+        max_score = max(scores.values()) if scores else 0.0
+        if platform and max_score > best_score_value:
+            best_platform = platform
+            best_scores = scores
+            best_score_value = max_score
+            winning_roi = candidate
+    
+    if _PLATFORM_DEBUG_DIR and winning_roi:
+        try:
+            debug_path = Path(_PLATFORM_DEBUG_DIR)
+            debug_path.mkdir(parents=True, exist_ok=True)
+            ts = int(time.time() * 1000)
+            filename = f"{ts}_{best_platform or 'none'}_{best_score_value:.3f}.png"
+            winning_roi.save(debug_path / filename)
+        except Exception:
+            logger.exception("Failed to save debug icon ROI")
+    
+    return best_platform, best_scores
+
+
 def _silhouette(image: Image.Image, size: tuple[int, int]) -> list[int]:
     """Return a binary silhouette (0/1 per pixel) of the icon at the given size."""
     img = image.convert("RGBA").resize(size, Image.LANCZOS)
@@ -235,104 +441,24 @@ def detect_platform_from_image(
     image: Image.Image,
     references: dict[str, Image.Image] | None = None,
 ) -> str | None:
-    """Detect platform by matching the title-bar icon against reference icons.
+    """Legacy shim: detect platform by matching title-bar icon against references.
 
-    By default the wiki MMF icons are auto-loaded (and cached) and used for
-    silhouette template-matching. Pass ``references={}`` to force the
-    hue-based fallback only.
+    Now delegates to detect_platform(). The references parameter is ignored.
     """
-    if image is None:
-        return None
-
-    if references is None:
-        references = load_default_references()
-
-    bbox = _icon_bbox(image)
-    if bbox is None:
-        return _color_fallback(image)
-
-    candidate = image.convert("RGBA").crop(bbox)
-    cw, ch = candidate.size
-    if cw < 6 or ch < 6:
-        return _color_fallback(image)
-
-    if references:
-        size = (32, 32)
-        cand_sil = _silhouette(candidate, size)
-        scores: dict[str, float] = {}
-        for key, ref in references.items():
-            scores[key] = _silhouette_score(cand_sil, _silhouette(ref, size))
-        
-        sorted_platforms = sorted(scores.items(), key=lambda x: x[1])
-        if not sorted_platforms:
-            return _color_fallback(image)
-        
-        best_key, best_score = sorted_platforms[0]
-        
-        per_platform_thresholds = {
-            PLATFORM_PLAYSTATION: 0.20,
-            PLATFORM_SWITCH: 0.22,
-            PLATFORM_PC: 0.25,
-            PLATFORM_XBOX: 0.25,
-            PLATFORM_MOBILE: 0.25,
-        }
-        threshold = per_platform_thresholds.get(best_key, 0.25)
-        
-        if best_score <= threshold:
-            if len(sorted_platforms) > 1:
-                second_score = sorted_platforms[1][1]
-                if second_score - best_score < 0.08:
-                    return _color_fallback(image)
-            return best_key
-
-    return _color_fallback(image)
+    platform, _ = detect_platform(image, anchor_bbox=None)
+    return platform
 
 
 def detect_platform_near_anchor(
     image: Image.Image,
     anchor_bbox: tuple[int, int, int, int],
 ) -> str | None:
-    """Detect platform by classifying icon pixels adjacent to a known anchor.
+    """Legacy shim: detect platform near a known OCR anchor.
 
-    ``anchor_bbox`` is the (left, top, right, bottom) of the OCR'd profile-name
-    word. The Warframe profile shows the platform icon immediately to the left
-    of the player handle; some layouts place it on the right. We probe both
-    sides and pick whichever yields more saturated brand-coloured pixels.
+    Now delegates to detect_platform().
     """
-    if image is None:
-        return None
-    rgb = image.convert("RGB")
-    iw, ih = rgb.size
-    if iw == 0 or ih == 0:
-        return None
-
-    left, top, right, bottom = anchor_bbox
-    h = max(8, bottom - top)
-    pad_y = max(2, h // 4)
-    y0 = max(0, top - pad_y)
-    y1 = min(ih, bottom + pad_y)
-    box_w = max(h, 24)  # icon is roughly square at line height
-
-    candidates: list[tuple[int, int, int, int]] = []
-    if left - 4 > 0:
-        candidates.append((max(0, left - box_w - 8), y0, max(0, left - 2), y1))
-    if right + 4 < iw:
-        candidates.append((min(iw, right + 2), y0, min(iw, right + box_w + 8), y1))
-
-    best_platform: str | None = None
-    best_score = 0
-    for cx0, cy0, cx1, cy1 in candidates:
-        if cx1 - cx0 < 6 or cy1 - cy0 < 6:
-            continue
-        crop = rgb.crop((cx0, cy0, cx1, cy1))
-        platform, score = _vote_platform_color(crop)
-        if platform is not None and score > best_score:
-            best_platform = platform
-            best_score = score
-
-    if best_platform is not None and best_score >= 8:
-        return best_platform
-    return None
+    platform, _ = detect_platform(image, anchor_bbox)
+    return platform
 
 
 def _vote_platform_color(crop: Image.Image) -> tuple[str | None, int]:

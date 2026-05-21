@@ -29,8 +29,7 @@ except ImportError:
 
 from logic import (
     ClanSlot,
-    detect_platform_from_image,
-    detect_platform_near_anchor,
+    detect_platform,
     find_clan_slot,
     load_default_references,
     parse_clan_name,
@@ -1032,11 +1031,7 @@ async def on_message(message: discord.Message) -> None:
     mastery_rank = parse_mastery_rank(ocr_text)
 
     anchor_bbox = _profile_name_bbox(ocr_words) if profile_name else None
-    platform: str | None = None
-    if anchor_bbox is not None:
-        platform = detect_platform_near_anchor(image, anchor_bbox)
-    if platform is None:
-        platform = detect_platform_from_image(image, PLATFORM_ICONS or None)
+    platform, platform_scores = detect_platform(image, anchor_bbox)
 
     if not profile_name or not platform:
         analytics.record_verification(
@@ -1047,6 +1042,7 @@ async def on_message(message: discord.Message) -> None:
             ocr_latency_ms=ocr_latency_ms,
             user_id=message.author.id,
             guild_id=message.guild.id,
+            platform_scores=platform_scores,
         )
         await _fail(
             message,
@@ -1114,6 +1110,7 @@ async def on_message(message: discord.Message) -> None:
         ocr_latency_ms=ocr_latency_ms,
         user_id=member.id,
         guild_id=message.guild.id,
+        platform_scores=platform_scores,
     )
 
 

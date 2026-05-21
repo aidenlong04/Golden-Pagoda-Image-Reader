@@ -79,6 +79,15 @@ def _init() -> None:
                 """
             )
             conn.commit()
+            
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+            if "platform_scores" not in columns:
+                try:
+                    conn.execute("ALTER TABLE events ADD COLUMN platform_scores TEXT")
+                    conn.commit()
+                    logger.info("analytics: added platform_scores column")
+                except Exception:
+                    logger.warning("analytics: failed to add platform_scores column", exc_info=True)
         _initialized = True
     except Exception:
         logger.exception("analytics: init failed; disabling")
@@ -94,6 +103,7 @@ def record_verification(
     ocr_latency_ms: int | None = None,
     user_id: int | None = None,
     guild_id: int | None = None,
+    platform_scores: dict | None = None,
 ) -> None:
     if _disabled:
         return
@@ -102,11 +112,12 @@ def record_verification(
         if _disabled:
             return
         try:
+            scores_json = json.dumps(platform_scores, sort_keys=True) if platform_scores else None
             with _connect() as conn:
                 conn.execute(
                     "INSERT INTO events"
-                    "(ts, outcome, platform, clan, ocr_engine, ocr_latency_ms, user_id, guild_id)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(ts, outcome, platform, clan, ocr_engine, ocr_latency_ms, user_id, guild_id, platform_scores)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         int(time.time()),
                         outcome,
@@ -116,6 +127,7 @@ def record_verification(
                         ocr_latency_ms,
                         user_id,
                         guild_id,
+                        scores_json,
                     ),
                 )
                 conn.commit()

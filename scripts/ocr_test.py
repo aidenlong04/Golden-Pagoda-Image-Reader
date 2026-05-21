@@ -17,9 +17,10 @@ try:
 except ImportError:
     pass
 
-from logic import detect_platform_from_image, parse_clan_name, parse_profile_name
+from logic import detect_platform_from_image, detect_platform, parse_clan_name, parse_profile_name
 
 MESSAGE_ID = int(sys.argv[1]) if len(sys.argv) > 1 else 1506665856632094902
+SHOW_PLATFORM_SCORES = "--platform-scores" in sys.argv
 CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID", "0"))
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 
@@ -83,7 +84,12 @@ async def main() -> None:
             print(f"clan_name:    {parse_clan_name(text)!r}")
             try:
                 img = Image.open(io.BytesIO(data))
-                print(f"platform:     {detect_platform_from_image(img)!r}")
+                if SHOW_PLATFORM_SCORES:
+                    platform, scores = detect_platform(img)
+                    print(f"platform:     {platform!r}")
+                    print(f"scores:       {scores}")
+                else:
+                    print(f"platform:     {detect_platform_from_image(img)!r}")
             except Exception as e:
                 print(f"platform detection failed: {e}")
         finally:
