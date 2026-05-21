@@ -16,6 +16,10 @@ WorkingDirectory=/opt/golden-pagoda
 ExecStartPre=-/usr/bin/docker rm -f golden-pagoda
 ExecStartPre=-/bin/mkdir -p /opt/golden-pagoda/data /opt/golden-pagoda/icons
 ExecStartPre=-/bin/chown -R 10001:10001 /opt/golden-pagoda/data
+# The bot rewrites .env in-place when /clan-emblems is used; the container
+# user (uid 10001) must own the file. Idempotent — fine if already correct.
+ExecStartPre=-/bin/chown 10001:10001 /opt/golden-pagoda/.env
+ExecStartPre=-/bin/chmod 0600 /opt/golden-pagoda/.env
 ExecStart=/usr/bin/docker run --rm --name golden-pagoda --init \
     --pull=never \
     --memory=512m --memory-swap=512m \
@@ -25,6 +29,8 @@ ExecStart=/usr/bin/docker run --rm --name golden-pagoda --init \
     --log-opt max-size=10m \
     --log-opt max-file=3 \
     --env-file /opt/golden-pagoda/.env \
+    -e ENV_FILE_PATH=/app/.env \
+    -v /opt/golden-pagoda/.env:/app/.env \
     -v /opt/golden-pagoda/icons:/app/icons \
     -v /opt/golden-pagoda/data:/app/data \
     golden-pagoda:latest
