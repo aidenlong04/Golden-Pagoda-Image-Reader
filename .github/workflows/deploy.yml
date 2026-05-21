@@ -42,15 +42,25 @@ jobs:
           ssh -i ~/.ssh/hetzner "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
             set -e
             cd /opt/golden-pagoda
+            sudo mkdir -p /opt/golden-pagoda/data /opt/golden-pagoda/icons
+            # Daemon-wide log rotation defaults so any transient container is bounded.
+            if [ ! -f /etc/docker/daemon.json ]; then
+                echo "{\"log-driver\":\"json-file\",\"log-opts\":{\"max-size\":\"10m\",\"max-file\":\"3\"}}" \
+                    | sudo tee /etc/docker/daemon.json > /dev/null
+                sudo systemctl reload docker || sudo systemctl restart docker
+            fi
             sudo install -m 0644 scripts/golden-pagoda.service /etc/systemd/system/golden-pagoda.service
             sudo chmod +x scripts/golden-pagoda-watchdog.sh
             sudo install -m 0644 scripts/golden-pagoda-watchdog.service /etc/systemd/system/golden-pagoda-watchdog.service
             sudo install -m 0644 scripts/golden-pagoda-watchdog.timer /etc/systemd/system/golden-pagoda-watchdog.timer
             sudo systemctl daemon-reload
             sudo systemctl enable --now golden-pagoda-watchdog.timer
-            docker build -t golden-pagoda:latest . | tail -3
+            DOCKER_BUILDKIT=1 docker build -t golden-pagoda:latest . | tail -3
             sudo systemctl restart golden-pagoda
             sleep 5
             systemctl is-active golden-pagoda
             docker logs golden-pagoda --tail 20
+            # Reclaim build cache & dangling images (keeps disk healthy on CX22).
+            docker image prune -f >/dev/null
+            docker builder prune -f --filter until=24h >/dev/null || true
           '

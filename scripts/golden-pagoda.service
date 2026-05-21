@@ -8,13 +8,26 @@ Wants=network-online.target
 Type=simple
 Restart=always
 RestartSec=10
+# `docker stop` SIGKILLs the container after the grace period — exit 137 is
+# expected on `systemctl stop` and should not be treated as a failure.
+SuccessExitStatus=0 137 143
+TimeoutStopSec=20
 WorkingDirectory=/opt/golden-pagoda
 ExecStartPre=-/usr/bin/docker rm -f golden-pagoda
-ExecStart=/usr/bin/docker run --rm --name golden-pagoda \
+ExecStartPre=-/bin/mkdir -p /opt/golden-pagoda/data /opt/golden-pagoda/icons
+ExecStart=/usr/bin/docker run --rm --name golden-pagoda --init \
+    --pull=never \
+    --memory=512m --memory-swap=512m \
+    --cpus=1 \
+    --pids-limit=256 \
+    --log-driver=json-file \
+    --log-opt max-size=10m \
+    --log-opt max-file=3 \
     --env-file /opt/golden-pagoda/.env \
     -v /opt/golden-pagoda/icons:/app/icons \
+    -v /opt/golden-pagoda/data:/app/data \
     golden-pagoda:latest
-ExecStop=/usr/bin/docker stop golden-pagoda
+ExecStop=/usr/bin/docker stop -t 15 golden-pagoda
 
 [Install]
 WantedBy=multi-user.target

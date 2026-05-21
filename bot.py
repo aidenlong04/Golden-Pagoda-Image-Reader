@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import logging
 import os
@@ -35,6 +36,7 @@ from logic import (
     parse_mastery_rank,
     parse_profile_name,
 )
+import analytics
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -371,7 +373,7 @@ def _sync_clan_slots_from_guilds() -> None:
             if slot.clan_name:
                 want = _normalize(slot.clan_name)
                 role = discord.utils.find(
-                    lambda r: _normalize(r.name) == want, guild.roles
+                    lambda r, w=want: _normalize(r.name) == w, guild.roles
                 )
                 if role is not None:
                     resolved = role
@@ -543,7 +545,7 @@ def _profile_name_bbox(
             tail_bottom = words[idx][1][3]
             line_h = tail_bottom - tail_top
             for prev in reversed(words[:idx]):
-                ptext, pbbox = prev
+                _ptext, pbbox = prev
                 if abs(pbbox[1] - tail_top) > line_h:
                     break
                 if pbbox[2] < cluster[0][1][0] - line_h * 2:
@@ -716,7 +718,7 @@ def _pass_components(
     profile: str,
     platform: str | None,
     clan: str | None,
-    role_lines: list[str],  # noqa: ARG001 — kept for API parity / preview
+    role_lines: list[str],  # kept for API parity / preview
     *,
     clan_emoji: str | None = None,
     mastery_rank: str | None = None,
@@ -969,6 +971,8 @@ async def on_message(message: discord.Message) -> None:
         await _fail(message, "Invalid image", "Image could not be opened. Re-upload a valid PNG/JPG.")
         return
 
+    ocr_engine = "ocr.space" if OCR_API_KEY else ("tesseract" if pytesseract else "none")
+    ocr_started = time.monotonic()
     try:
         ocr_text_raw, ocr_words = _ocr(
             image_bytes,
@@ -978,8 +982,16 @@ async def on_message(message: discord.Message) -> None:
         ocr_text = ocr_text_raw.strip()
     except Exception:
         logger.exception("OCR failed for uploaded image")
+        analytics.record_verification(
+            outcome="ocr_error",
+            ocr_engine=ocr_engine,
+            ocr_latency_ms=int((time.monotonic() - ocr_started) * 1000),
+            user_id=message.author.id,
+            guild_id=message.guild.id,
+        )
         await _fail(message, "Not readable", "No text could be read. Upload a clearer screenshot.")
         return
+    ocr_latency_ms = int((time.monotonic() - ocr_started) * 1000)
 
     profile_name = parse_profile_name(ocr_text)
     clan_name = parse_clan_name(ocr_text)
@@ -993,6 +1005,15 @@ async def on_message(message: discord.Message) -> None:
         platform = detect_platform_from_image(image, PLATFORM_ICONS or None)
 
     if not profile_name or not platform:
+        analytics.record_verification(
+            outcome="unreadable",
+            platform=platform,
+            clan=clan_name,
+            ocr_engine=ocr_engine,
+            ocr_latency_ms=ocr_latency_ms,
+            user_id=message.author.id,
+            guild_id=message.guild.id,
+        )
         await _fail(
             message,
             "Profile not found",
@@ -1050,6 +1071,16 @@ async def on_message(message: discord.Message) -> None:
         await _add_incomplete_role(member)
         components = _incomplete_components(" ".join(issues))
         await _send_v2(message, components, mention_user=True, allow_role_mentions=True)
+
+    analytics.record_verification(
+        outcome="pass" if passed else "incomplete",
+        platform=platform,
+        clan=clan_name,
+        ocr_engine=ocr_engine,
+        ocr_latency_ms=ocr_latency_ms,
+        user_id=member.id,
+        guild_id=message.guild.id,
+    )
 
 
 # ---------- Slash commands --------------------------------------------------
@@ -1245,7 +1276,6 @@ def _status_page_bot(interaction: discord.Interaction) -> str:
 
 
 def _status_page_roles(interaction: discord.Interaction) -> str:
-    guild = interaction.guild
     lines = ["**Clan slots**"]
     for s in CLAN_SLOTS:
         name = s.clan_name or "*(unset)*"
@@ -1256,7 +1286,7 @@ def _status_page_roles(interaction: discord.Interaction) -> str:
 
     lines.append("")
     lines.append("**Platform roles**")
-    for plat, key in PLATFORM_ROLE_ID_ENV_KEYS.items():
+    for plat in PLATFORM_ROLE_ID_ENV_KEYS:
         rid = PLATFORM_ROLE_IDS.get(plat) or 0
         glyph = _platform_glyph(plat)
         mention = f"<@&{rid}>" if rid else "*(unset)*"
@@ -1385,10 +1415,8 @@ async def _interaction_callback(
             },
         },
     )
-    try:
+    with contextlib.suppress(AttributeError):
         interaction.response._responded = True  # type: ignore[attr-defined]
-    except AttributeError:
-        pass
 
 
 @tree.command(name="status", description="Show bot status (paginated, ephemeral).")
@@ -1405,30 +1433,204 @@ async def status_cmd(interaction: discord.Interaction) -> None:
             )
 
 
+# ---------- /stats (analytics) ---------------------------------------------
+
+
+def _fmt_age(ts: int | None) -> str:
+    if not ts:
+        return "*(none)*"
+    delta = max(0, int(time.time()) - int(ts))
+    if delta < 60:
+        return f"{delta}s ago"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    return f"{delta // 86400}d ago"
+
+
+def _fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 ** 2:
+        return f"{n / 1024:.1f} KiB"
+    return f"{n / 1024 ** 2:.1f} MiB"
+
+
+def _stats_page_overview(s: dict) -> str:
+    if not s.get("available"):
+        return (
+            "**Analytics**\n"
+            "-# Storage unavailable.\n"
+            f"-# DB path: `{s.get('db_path')}`\n"
+            "-# Mount `/opt/golden-pagoda/data:/app/data` to enable."
+        )
+    total = s["total"]
+    by = s["by_outcome"]
+    p = by.get("pass", 0)
+    f = by.get("fail", 0)
+    inc = by.get("incomplete", 0)
+    unr = by.get("unreadable", 0)
+    err = by.get("ocr_error", 0)
+    pct = lambda n: f"{(n / total * 100):.1f}%" if total else "-"  # noqa: E731
+
+    win = s["windows"]
+    return (
+        f"**Verifications**\n"
+        f"-# Total: `{total}`\n"
+        f"-# Pass: `{p}` ({pct(p)})\n"
+        f"-# Incomplete: `{inc}` ({pct(inc)})\n"
+        f"-# Fail: `{f}` ({pct(f)})\n"
+        f"-# Unreadable: `{unr}` ({pct(unr)})\n"
+        f"-# OCR error: `{err}` ({pct(err)})\n"
+        f"\n**Windows**\n"
+        f"-# Last 24h: `{win.get('24h', 0)}`\n"
+        f"-# Last 7d: `{win.get('7d', 0)}`\n"
+        f"-# Last 30d: `{win.get('30d', 0)}`\n"
+        f"-# First seen: {_fmt_age(s.get('first_ts'))}\n"
+        f"-# Last seen: {_fmt_age(s.get('last_ts'))}\n"
+        f"-# DB size: `{_fmt_bytes(s.get('db_size_bytes', 0))}`"
+    )
+
+
+def _stats_page_platforms(s: dict) -> str:
+    rows = s.get("by_platform") or []
+    if not rows:
+        return "**Platforms**\n-# No data yet."
+    lines = ["**Platforms**"]
+    for name, count in rows:
+        glyph = _platform_glyph(name) if name and name != "(unknown)" else "?"
+        lines.append(f"-# {glyph} `{name}` \u2014 `{count}`")
+    return "\n".join(lines)
+
+
+def _stats_page_clans(s: dict) -> str:
+    rows = s.get("by_clan") or []
+    if not rows:
+        return "**Clans**\n-# No data yet."
+    lines = ["**Clans (top 10)**"]
+    for name, count in rows:
+        slot = next((c for c in CLAN_SLOTS if c.clan_name and name and c.clan_name.lower() == name.lower()), None)
+        glyph = (slot.emoji if slot else "") or "\u2022"
+        lines.append(f"-# {glyph} `{name}` \u2014 `{count}`")
+    return "\n".join(lines)
+
+
+def _stats_page_ocr(s: dict) -> str:
+    ocr = s.get("ocr") or {}
+    engines = ocr.get("engines") or []
+    lines = ["**OCR latency** (last 500 events)"]
+    if ocr.get("samples"):
+        lines.append(f"-# Samples: `{ocr['samples']}`")
+        lines.append(f"-# Avg: `{ocr['avg_ms']} ms`")
+        lines.append(f"-# p50: `{ocr['p50_ms']} ms`")
+        lines.append(f"-# p95: `{ocr['p95_ms']} ms`")
+    else:
+        lines.append("-# No samples yet.")
+    lines.append("")
+    lines.append("**Engines**")
+    if engines:
+        for name, count in engines:
+            lines.append(f"-# `{name}` \u2014 `{count}`")
+    else:
+        lines.append("-# No data.")
+    return "\n".join(lines)
+
+
+_STATS_PAGES = [
+    ("\U0001F4C8 Overview", _stats_page_overview),
+    ("\U0001F3AE Platforms", _stats_page_platforms),
+    ("\U0001F3F0 Clans", _stats_page_clans),
+    ("\u23F1\uFE0F OCR", _stats_page_ocr),
+]
+
+
+def _stats_components(page: int) -> list[dict]:
+    page = max(0, min(page, len(_STATS_PAGES) - 1))
+    title, builder = _STATS_PAGES[page]
+    snap = analytics.summary()
+    body = builder(snap)
+    header = {
+        "type": 10,
+        "content": f"### \U0001F4CA  Stats \u2014 {title}\n-# Page {page + 1}/{len(_STATS_PAGES)}",
+    }
+    nav_buttons = [
+        {
+            "type": 2, "style": 2, "label": "\u25C0 Prev",
+            "custom_id": f"stats:{page - 1}", "disabled": page == 0,
+        },
+        {
+            "type": 2, "style": 2,
+            "label": f"{page + 1}/{len(_STATS_PAGES)}",
+            "custom_id": "stats:noop", "disabled": True,
+        },
+        {
+            "type": 2, "style": 2, "label": "Next \u25B6",
+            "custom_id": f"stats:{page + 1}",
+            "disabled": page >= len(_STATS_PAGES) - 1,
+        },
+        {
+            "type": 2, "style": 1, "label": "\U0001F504 Refresh",
+            "custom_id": f"stats:{page}",
+        },
+    ]
+    container = {
+        "type": 17,
+        "accent_color": ACCENT_PASS,
+        "components": [
+            {"type": 10, "content": body},
+            {"type": 1, "components": nav_buttons},
+        ],
+    }
+    return [header, container]
+
+
+@tree.command(name="stats", description="Show verification analytics (paginated, ephemeral).")
+@app_commands.default_permissions(manage_guild=True)
+async def stats_cmd(interaction: discord.Interaction) -> None:
+    components = _stats_components(0)
+    try:
+        await _interaction_callback(interaction, 4, components)
+    except Exception:
+        logger.exception("stats command failed")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "\u274C Failed to render stats.", ephemeral=True
+            )
+
+
 @client.event
 async def on_interaction(interaction: discord.Interaction) -> None:
     if interaction.type != discord.InteractionType.component:
         return
     data = interaction.data or {}
     custom_id = str(data.get("custom_id", ""))
-    if not custom_id.startswith("status:"):
+
+    if custom_id.startswith("status:"):
+        builder = _status_components
+        ctx_arg: tuple = (interaction,)
+    elif custom_id.startswith("stats:"):
+        builder = _stats_components  # type: ignore[assignment]
+        ctx_arg = ()
+    else:
         return
+
     parts = custom_id.split(":", 1)
     if len(parts) != 2 or parts[1] == "noop":
         try:
             await _interaction_callback(interaction, 6, [])  # DEFERRED_UPDATE
         except Exception:
-            logger.exception("status noop ack failed")
+            logger.exception("noop ack failed")
         return
     try:
         page = int(parts[1])
     except ValueError:
         return
-    components = _status_components(interaction, page)
+    components = builder(*ctx_arg, page)  # type: ignore[arg-type]
     try:
         await _interaction_callback(interaction, 7, components)  # UPDATE_MESSAGE
     except Exception:
-        logger.exception("status pagination failed")
+        logger.exception("pagination failed")
 
 
 if __name__ == "__main__":

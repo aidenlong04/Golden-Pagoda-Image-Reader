@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 from PIL import Image
 
@@ -226,7 +226,7 @@ def _silhouette(image: Image.Image, size: tuple[int, int]) -> list[int]:
 def _silhouette_score(a: list[int], b: list[int]) -> float:
     if not a or len(a) != len(b):
         return 1.0
-    diff = sum(1 for x, y in zip(a, b) if x != y)
+    diff = sum(1 for x, y in zip(a, b, strict=True) if x != y)
     return diff / len(a)
 
 

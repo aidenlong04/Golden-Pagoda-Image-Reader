@@ -23,8 +23,10 @@ RUN pip install -r requirements.txt
 
 COPY . .
 
-# Run as non-root.
-RUN useradd --create-home --uid 10001 bot && chown -R bot:bot /app
+# Run as non-root. /app/data is the analytics SQLite mount target.
+RUN useradd --create-home --uid 10001 bot \
+ && mkdir -p /app/data /app/icons \
+ && chown -R bot:bot /app
 USER bot
 
 # Container is healthy iff the bot updates /tmp/gp_heartbeat within the last 90s.
