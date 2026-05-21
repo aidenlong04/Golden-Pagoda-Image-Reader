@@ -40,6 +40,30 @@ A Discord bot that reads screenshot images in a specific channel and assigns rol
   `CLAN_CONFIG_PATH`). Requires Manage Roles.
 - `/listclans` — show the current 6-slot mapping.
 
+## Deployment (Hetzner / any Ubuntu VPS)
+
+The bot ships with a Docker image and a systemd unit. To deploy to a fresh
+Ubuntu 22.04/24.04 server:
+
+```bash
+./scripts/deploy_hetzner.sh root@<server-ip> ~/.ssh/hetzner
+```
+
+The script is idempotent — re-run it any time you push new code to redeploy.
+It will:
+
+1. Install Docker if missing.
+2. Rsync the repo (including `.env` and `icons/`) to `/opt/golden-pagoda`.
+3. Install the systemd unit at `/etc/systemd/system/golden-pagoda.service`.
+4. Build the Docker image and (re)start the service.
+
+To check status / logs on the server:
+
+```bash
+ssh root@<server-ip> systemctl status golden-pagoda
+ssh root@<server-ip> docker logs golden-pagoda --tail 100 -f
+```
+
 ## Notes
 
 - Requires Discord intents: message content, members.

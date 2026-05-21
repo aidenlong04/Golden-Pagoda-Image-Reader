@@ -1,0 +1,20 @@
+[Unit]
+Description=Golden Pagoda Discord verification bot
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+WorkingDirectory=/opt/golden-pagoda
+ExecStartPre=-/usr/bin/docker rm -f golden-pagoda
+ExecStart=/usr/bin/docker run --rm --name golden-pagoda \
+    --env-file /opt/golden-pagoda/.env \
+    -v /opt/golden-pagoda/icons:/app/icons \
+    golden-pagoda:latest
+ExecStop=/usr/bin/docker stop golden-pagoda
+
+[Install]
+WantedBy=multi-user.target
