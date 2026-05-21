@@ -18,10 +18,11 @@ jobs:
       - name: Set up SSH
         run: |
           mkdir -p ~/.ssh
-          # printf %s\n + tr fixes missing trailing newline / CRLF that
-          # GitHub's secrets UI sometimes introduces.
-          printf '%s\n' "${{ secrets.HETZNER_SSH_KEY }}" | tr -d '\r' > ~/.ssh/hetzner
+          # HETZNER_SSH_KEY is base64-encoded private key (avoids any
+          # whitespace/CRLF mangling by the GitHub secrets UI).
+          echo "${{ secrets.HETZNER_SSH_KEY }}" | base64 -d > ~/.ssh/hetzner
           chmod 600 ~/.ssh/hetzner
+          ssh-keygen -y -f ~/.ssh/hetzner > /dev/null  # validate
           ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts
 
       - name: Sync repo to server
