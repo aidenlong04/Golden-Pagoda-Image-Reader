@@ -43,7 +43,7 @@ jobs:
             set -e
             cd /opt/golden-pagoda
             sudo install -m 0644 scripts/golden-pagoda.service /etc/systemd/system/golden-pagoda.service
-            sudo install -m 0755 scripts/golden-pagoda-watchdog.sh /opt/golden-pagoda/scripts/golden-pagoda-watchdog.sh
+            sudo chmod +x scripts/golden-pagoda-watchdog.sh
             sudo install -m 0644 scripts/golden-pagoda-watchdog.service /etc/systemd/system/golden-pagoda-watchdog.service
             sudo install -m 0644 scripts/golden-pagoda-watchdog.timer /etc/systemd/system/golden-pagoda-watchdog.timer
             sudo systemctl daemon-reload
