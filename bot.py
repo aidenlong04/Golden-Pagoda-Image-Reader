@@ -962,7 +962,7 @@ def _resolve_pass_link_buttons(
                     ("Clan Chat", _channel_url(guild.id, general.id))
                 )
 
-    info = guild.get_channel(PASS_INFO_CHANNEL_ID)
+    info = guild.get_channel(PASS_EXTRA_CHANNEL_ID)
     if info is not None:
         label = f"#{info.name}"
         buttons.append((label, _channel_url(guild.id, info.id)))
