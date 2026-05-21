@@ -13,7 +13,7 @@ from pathlib import Path
 import discord
 import requests
 from discord import app_commands
-from PIL import Image
+from PIL import Image, ImageOps
 
 try:
     import pytesseract  # optional local fallback
@@ -522,7 +522,11 @@ def _shrink_for_ocr(
 
 
 def _ocr_via_api(
-    image_bytes: bytes, filename: str, content_type: str
+    image_bytes: bytes,
+    filename: str,
+    content_type: str,
+    *,
+    engine: str | None = None,
 ) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]]:
     image_bytes, filename, content_type = _shrink_for_ocr(
         image_bytes, filename, content_type
@@ -535,7 +539,7 @@ def _ocr_via_api(
                 OCR_API_URL,
                 headers={"apikey": OCR_API_KEY},
                 data={
-                    "OCREngine": OCR_ENGINE,
+                    "OCREngine": engine or OCR_ENGINE,
                     "language": OCR_LANGUAGE,
                     "scale": "true",
                     "isTable": "false",
@@ -585,14 +589,32 @@ def _ocr_via_api(
     return text, words
 
 
+def _preprocess_for_tesseract(image_bytes: bytes) -> Image.Image:
+    """Upscale + grayscale + autocontrast. Tesseract is dramatically more
+    accurate on Warframe's stylized UI font when the input is enlarged and
+    contrast-normalized first."""
+    img = Image.open(io.BytesIO(image_bytes))
+    if img.mode != "L":
+        img = ImageOps.grayscale(img)
+    # Upscale only when the source is modestly sized; very large screenshots
+    # are already legible and 2x would blow past Tesseract's memory budget.
+    if max(img.size) < 2400:
+        img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+    img = ImageOps.autocontrast(img, cutoff=2)
+    return img
+
+
 def _ocr_via_tesseract(
     image_bytes: bytes,
 ) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]]:
     if pytesseract is None:
         raise RuntimeError("pytesseract not installed")
-    text = pytesseract.image_to_string(
-        Image.open(io.BytesIO(image_bytes)), config=TESSERACT_CONFIG
-    )
+    try:
+        prepared = _preprocess_for_tesseract(image_bytes)
+    except Exception:
+        logger.exception("Tesseract preprocess failed; falling back to raw image")
+        prepared = Image.open(io.BytesIO(image_bytes))
+    text = pytesseract.image_to_string(prepared, config=TESSERACT_CONFIG)
     return text, []
 
 
@@ -611,12 +633,28 @@ def _ocr(
             _LAST_OCR_ENGINE = "ocr.space"
             return result
         except Exception as api_err:
-            if pytesseract is None:
-                raise
             logger.warning(
-                "OCR.space failed (%s); falling back to local Tesseract",
+                "OCR.space engine %s failed (%s); trying engine 2",
+                OCR_ENGINE,
                 api_err.__class__.__name__,
             )
+            # Engine 2 sometimes succeeds where engine 3 (multilang) 500s
+            # on the same upload. Skip the second attempt if we were already
+            # configured for engine 2.
+            if OCR_ENGINE != "2":
+                try:
+                    result = _ocr_via_api(
+                        image_bytes, filename, content_type, engine="2"
+                    )
+                    _LAST_OCR_ENGINE = "ocr.space:e2"
+                    return result
+                except Exception as api_err2:
+                    logger.warning(
+                        "OCR.space engine 2 also failed (%s); falling back to local Tesseract",
+                        api_err2.__class__.__name__,
+                    )
+            if pytesseract is None:
+                raise
             _LAST_OCR_ENGINE = "tesseract"
             return _ocr_via_tesseract(image_bytes)
     if pytesseract is None:
