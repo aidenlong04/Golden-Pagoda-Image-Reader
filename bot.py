@@ -922,17 +922,24 @@ def _resolve_pass_link_buttons(
                 [c.name for c in guild.categories],
             )
         else:
+            # Prefer channels named like a general/clan-chat hangout. Falls
+            # back to the first text channel in the category if no semantic
+            # match (so the button still works for non-standard setups).
+            keywords = ("general", "clan-chat", "clan chat", "chat", "lounge", "main", "hangout")
             general = next(
                 (
                     ch
+                    for kw in keywords
                     for ch in category.text_channels
-                    if "general" in ch.name.lower()
+                    if kw in ch.name.lower()
                 ),
                 None,
             )
+            if general is None and category.text_channels:
+                general = category.text_channels[0]
             if general is None:
                 logger.info(
-                    "Clan category %r matched but no #general channel found; available=%s",
+                    "Clan category %r matched but no chat channel found; available=%s",
                     category.name,
                     [ch.name for ch in category.text_channels],
                 )
