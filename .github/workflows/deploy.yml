@@ -18,7 +18,9 @@ jobs:
       - name: Set up SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.HETZNER_SSH_KEY }}" > ~/.ssh/hetzner
+          # printf %s\n + tr fixes missing trailing newline / CRLF that
+          # GitHub's secrets UI sometimes introduces.
+          printf '%s\n' "${{ secrets.HETZNER_SSH_KEY }}" | tr -d '\r' > ~/.ssh/hetzner
           chmod 600 ~/.ssh/hetzner
           ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts
 
