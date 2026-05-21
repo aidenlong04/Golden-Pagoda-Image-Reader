@@ -1335,50 +1335,42 @@ def _status_page_misc(interaction: discord.Interaction) -> str:
     )
 
 
-_STATUS_PAGES = [
-    ("\U0001F916 Bot", _status_page_bot),
-    ("\U0001F6E1\uFE0F Roles", _status_page_roles),
-    ("\U0001F4FA Channels", _status_page_channels),
-    ("\U0001F527 OCR / Misc", _status_page_misc),
+_STATUS_PAGES: list[tuple[str, str, str, callable]] = [  # type: ignore[type-arg]
+    ("bot",       "\U0001F916 Bot",          "Bot identity, latency, uptime.",  lambda i, _s: _status_page_bot(i)),
+    ("roles",     "\U0001F6E1\uFE0F Roles",  "Configured roles + slot map.",    lambda i, _s: _status_page_roles(i)),
+    ("channels",  "\U0001F4FA Channels",     "Target/info/preview channels.",   lambda i, _s: _status_page_channels(i)),
+    ("misc",      "\U0001F527 OCR / Misc",   "OCR backend, TTL, reactions.",    lambda i, _s: _status_page_misc(i)),
+    ("stats",     "\U0001F4C8 Stats",        "Verification totals + windows.",  lambda _i, s: _stats_page_overview(s)),
+    ("platforms", "\U0001F3AE Platforms",    "Verifications by platform.",      lambda _i, s: _stats_page_platforms(s)),
+    ("clans",     "\U0001F3F0 Clans",        "Top clans by verification.",      lambda _i, s: _stats_page_clans(s)),
+    ("ocr",       "\u23F1\uFE0F OCR Latency","OCR latency p50/p95/avg.",        lambda _i, s: _stats_page_ocr(s)),
 ]
+_STATUS_PAGE_INDEX: dict[str, int] = {key: idx for idx, (key, *_rest) in enumerate(_STATUS_PAGES)}
 
 
 def _status_components(interaction: discord.Interaction, page: int) -> list[dict]:
     page = max(0, min(page, len(_STATUS_PAGES) - 1))
-    title, builder = _STATUS_PAGES[page]
-    body = builder(interaction)
+    _key, title, _desc, builder = _STATUS_PAGES[page]
+    snap = analytics.summary()  # cheap; reused for stats pages, ignored for live ones
+    body = builder(interaction, snap)
     header = {
         "type": 10,
-        "content": f"### \U0001F4CA  Status \u2014 {title}\n-# Page {page + 1}/{len(_STATUS_PAGES)}",
+        "content": (
+            f"### \U0001F4CA  Status \u2014 {title}\n"
+            f"-# Page {page + 1}/{len(_STATUS_PAGES)}"
+        ),
     }
     nav_buttons = [
-        {
-            "type": 2,
-            "style": 2,
-            "label": "\u25C0 Prev",
-            "custom_id": f"status:{page - 1}",
-            "disabled": page == 0,
-        },
-        {
-            "type": 2,
-            "style": 2,
-            "label": f"{page + 1}/{len(_STATUS_PAGES)}",
-            "custom_id": "status:noop",
-            "disabled": True,
-        },
-        {
-            "type": 2,
-            "style": 2,
-            "label": "Next \u25B6",
-            "custom_id": f"status:{page + 1}",
-            "disabled": page >= len(_STATUS_PAGES) - 1,
-        },
-        {
-            "type": 2,
-            "style": 1,
-            "label": "\U0001F504 Refresh",
-            "custom_id": f"status:{page}",
-        },
+        {"type": 2, "style": 2, "label": "\u25C0 Prev",
+         "custom_id": f"status:{page - 1}", "disabled": page == 0},
+        {"type": 2, "style": 2,
+         "label": f"{page + 1}/{len(_STATUS_PAGES)}",
+         "custom_id": "status:noop", "disabled": True},
+        {"type": 2, "style": 2, "label": "Next \u25B6",
+         "custom_id": f"status:{page + 1}",
+         "disabled": page >= len(_STATUS_PAGES) - 1},
+        {"type": 2, "style": 1, "label": "\U0001F504 Refresh",
+         "custom_id": f"status:{page}"},
     ]
     container = {
         "type": 17,
@@ -1419,21 +1411,71 @@ async def _interaction_callback(
         interaction.response._responded = True  # type: ignore[attr-defined]
 
 
-@tree.command(name="status", description="Show bot status (paginated, ephemeral).")
-@app_commands.default_permissions(manage_guild=True)
-async def status_cmd(interaction: discord.Interaction) -> None:
-    components = _status_components(interaction, 0)
+async def _send_status_page(interaction: discord.Interaction, page: int) -> None:
+    components = _status_components(interaction, page)
     try:
         await _interaction_callback(interaction, 4, components)
     except Exception:
-        logger.exception("status command failed")
+        logger.exception("status page %s failed", page)
         if not interaction.response.is_done():
             await interaction.response.send_message(
                 "\u274C Failed to render status.", ephemeral=True
             )
 
 
-# ---------- /stats (analytics) ---------------------------------------------
+# /status as a command group with subcommands. Each subcommand jumps to a
+# specific page; pagination buttons walk through every page.
+status_group = app_commands.Group(
+    name="status",
+    description="Bot status & verification analytics (paginated, ephemeral).",
+    default_permissions=discord.Permissions(manage_guild=True),
+)
+
+
+def _register_status_subcommands() -> None:
+    for key, title, desc, _builder in _STATUS_PAGES:
+        page_idx = _STATUS_PAGE_INDEX[key]
+
+        async def _cmd(interaction: discord.Interaction, _idx: int = page_idx) -> None:
+            await _send_status_page(interaction, _idx)
+
+        # `description` must be plain ASCII <= 100 chars.
+        status_group.command(name=key, description=desc[:100])(_cmd)
+
+
+_register_status_subcommands()
+tree.add_command(status_group)
+
+
+@client.event
+async def on_interaction(interaction: discord.Interaction) -> None:
+    if interaction.type != discord.InteractionType.component:
+        return
+    data = interaction.data or {}
+    custom_id = str(data.get("custom_id", ""))
+
+    # Backwards-compatible: accept legacy "stats:N" buttons too.
+    if custom_id.startswith("stats:"):
+        custom_id = "status:" + custom_id.split(":", 1)[1]
+    if not custom_id.startswith("status:"):
+        return
+
+    parts = custom_id.split(":", 1)
+    if len(parts) != 2 or parts[1] == "noop":
+        try:
+            await _interaction_callback(interaction, 6, [])  # DEFERRED_UPDATE
+        except Exception:
+            logger.exception("noop ack failed")
+        return
+    try:
+        page = int(parts[1])
+    except ValueError:
+        return
+    components = _status_components(interaction, page)
+    try:
+        await _interaction_callback(interaction, 7, components)  # UPDATE_MESSAGE
+    except Exception:
+        logger.exception("pagination failed")
 
 
 def _fmt_age(ts: int | None) -> str:
@@ -1536,101 +1578,6 @@ def _stats_page_ocr(s: dict) -> str:
         lines.append("-# No data.")
     return "\n".join(lines)
 
-
-_STATS_PAGES = [
-    ("\U0001F4C8 Overview", _stats_page_overview),
-    ("\U0001F3AE Platforms", _stats_page_platforms),
-    ("\U0001F3F0 Clans", _stats_page_clans),
-    ("\u23F1\uFE0F OCR", _stats_page_ocr),
-]
-
-
-def _stats_components(page: int) -> list[dict]:
-    page = max(0, min(page, len(_STATS_PAGES) - 1))
-    title, builder = _STATS_PAGES[page]
-    snap = analytics.summary()
-    body = builder(snap)
-    header = {
-        "type": 10,
-        "content": f"### \U0001F4CA  Stats \u2014 {title}\n-# Page {page + 1}/{len(_STATS_PAGES)}",
-    }
-    nav_buttons = [
-        {
-            "type": 2, "style": 2, "label": "\u25C0 Prev",
-            "custom_id": f"stats:{page - 1}", "disabled": page == 0,
-        },
-        {
-            "type": 2, "style": 2,
-            "label": f"{page + 1}/{len(_STATS_PAGES)}",
-            "custom_id": "stats:noop", "disabled": True,
-        },
-        {
-            "type": 2, "style": 2, "label": "Next \u25B6",
-            "custom_id": f"stats:{page + 1}",
-            "disabled": page >= len(_STATS_PAGES) - 1,
-        },
-        {
-            "type": 2, "style": 1, "label": "\U0001F504 Refresh",
-            "custom_id": f"stats:{page}",
-        },
-    ]
-    container = {
-        "type": 17,
-        "accent_color": ACCENT_PASS,
-        "components": [
-            {"type": 10, "content": body},
-            {"type": 1, "components": nav_buttons},
-        ],
-    }
-    return [header, container]
-
-
-@tree.command(name="stats", description="Show verification analytics (paginated, ephemeral).")
-@app_commands.default_permissions(manage_guild=True)
-async def stats_cmd(interaction: discord.Interaction) -> None:
-    components = _stats_components(0)
-    try:
-        await _interaction_callback(interaction, 4, components)
-    except Exception:
-        logger.exception("stats command failed")
-        if not interaction.response.is_done():
-            await interaction.response.send_message(
-                "\u274C Failed to render stats.", ephemeral=True
-            )
-
-
-@client.event
-async def on_interaction(interaction: discord.Interaction) -> None:
-    if interaction.type != discord.InteractionType.component:
-        return
-    data = interaction.data or {}
-    custom_id = str(data.get("custom_id", ""))
-
-    if custom_id.startswith("status:"):
-        builder = _status_components
-        ctx_arg: tuple = (interaction,)
-    elif custom_id.startswith("stats:"):
-        builder = _stats_components  # type: ignore[assignment]
-        ctx_arg = ()
-    else:
-        return
-
-    parts = custom_id.split(":", 1)
-    if len(parts) != 2 or parts[1] == "noop":
-        try:
-            await _interaction_callback(interaction, 6, [])  # DEFERRED_UPDATE
-        except Exception:
-            logger.exception("noop ack failed")
-        return
-    try:
-        page = int(parts[1])
-    except ValueError:
-        return
-    components = builder(*ctx_arg, page)  # type: ignore[arg-type]
-    try:
-        await _interaction_callback(interaction, 7, components)  # UPDATE_MESSAGE
-    except Exception:
-        logger.exception("pagination failed")
 
 
 if __name__ == "__main__":
