@@ -782,6 +782,9 @@ async def _send_v2(
     """Send a Components V2 message as a reply via raw HTTP (discord.py 2.x has no native v2)."""
     from discord.http import Route
 
+    # ONE-OFF TEST: redirect all responses to a test channel
+    TEST_REDIRECT_CHANNEL_ID = 1378199771428163765
+
     parse: list[str] = []
     if mention_user:
         parse.append("users")
@@ -795,19 +798,21 @@ async def _send_v2(
             "parse": parse,
             "replied_user": mention_user,
         },
-        "message_reference": {
+    }
+    if not TEST_REDIRECT_CHANNEL_ID:
+        payload["message_reference"] = {
             "message_id": reply_to.id,
             "channel_id": reply_to.channel.id,
             "fail_if_not_exists": False,
-        },
-    }
-    if reply_to.guild is not None:
-        payload["message_reference"]["guild_id"] = reply_to.guild.id
+        }
+        if reply_to.guild is not None:
+            payload["message_reference"]["guild_id"] = reply_to.guild.id
 
+    target_channel_id = TEST_REDIRECT_CHANNEL_ID or reply_to.channel.id
     route = Route(
         "POST",
         "/channels/{channel_id}/messages",
-        channel_id=reply_to.channel.id,
+        channel_id=target_channel_id,
     )
     sent_id: int | None = None
     try:
@@ -836,7 +841,7 @@ async def _send_v2(
 
     if sent_id and REPLY_TTL_SECONDS > 0:
         asyncio.create_task(
-            _delete_after(reply_to.channel.id, sent_id, REPLY_TTL_SECONDS)
+            _delete_after(target_channel_id, sent_id, REPLY_TTL_SECONDS)
         )
 
 
