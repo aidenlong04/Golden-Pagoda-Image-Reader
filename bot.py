@@ -1423,28 +1423,16 @@ async def _send_status_page(interaction: discord.Interaction, page: int) -> None
             )
 
 
-# /status as a command group with subcommands. Each subcommand jumps to a
-# specific page; pagination buttons walk through every page.
-status_group = app_commands.Group(
+# /status — single ephemeral command. The Components V2 message paginates
+# through every page (bot, roles, channels, misc, stats, platforms, clans,
+# ocr) via the Prev/Next buttons, so subcommands are unnecessary.
+@tree.command(
     name="status",
     description="Bot status & verification analytics (paginated, ephemeral).",
-    default_permissions=discord.Permissions(manage_guild=True),
 )
-
-
-def _register_status_subcommands() -> None:
-    for key, title, desc, _builder in _STATUS_PAGES:
-        page_idx = _STATUS_PAGE_INDEX[key]
-
-        async def _cmd(interaction: discord.Interaction, _idx: int = page_idx) -> None:
-            await _send_status_page(interaction, _idx)
-
-        # `description` must be plain ASCII <= 100 chars.
-        status_group.command(name=key, description=desc[:100])(_cmd)
-
-
-_register_status_subcommands()
-tree.add_command(status_group)
+@app_commands.default_permissions(manage_guild=True)
+async def status_cmd(interaction: discord.Interaction) -> None:
+    await _send_status_page(interaction, 0)
 
 
 @client.event
