@@ -1328,7 +1328,7 @@ def _status_page_roles_split(
 ) -> tuple[str, str]:
     """Return (clan_slots_section, platform+special_roles_section).
 
-    Used by `_status_components` to wedge the "Assign Emblems" button
+    Used by `_status_components` to wedge the "Emblems" button
     directly under the Clan slots block, between the two text blobs.
     """
     clan_lines = ["**Clan slots**"]
@@ -1426,14 +1426,14 @@ def _status_components(interaction: discord.Interaction, page: int) -> list[dict
          "custom_id": f"status:{page}"},
     ]
     if key == "roles":
-        # Wedge the Assign Emblems button between Clan slots and the rest
+        # Wedge the Emblems button between Clan slots and the rest
         # of the Roles page so it lives directly under the clan listing.
         clan_text, rest_text = _status_page_roles_split(interaction)
         assign_row = {
             "type": 1,
             "components": [
-                {"type": 2, "style": 1,
-                 "label": "Assign Emblems",
+                {"type": 2, "style": 3,
+                 "label": "Emblems",
                  "custom_id": "status:assign_emblems"},
             ],
         }
@@ -1535,7 +1535,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             f"</clan-emblems:{cmd_id}>" if cmd_id else "`/clan-emblems`"
         )
         body = (
-            f"### <:GoldenPagoda_Emblem:1416905638428020877>  Assign Emblems\n"
+            f"### <:GoldenPagoda_Emblem:1416905638428020877>  Emblems\n"
             f"Click {mention} to set or clear a clan emoji.\n"
             f"-# > Select clan member role and then input clan emblem emoji. "
             f"Leave emoji blank to clear"
