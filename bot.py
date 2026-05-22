@@ -1848,7 +1848,18 @@ def _stats_page_clans(s: dict) -> str:
     rows = s.get("by_clan") or []
     if not rows:
         return "**Clans**\n-# No data yet."
-    lines = ["**Clans (top 10)**"]
+    import re as _re
+    _placeholder_re = _re.compile(r"^place[\s\-_]*holder\s*(\d+)$", _re.IGNORECASE)
+    def _key(row):
+        name, _count = row
+        slot = next((c for c in CLAN_SLOTS if c.clan_name and name and c.clan_name.lower() == name.lower()), None)
+        has_emblem = 0 if (slot and slot.emoji) else 1
+        m = _placeholder_re.match((name or "").strip())
+        if m:
+            return (has_emblem, 1, int(m.group(1)), "")
+        return (has_emblem, 0, 0, (name or "").lower())
+    rows = sorted(rows, key=_key)
+    lines = ["**Clans (top 10, A\u2013Z)**"]
     for name, count in rows:
         slot = next((c for c in CLAN_SLOTS if c.clan_name and name and c.clan_name.lower() == name.lower()), None)
         glyph = (slot.emoji if slot else "") or "\u2022"
