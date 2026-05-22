@@ -136,6 +136,16 @@ OCR_RECOMPRESS_QUALITY = _int_env("OCR_RECOMPRESS_QUALITY", 70)
 PASS_REACTION_ID = _int_env("PASS_REACTION_ID", 1506744187096399882)
 PASS_REACTION_NAME = os.getenv("PASS_REACTION_NAME", "thumbsup")
 FAIL_REACTION = os.getenv("FAIL_REACTION", "\U0001F6A8")  # 🚨
+# Parsed form: a PartialEmoji if FAIL_REACTION is a custom emoji literal
+# (<:name:id> or <a:name:id>), otherwise the raw unicode string.
+_CUSTOM_EMOJI_RE = re.compile(r"^<(a?):([A-Za-z0-9_~]+):(\d+)>$")
+def _parse_reaction_emoji(raw: str):
+    m = _CUSTOM_EMOJI_RE.match((raw or "").strip())
+    if not m:
+        return raw
+    animated, name, eid = m.group(1) == "a", m.group(2), int(m.group(3))
+    return discord.PartialEmoji(name=name, id=eid, animated=animated)
+FAIL_REACTION_EMOJI = _parse_reaction_emoji(FAIL_REACTION)
 # Reaction cleared from the post when verification passes (e.g. a "pending"
 # marker added upstream). Set to 0 to disable.
 PENDING_REACTION_ID = _int_env("PENDING_REACTION_ID", 1459403163432910972)
@@ -741,7 +751,7 @@ async def _react(message: discord.Message, status: str) -> None:
         if emoji is None:
             emoji = "\U0001F44D"  # 👍 fallback
     else:  # fail
-        emoji = FAIL_REACTION
+        emoji = FAIL_REACTION_EMOJI
     try:
         await message.add_reaction(emoji)
     except discord.HTTPException:
