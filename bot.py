@@ -1550,7 +1550,16 @@ def _status_page_roles_split(
     directly under the Clan slots block, between the two text blobs.
     """
     clan_lines = ["**Clan slots**"]
-    for s in CLAN_SLOTS:
+    _placeholder_re = re.compile(r"^place[\s\-_]*holder", re.IGNORECASE)
+
+    def _sort_key(slot):
+        name = (slot.clan_name or "").strip()
+        is_placeholder = 1 if _placeholder_re.match(name) else 0
+        has_emoji = 0 if (slot.emoji or "").strip() else 1
+        # Order: named+emoji, named+no-emoji, placeholders (then slot index).
+        return (is_placeholder, has_emoji, slot.slot)
+
+    for s in sorted(CLAN_SLOTS, key=_sort_key):
         name = s.clan_name or "*(unset)*"
         rid = s.role_id or 0
         emoji = s.emoji or ""
