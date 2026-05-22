@@ -55,6 +55,55 @@ gp-logs() {
     _gp_ssh "sudo docker logs --tail $n -f $GP_CONTAINER"
 }
 
+# Update a single key in the server's /opt/golden-pagoda/.env and restart.
+# Usage:  gp-env-set KEY "VALUE"
+# Notes:
+#   - The server's .env is the source of truth at runtime. The repo's .env
+#     is excluded from the deploy rsync, so commits do NOT touch it.
+#   - Replaces an existing KEY=... line in place, or appends if missing.
+#   - VALUE is passed verbatim; quote it if it contains spaces, '<', '>',
+#     or shell metacharacters (e.g. emoji literals like '<:Foo:123>').
+#   - Restarts golden-pagoda.service so the new value is picked up.
+gp-env-set() {
+    local key="$1"
+    local value="$2"
+    if [[ -z "$key" ]]; then
+        echo "usage: gp-env-set KEY VALUE" >&2
+        return 2
+    fi
+    # Base64 the value to avoid any quoting / sed-delimiter pain over SSH.
+    local b64
+    b64="$(printf '%s' "$value" | base64 -w0)"
+    _gp_ssh "
+        set -e
+        ENV_FILE=/opt/golden-pagoda/.env
+        VAL=\$(printf '%s' '$b64' | base64 -d)
+        if sudo grep -qE '^$key=' \"\$ENV_FILE\"; then
+            # Use a delimiter unlikely to appear in env values.
+            sudo awk -v k='$key' -v v=\"\$VAL\" 'BEGIN{FS=OFS=\"=\"} \$1==k {print k\"=\"v; next} {print}' \"\$ENV_FILE\" | sudo tee \"\$ENV_FILE.tmp\" > /dev/null
+            sudo mv \"\$ENV_FILE.tmp\" \"\$ENV_FILE\"
+        else
+            echo \"$key=\$VAL\" | sudo tee -a \"\$ENV_FILE\" > /dev/null
+        fi
+        sudo grep -nE '^$key=' \"\$ENV_FILE\" || true
+        sudo systemctl restart $GP_SERVICE
+        sleep 3
+        systemctl is-active $GP_SERVICE
+    "
+}
+
+# Print one or more keys from the server's .env. Usage: gp-env-get KEY [KEY...]
+gp-env-get() {
+    local keys="$*"
+    if [[ -z "$keys" ]]; then
+        echo "usage: gp-env-get KEY [KEY...]" >&2
+        return 2
+    fi
+    local pattern
+    pattern="^($(echo "$keys" | tr ' ' '|'))="
+    _gp_ssh "sudo grep -nE '$pattern' /opt/golden-pagoda/.env || echo '(no matches)'"
+}
+
 # Allow direct invocation:  scripts/ops.sh <cmd> [args...]
 if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     cmd="${1:-status}"
@@ -65,6 +114,8 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
         deploy)  gp-deploy ;;
         health)  gp-health ;;
         logs)    gp-logs "$@" ;;
-        *) echo "usage: $0 {status|restart|deploy|health|logs [N]}" >&2; exit 2 ;;
+        env-set) gp-env-set "$@" ;;
+        env-get) gp-env-get "$@" ;;
+        *) echo "usage: $0 {status|restart|deploy|health|logs [N]|env-set KEY VALUE|env-get KEY [KEY...]}" >&2; exit 2 ;;
     esac
 fi

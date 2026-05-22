@@ -23,7 +23,7 @@ You are **Oda Assistant**, the maintainer agent for the **Golden Pagoda Discord 
 ## Operational Workflow
 
 1. **Code changes** → edit locally → commit → push to `main`. Auto-deploy handles the rest.
-2. **Env-only changes** (e.g. add a clan emoji) → either run `/clan-emblems` in Discord, or SSH to server, edit `/opt/golden-pagoda/.env` with `sudo`, `sudo systemctl restart golden-pagoda`. Do NOT push `.env` to git.
+2. **Env-only changes** (e.g. add a clan emoji) → preferred order: (a) run `/clan-emblems` in Discord, (b) `scripts/ops.sh env-set KEY "VALUE"` from this workspace (in-place edit + auto-restart), or (c) manual fallback `ssh ... 'sudoedit /opt/golden-pagoda/.env' && ssh ... 'sudo systemctl restart golden-pagoda'`. Do NOT push `.env` to git — the deploy rsync excludes it, so the server file is the source of truth.
 3. **Verify deploy succeeded** → `gh run watch <id> --exit-status` or `gh run view <id> --json conclusion`.
 4. **Verify bot is healthy** → `ssh ... 'systemctl is-active golden-pagoda && docker inspect --format="{{.State.Health.Status}}" golden-pagoda && docker logs --tail 20 golden-pagoda'`. Look for `Logged in as` and `Synced N slash command(s)` (currently 3).
 
@@ -46,7 +46,9 @@ You are **Oda Assistant**, the maintainer agent for the **Golden Pagoda Discord 
 | Trigger redeploy | `git commit --allow-empty -m "ci: redeploy" && git push origin main` |
 | Watch latest run | `gh run list --branch main --limit 1` then `gh run watch <id> --exit-status` |
 | Tail server logs | `ssh -i ~/.ssh/hetzner nomekui@5.78.211.130 'sudo docker logs -f golden-pagoda'` |
-| Edit server env | `ssh ... 'sudoedit /opt/golden-pagoda/.env'` then restart service |
+| Read server env key(s) | `scripts/ops.sh env-get CLAN_ROLE_6_NAME CLAN_ROLE_6_EMOJI` |
+| Set server env key | `scripts/ops.sh env-set CLAN_ROLE_6_EMOJI "<:Apestorm_Emblem:1507182778284904568>"` (auto-restarts) |
+| Edit server env (manual) | `ssh ... 'sudoedit /opt/golden-pagoda/.env'` then restart service |
 | Restart bot | `ssh ... 'sudo systemctl restart golden-pagoda'` |
 | Health status | `ssh ... 'docker inspect --format={{.State.Health.Status}} golden-pagoda'` |
 | Inspect analytics | `ssh ... 'docker exec golden-pagoda python -c "import analytics; print(analytics.summary())"'` |
