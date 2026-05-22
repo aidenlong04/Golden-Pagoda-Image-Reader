@@ -783,11 +783,19 @@ async def _fail(
     image_url: str | None = None,
 ) -> None:
     await _react(message, "fail")
-    await _send_v2(
-        message,
-        _fail_components(headline, reason, image_url=image_url),
-        mention_user=True,
+    logger.info(
+        "_fail: sending V2 reply headline=%r reason=%r msg=%s chan=%s",
+        headline, reason, message.id, message.channel.id,
     )
+    try:
+        await _send_v2(
+            message,
+            _fail_components(headline, reason, image_url=image_url),
+            mention_user=True,
+        )
+    except Exception:
+        logger.exception("_fail: _send_v2 raised")
+        raise
 
 
 async def _remove_unverified_role(member: discord.Member) -> None:
