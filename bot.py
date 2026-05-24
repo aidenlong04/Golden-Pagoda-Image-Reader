@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import json
 import logging
 import os
 import re
 import time
 from collections.abc import Callable
+from datetime import timedelta
 from pathlib import Path
 
 import discord
@@ -186,6 +188,11 @@ ICON_EXAMPLE_URL = os.getenv(
 # gate role). Set to 0 to disable.
 VERIFY_REMOVE_ROLE_ID = _int_env("VERIFY_REMOVE_ROLE_ID", 1459326361968574555)
 
+# Catch-up scan: process missed messages from recent history on startup.
+CATCHUP_LOOKBACK_HOURS = _int_env("CATCHUP_LOOKBACK_HOURS", 24)
+CATCHUP_STATE_PATH = Path(os.getenv("CATCHUP_STATE_PATH", "/app/data/catchup_state.json"))
+CATCHUP_DELAY_SECONDS = float(os.getenv("CATCHUP_DELAY_SECONDS") or "1.0")
+
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is required")
 if TARGET_CHANNEL_ID <= 0:
@@ -340,6 +347,53 @@ _COMMAND_IDS: dict[str, int] = {}
 _BG_TASKS: set[asyncio.Task] = set()
 
 
+# ---------- Catch-up state persistence --------------------------------------
+
+
+def _load_catchup_state() -> int | None:
+    """Load the last successfully-scanned message ID from disk."""
+    try:
+        data = json.loads(CATCHUP_STATE_PATH.read_text())
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.warning("Failed to load catch-up state from %s", CATCHUP_STATE_PATH, exc_info=True)
+        return None
+    return data.get("last_message_id")
+
+
+def _save_catchup_state(message_id: int) -> None:
+    """Persist the last successfully-scanned message ID to disk."""
+    try:
+        CATCHUP_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CATCHUP_STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"last_message_id": message_id}))
+        os.replace(tmp, CATCHUP_STATE_PATH)
+    except Exception:
+        logger.warning("Failed to save catch-up state to %s", CATCHUP_STATE_PATH, exc_info=True)
+
+
+def _message_already_processed(message: discord.Message) -> bool:
+    """Check if a message has already been processed by looking for the bot's
+    reactions (pass/fail). Returns True if the message has any of the bot's
+    outcome reactions, meaning it was already handled."""
+    if not message.reactions or client.user is None:
+        return False
+    fail_id = FAIL_REACTION_EMOJI.id if isinstance(FAIL_REACTION_EMOJI, discord.PartialEmoji) else None
+    fail_str = FAIL_REACTION_EMOJI if isinstance(FAIL_REACTION_EMOJI, str) else None
+    for reaction in message.reactions:
+        if not reaction.me:
+            continue
+        emoji = reaction.emoji
+        if isinstance(emoji, (discord.Emoji, discord.PartialEmoji)):
+            eid = emoji.id
+            if eid is not None and (eid == PASS_REACTION_ID or eid == fail_id):
+                return True
+        elif fail_str is not None and emoji == fail_str:
+            return True
+    return False
+
+
 async def _health_task() -> None:
     while True:
         try:
@@ -350,11 +404,20 @@ async def _health_task() -> None:
         await asyncio.sleep(HEALTH_INTERVAL)
 
 
+def _spawn_bg_task(coro) -> asyncio.Task:
+    """Schedule a coroutine on the running loop and keep a strong reference
+    so the GC can't reap it mid-await. Self-cleans on completion."""
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
+
 @client.event
 async def on_ready() -> None:
     logger.info("Logged in as %s", client.user)
     if not getattr(client, "_health_started", False):
-        client.loop.create_task(_health_task())
+        _spawn_bg_task(_health_task())
         client._health_started = True  # type: ignore[attr-defined]
     _sync_clan_slots_from_guilds()
     _sync_platform_roles_from_guilds()
@@ -366,6 +429,14 @@ async def on_ready() -> None:
             _COMMAND_IDS[cmd.name] = cmd.id
     except Exception:
         logger.exception("Failed to sync slash commands")
+
+    # Run catch-up scan on first connect only (not on every reconnect).
+    # Spawned as a background task so on_ready returns immediately — the
+    # scan can take tens of seconds, and we don't want to block heartbeats
+    # or delay the event loop from processing live messages.
+    if not getattr(client, "_catchup_done", False):
+        client._catchup_done = True  # type: ignore[attr-defined]
+        _spawn_bg_task(_catchup_scan())
 
 
 def _sync_platform_roles_from_guilds() -> list[str]:
@@ -715,6 +786,259 @@ def _first_image_attachment(message: discord.Message) -> discord.Attachment | No
         if attachment.content_type and attachment.content_type.startswith("image/"):
             return attachment
     return None
+
+
+async def _process_screenshot(message: discord.Message) -> None:
+    """Core screenshot verification logic. Extracted from on_message to support
+    both live processing and catch-up scanning."""
+    attachment = _first_image_attachment(message)
+    if attachment is None:
+        await _fail(message, "Not an image", "Upload a PNG/JPG screenshot of your Warframe profile.")
+        return
+    if message.guild is None:
+        await _fail(message, "Server only", "I can only assign roles in a server channel.")
+        return
+
+    try:
+        image_bytes = await attachment.read()
+        image = Image.open(io.BytesIO(image_bytes))
+    except Exception:
+        logger.exception("Failed to read uploaded image")
+        await _fail(message, "Invalid image", "Image could not be opened. Re-upload a valid PNG/JPG.")
+        return
+
+    ocr_engine = "ocr.space" if OCR_API_KEY else ("tesseract" if pytesseract else "none")
+    ocr_started = time.monotonic()
+    try:
+        # OCR involves blocking HTTP (up to 60s) and subprocess work — run it
+        # in a worker thread so the event loop keeps servicing heartbeats and
+        # other messages while a single screenshot is being verified.
+        ocr_text_raw, ocr_words = await asyncio.to_thread(
+            _ocr,
+            image_bytes,
+            attachment.filename,
+            attachment.content_type or "image/png",
+        )
+        ocr_text = ocr_text_raw.strip()
+        ocr_engine = _LAST_OCR_ENGINE
+    except Exception:
+        logger.exception("OCR failed for uploaded image")
+        analytics.record_verification(
+            outcome="ocr_error",
+            ocr_engine=ocr_engine,
+            ocr_latency_ms=int((time.monotonic() - ocr_started) * 1000),
+            user_id=message.author.id,
+            guild_id=message.guild.id,
+        )
+        await _fail(message, "Not readable", "No text could be read. Upload a clearer screenshot.")
+        return
+    ocr_latency_ms = int((time.monotonic() - ocr_started) * 1000)
+
+    profile_name = parse_profile_name(ocr_text)
+    clan_name = parse_clan_name(ocr_text)
+    mastery_rank = parse_mastery_rank(ocr_text)
+
+    anchor_bbox = _profile_name_bbox(ocr_words) if profile_name else None
+    platform, platform_scores = detect_platform(image, anchor_bbox)
+
+    # Fallback name when OCR can't read the profile handle: use the
+    # guild's current member count as a pseudo-discriminator so the
+    # pass response still shows something meaningful (e.g. "Tenno #1234").
+    profile_name_fallback_used = False
+    if not profile_name:
+        member_count = getattr(message.guild, "member_count", None) or 0
+        profile_name = f"Tenno #{member_count}"
+        profile_name_fallback_used = True
+
+    # TEMP: platform detection is flaky on downscaled / noisy uploads.
+    # If we have a profile name AND a clan name, accept the verification
+    # without a platform role rather than blocking the user. The clan role
+    # is the more important assignment for community use.
+    if not platform and not clan_name:
+        # Log a compact OCR snippet + which fields we did/didn't parse so
+        # failures can be diagnosed without having to reach into the
+        # screenshot. ocr_text is truncated to keep journal lines bounded.
+        snippet = " ".join(ocr_text.split())[:240]
+        logger.warning(
+            "Unreadable: engine=%s profile=%r clan=%r mastery=%r platform=%r scores=%s ocr=%r",
+            ocr_engine,
+            profile_name,
+            clan_name,
+            mastery_rank,
+            platform,
+            platform_scores,
+            snippet,
+        )
+        analytics.record_verification(
+            outcome="unreadable",
+            platform=platform,
+            clan=clan_name,
+            ocr_engine=ocr_engine,
+            ocr_latency_ms=ocr_latency_ms,
+            user_id=message.author.id,
+            guild_id=message.guild.id,
+            platform_scores=platform_scores,
+        )
+        await _fail(
+            message,
+            "Profile not found",
+            "Make sure your title bar (PlayerName#NNN) and platform icon are visible at the top.",
+            image_url=ICON_EXAMPLE_URL or None,
+        )
+        return
+
+    member = message.author if isinstance(message.author, discord.Member) else None
+    if member is None:
+        await _fail(message, "Not a member", "I can only assign roles to server members.")
+        return
+
+    role_lines: list[str] = []
+    issues: list[str] = []
+    passed = True
+
+    if profile_name_fallback_used:
+        logger.info(
+            "Profile name OCR failed; using member-count fallback %r", profile_name
+        )
+
+    if platform is None:
+        # TEMP fallback: platform detection failed but clan was readable.
+        # Skip platform role assignment instead of blocking the user.
+        logger.info(
+            "Passing without platform role (clan=%r, profile=%r)", clan_name, profile_name
+        )
+        role_lines.append("Platform: skipped (icon not detected)")
+    else:
+        role = _find_platform_role(message.guild, platform)
+        if role is None:
+            issues.append(f"No role for platform **{platform}**.")
+            passed = False
+        else:
+            _, status = await _add_role(member, role, "Screenshot platform verification")
+            role_lines.append(f"Platform: {status}")
+
+    clan_emoji: str | None = None
+    if clan_name:
+        slot = find_clan_slot(CLAN_SLOTS, clan_name)
+        if slot is not None:
+            clan_emoji = slot.emoji
+        role = _find_clan_role(message.guild, clan_name)
+        if role is None:
+            issues.append(f"No role for clan **{_strip_clan_tag(clan_name)}**.")
+            passed = False
+        else:
+            _, status = await _add_role(member, role, "Screenshot clan verification")
+            role_lines.append(f"Clan: {status}")
+    else:
+        issues.append("Clan shown as Unaffiliated — no matching server clan role.")
+        passed = False
+
+    await _react(message, "pass" if passed else "incomplete")
+    if passed:
+        await _remove_unverified_role(member)
+        await _send_v2(
+            message,
+            _pass_components(
+                profile_name, platform, clan_name, role_lines,
+                clan_emoji=clan_emoji,
+                mastery_rank=mastery_rank,
+                link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
+            ),
+        )
+    else:
+        await _add_incomplete_role(member)
+        components = _incomplete_components(" ".join(issues))
+        await _send_v2(message, components, mention_user=True, allow_role_mentions=True)
+
+    analytics.record_verification(
+        outcome="pass" if passed else "incomplete",
+        platform=platform,
+        clan=clan_name,
+        ocr_engine=ocr_engine,
+        ocr_latency_ms=ocr_latency_ms,
+        user_id=member.id,
+        guild_id=message.guild.id,
+        platform_scores=platform_scores,
+    )
+
+
+# Hard cap on history fetched per scan. Guards against a corrupt state file
+# or extreme lookback values driving an unbounded API walk.
+_CATCHUP_SCAN_LIMIT = 1000
+
+
+async def _catchup_scan() -> None:
+    """Scan recent message history in TARGET_CHANNEL_ID for unprocessed
+    screenshots and verify them. Runs once on startup after on_ready."""
+    if CATCHUP_LOOKBACK_HOURS <= 0:
+        logger.info("Catch-up scan disabled (CATCHUP_LOOKBACK_HOURS=%d)", CATCHUP_LOOKBACK_HOURS)
+        return
+
+    channel = client.get_channel(TARGET_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        logger.warning("Catch-up scan: TARGET_CHANNEL_ID=%s not found or not a text channel", TARGET_CHANNEL_ID)
+        return
+
+    last_seen_id = _load_catchup_state()
+    cutoff = discord.utils.utcnow() - timedelta(hours=CATCHUP_LOOKBACK_HOURS)
+    # Prefer resuming from last-seen snowflake; otherwise let Discord skip
+    # everything older than the lookback window server-side.
+    after: discord.Object | object
+    after = discord.Object(id=last_seen_id) if last_seen_id else cutoff
+
+    logger.info(
+        "Starting catch-up scan: channel=%s lookback=%dh last_seen=%s limit=%d",
+        channel.name, CATCHUP_LOOKBACK_HOURS, last_seen_id, _CATCHUP_SCAN_LIMIT,
+    )
+
+    allowed_types = (discord.MessageType.default, discord.MessageType.reply)
+    found = 0
+    processed = 0
+    skipped = 0
+    errors = 0
+    latest_id: int | None = None
+
+    try:
+        async for message in channel.history(
+            limit=_CATCHUP_SCAN_LIMIT,
+            after=after,
+            oldest_first=True,
+        ):
+            latest_id = message.id
+            if (
+                message.author.bot
+                or message.webhook_id is not None
+                or message.type not in allowed_types
+            ):
+                continue
+            if not _first_image_attachment(message):
+                continue
+
+            found += 1
+
+            if _message_already_processed(message):
+                skipped += 1
+                continue
+
+            try:
+                logger.info("Catch-up: processing message %s from %s", message.id, message.author)
+                await _process_screenshot(message)
+                processed += 1
+                _save_catchup_state(message.id)
+                await asyncio.sleep(CATCHUP_DELAY_SECONDS)
+            except Exception:
+                errors += 1
+                logger.exception("Catch-up: failed to process message %s", message.id)
+
+        if latest_id is not None:
+            _save_catchup_state(latest_id)
+
+        logger.info(
+            "Catch-up scan complete: found=%d processed=%d skipped=%d errors=%d",
+            found, processed, skipped, errors,
+        )
+    except Exception:
+        logger.exception("Catch-up scan failed")
 
 
 async def _add_role(
@@ -1150,176 +1474,15 @@ async def on_message(message: discord.Message) -> None:
     if message.channel.id != TARGET_CHANNEL_ID:
         return
 
-    attachment = _first_image_attachment(message)
-    if attachment is None:
-        await _fail(message, "Not an image", "Upload a PNG/JPG screenshot of your Warframe profile.")
-        return
-    if message.guild is None:
-        await _fail(message, "Server only", "I can only assign roles in a server channel.")
-        return
-
-    try:
-        image_bytes = await attachment.read()
-        image = Image.open(io.BytesIO(image_bytes))
-    except Exception:
-        logger.exception("Failed to read uploaded image")
-        await _fail(message, "Invalid image", "Image could not be opened. Re-upload a valid PNG/JPG.")
-        return
-
-    ocr_engine = "ocr.space" if OCR_API_KEY else ("tesseract" if pytesseract else "none")
-    ocr_started = time.monotonic()
-    try:
-        ocr_text_raw, ocr_words = _ocr(
-            image_bytes,
-            attachment.filename,
-            attachment.content_type or "image/png",
-        )
-        ocr_text = ocr_text_raw.strip()
-        ocr_engine = _LAST_OCR_ENGINE
-    except Exception:
-        logger.exception("OCR failed for uploaded image")
-        analytics.record_verification(
-            outcome="ocr_error",
-            ocr_engine=ocr_engine,
-            ocr_latency_ms=int((time.monotonic() - ocr_started) * 1000),
-            user_id=message.author.id,
-            guild_id=message.guild.id,
-        )
-        await _fail(message, "Not readable", "No text could be read. Upload a clearer screenshot.")
-        return
-    ocr_latency_ms = int((time.monotonic() - ocr_started) * 1000)
-
-    profile_name = parse_profile_name(ocr_text)
-    clan_name = parse_clan_name(ocr_text)
-    mastery_rank = parse_mastery_rank(ocr_text)
-
-    anchor_bbox = _profile_name_bbox(ocr_words) if profile_name else None
-    platform, platform_scores = detect_platform(image, anchor_bbox)
-
-    # Fallback name when OCR can't read the profile handle: use the
-    # guild's current member count as a pseudo-discriminator so the
-    # pass response still shows something meaningful (e.g. "Tenno #1234").
-    profile_name_fallback_used = False
-    if not profile_name:
-        member_count = getattr(message.guild, "member_count", None) or 0
-        profile_name = f"Tenno #{member_count}"
-        profile_name_fallback_used = True
-
-    # TEMP: platform detection is flaky on downscaled / noisy uploads.
-    # If we have a profile name AND a clan name, accept the verification
-    # without a platform role rather than blocking the user. The clan role
-    # is the more important assignment for community use.
-    if not platform and not clan_name:
-        # Log a compact OCR snippet + which fields we did/didn't parse so
-        # failures can be diagnosed without having to reach into the
-        # screenshot. ocr_text is truncated to keep journal lines bounded.
-        snippet = " ".join(ocr_text.split())[:240]
-        logger.warning(
-            "Unreadable: engine=%s profile=%r clan=%r mastery=%r platform=%r scores=%s ocr=%r",
-            ocr_engine,
-            profile_name,
-            clan_name,
-            mastery_rank,
-            platform,
-            platform_scores,
-            snippet,
-        )
-        analytics.record_verification(
-            outcome="unreadable",
-            platform=platform,
-            clan=clan_name,
-            ocr_engine=ocr_engine,
-            ocr_latency_ms=ocr_latency_ms,
-            user_id=message.author.id,
-            guild_id=message.guild.id,
-            platform_scores=platform_scores,
-        )
-        await _fail(
-            message,
-            "Profile not found",
-            "Make sure your title bar (PlayerName#NNN) and platform icon are visible at the top.",
-            image_url=ICON_EXAMPLE_URL or None,
-        )
-        return
-
-    member = message.author if isinstance(message.author, discord.Member) else None
-    if member is None:
-        await _fail(message, "Not a member", "I can only assign roles to server members.")
-        return
-
-    role_lines: list[str] = []
-    issues: list[str] = []
-    passed = True
-
-    if profile_name_fallback_used:
-        logger.info(
-            "Profile name OCR failed; using member-count fallback %r", profile_name
-        )
-
-    if platform is None:
-        # TEMP fallback: platform detection failed but clan was readable.
-        # Skip platform role assignment instead of blocking the user.
-        logger.info(
-            "Passing without platform role (clan=%r, profile=%r)", clan_name, profile_name
-        )
-        role_lines.append("Platform: skipped (icon not detected)")
-    else:
-        role = _find_platform_role(message.guild, platform)
-        if role is None:
-            issues.append(f"No role for platform **{platform}**.")
-            passed = False
-        else:
-            _, status = await _add_role(member, role, "Screenshot platform verification")
-            role_lines.append(f"Platform: {status}")
-
-    clan_emoji: str | None = None
-    if clan_name:
-        slot = find_clan_slot(CLAN_SLOTS, clan_name)
-        if slot is not None:
-            clan_emoji = slot.emoji
-        role = _find_clan_role(message.guild, clan_name)
-        if role is None:
-            issues.append(f"No role for clan **{_strip_clan_tag(clan_name)}**.")
-            passed = False
-        else:
-            _, status = await _add_role(member, role, "Screenshot clan verification")
-            role_lines.append(f"Clan: {status}")
-    else:
-        issues.append("Clan shown as Unaffiliated — no matching server clan role.")
-        passed = False
-
-    await _react(message, "pass" if passed else "incomplete")
-    if passed:
-        await _remove_unverified_role(member)
-        await _send_v2(
-            message,
-            _pass_components(
-                profile_name, platform, clan_name, role_lines,
-                clan_emoji=clan_emoji,
-                mastery_rank=mastery_rank,
-                link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
-            ),
-        )
-    else:
-        await _add_incomplete_role(member)
-        components = _incomplete_components(" ".join(issues))
-        await _send_v2(message, components, mention_user=True, allow_role_mentions=True)
-
-    analytics.record_verification(
-        outcome="pass" if passed else "incomplete",
-        platform=platform,
-        clan=clan_name,
-        ocr_engine=ocr_engine,
-        ocr_latency_ms=ocr_latency_ms,
-        user_id=member.id,
-        guild_id=message.guild.id,
-        platform_scores=platform_scores,
-    )
+    await _process_screenshot(message)
 
 
 # ---------- Slash commands --------------------------------------------------
 
-_CUSTOM_EMOJI_RE = re.compile(r"^<a?:[A-Za-z0-9_]{2,}:\d{15,25}>$")
+# Stricter than the module-level `_CUSTOM_EMOJI_RE` used for reaction parsing:
+# this one is the validator for user-supplied `/clan-emblems` input, so it
+# rejects fancy unicode in the name and bounds the snowflake length.
+_CUSTOM_EMOJI_INPUT_RE = re.compile(r"^<a?:[A-Za-z0-9_]{2,}:\d{15,25}>$")
 
 
 def _normalize_emoji_input(raw: str) -> str | None:
@@ -1333,7 +1496,7 @@ def _normalize_emoji_input(raw: str) -> str | None:
     s = (raw or "").strip()
     if not s:
         return ""
-    if _CUSTOM_EMOJI_RE.match(s):
+    if _CUSTOM_EMOJI_INPUT_RE.match(s):
         return s
     # Bare ID is ambiguous (no name), reject — user should paste full <:name:id>.
     if s.isdigit():

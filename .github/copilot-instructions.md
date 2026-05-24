@@ -8,6 +8,7 @@ Discord bot ("**Oda Helper**") that OCRs Warframe profile screenshots, verifies 
 - **Entrypoint**: `bot.py` (single file, Discord client + slash commands + V2 component helpers). Pure logic in `logic.py`. Analytics in `analytics.py` (stdlib `sqlite3`, fail-soft). Tests in `tests/`.
 - **Container**: `Dockerfile` produces `golden-pagoda:latest` image. Runs as non-root `bot` user (uid `10001`).
 - **Hosting**: Hetzner CX22, Ubuntu 24.04, Docker + systemd.
+- **Catch-up scan**: On startup, the bot scans recent message history in `TARGET_CHANNEL_ID` for unprocessed screenshots (those without the bot's pass/fail reactions) and verifies them. Configurable via `CATCHUP_LOOKBACK_HOURS` (default 24). State is persisted in `/app/data/catchup_state.json` to avoid re-scanning on every restart.
 
 ## Deployment
 
@@ -35,6 +36,9 @@ Discord bot ("**Oda Helper**") that OCRs Warframe profile screenshots, verifies 
 - `INCOMPLETE_ROLE_ID`, `VERIFY_REMOVE_ROLE_ID`, `OUTREACH_ROLE_IDS` — verification flow roles.
 - `PASS_REACTION_ID/_NAME`, `FAIL_REACTION`, `PENDING_REACTION_ID/_NAME` — reactions on the original screenshot.
 - `REPLY_TTL_SECONDS` — auto-delete bot replies after N seconds.
+- `CATCHUP_LOOKBACK_HOURS` (default `24`) — how many hours of message history to scan on startup for missed screenshots.
+- `CATCHUP_STATE_PATH` (default `/app/data/catchup_state.json`) — where to persist the last-scanned message ID.
+- `CATCHUP_DELAY_SECONDS` (default `1.0`) — sleep between catch-up message processing to avoid rate limits.
 - `HEALTH_PATH` (default `/tmp/gp_health`), `HEALTH_INTERVAL` (default `20` seconds) — liveness signal.
 - `ANALYTICS_DB_PATH` (default `/app/data/analytics.db`) — SQLite path inside the container.
 - Never commit `.env`. Update server-side env, then restart the service.
