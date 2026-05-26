@@ -543,16 +543,20 @@ def _score_candidate(
 
 def _candidate_rois(
     image: Image.Image, anchor_bbox: tuple[int, int, int, int] | None = None
-) -> list[Image.Image]:
-    """Extract candidate icon ROIs from title bar or near anchor."""
-    candidates: list[Image.Image] = []
+) -> list[tuple[str, tuple[int, int, int, int], Image.Image]]:
+    """Extract candidate icon ROIs from title bar or near anchor.
+
+    Returns a list of (source_label, bbox, crop) tuples so the caller can
+    log which ROI won and exactly where it lived in the source image.
+    """
+    candidates: list[tuple[str, tuple[int, int, int, int], Image.Image]] = []
 
     # Crop first, convert after: PIL's convert() allocates a full-image
     # buffer (≈8 MB for 1920×1080), whereas converting a 64×64 crop is
     # essentially free. Same applies to the anchor candidates below.
     bbox = _icon_bbox(image)
     if bbox is not None:
-        candidates.append(image.crop(bbox).convert("RGBA"))
+        candidates.append(("title_strip", bbox, image.crop(bbox).convert("RGBA")))
 
     if anchor_bbox is not None:
         iw, ih = image.size
@@ -561,17 +565,25 @@ def _candidate_rois(
         pad_y = max(2, h // 4)
         y0 = max(0, top - pad_y)
         y1 = min(ih, bottom + pad_y)
-        box_w = max(h, 24)
+        # Search ~2.5x the text height to either side so we cover icons
+        # rendered noticeably larger than the handle glyphs.
+        box_w = max(int(h * 2.5), 32)
 
-        anchor_candidates: list[tuple[int, int, int, int]] = []
+        anchor_candidates: list[tuple[str, tuple[int, int, int, int]]] = []
         if left - 4 > 0:
-            anchor_candidates.append((max(0, left - box_w - 8), y0, max(0, left - 2), y1))
+            anchor_candidates.append(
+                ("anchor_left", (max(0, left - box_w - 8), y0, max(0, left - 2), y1))
+            )
         if right + 4 < iw:
-            anchor_candidates.append((min(iw, right + 2), y0, min(iw, right + box_w + 8), y1))
+            anchor_candidates.append(
+                ("anchor_right", (min(iw, right + 2), y0, min(iw, right + box_w + 8), y1))
+            )
 
-        for cx0, cy0, cx1, cy1 in anchor_candidates:
+        for label, (cx0, cy0, cx1, cy1) in anchor_candidates:
             if cx1 - cx0 >= 6 and cy1 - cy0 >= 6:
-                candidates.append(image.crop((cx0, cy0, cx1, cy1)).convert("RGB"))
+                candidates.append(
+                    (label, (cx0, cy0, cx1, cy1), image.crop((cx0, cy0, cx1, cy1)).convert("RGB"))
+                )
 
     return candidates
 
@@ -597,30 +609,51 @@ def detect_platform(
     best_scores: dict[str, float] = {}
     best_score_value = -1.0
     winning_roi: Image.Image | None = None
+    winning_label: str | None = None
+    winning_bbox: tuple[int, int, int, int] | None = None
     # Track the best candidate even when it fails the confidence gate so we
     # can (a) surface real scores in analytics, (b) optionally accept a
     # relaxed-gate match when no candidate clears the strict gate.
     fallback_scores: dict[str, float] = {}
     fallback_platform: str | None = None
     fallback_score_value = -1.0
+    fallback_label: str | None = None
+    fallback_bbox: tuple[int, int, int, int] | None = None
 
-    for candidate in candidates:
+    per_candidate_log: list[str] = []
+    for label, bbox, candidate in candidates:
         platform, scores = _score_candidate(candidate, _REFERENCE_FEATURES)
         if not scores:
+            per_candidate_log.append(f"{label}@{bbox}=<empty>")
             continue
-        sorted_scores = sorted(scores.values(), reverse=True)
-        cand_top = sorted_scores[0]
+        sorted_scores = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        cand_top_plat, cand_top = sorted_scores[0]
+        runner = sorted_scores[1][1] if len(sorted_scores) > 1 else 0.0
+        per_candidate_log.append(
+            f"{label}@{bbox} top={cand_top_plat}:{cand_top:.3f} gap={cand_top - runner:.3f}"
+        )
         if platform and cand_top > best_score_value:
             best_platform = platform
             best_scores = scores
             best_score_value = cand_top
             winning_roi = candidate
+            winning_label = label
+            winning_bbox = bbox
         # Independent of gating, remember the strongest scores seen so the
         # caller has telemetry even on failure.
         if cand_top > fallback_score_value:
             fallback_score_value = cand_top
             fallback_scores = scores
-            fallback_platform = max(scores.items(), key=lambda kv: kv[1])[0]
+            fallback_platform = cand_top_plat
+            fallback_label = label
+            fallback_bbox = bbox
+
+    if per_candidate_log:
+        logger.info(
+            "Platform candidates (anchor=%s): %s",
+            anchor_bbox,
+            " | ".join(per_candidate_log),
+        )
 
     # Relaxed-gate fallback: if the strict gate (best>=0.45, gap>=0.15)
     # rejected everything, accept a downscaled/noisy match where the
