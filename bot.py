@@ -832,6 +832,14 @@ def _supplement_title_bar_ocr(
         if _TITLE_NAME_RE.search(joined):
             found_token = True
     if not found_token:
+        joined = " ".join(t for t, _ in new_words)
+        logger.info(
+            "Title-bar OCR supplement found no #NNN token "
+            "(strip=%dpx, tokens=%d, text=%r)",
+            strip_h,
+            len(new_words),
+            joined[:200],
+        )
         return ocr_text, ocr_words
     logger.info(
         "Title-bar OCR supplement recovered %d token(s): %r",

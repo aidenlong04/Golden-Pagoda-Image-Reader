@@ -191,6 +191,20 @@ def load_default_references(
 
 def _icon_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
     """Locate the platform icon (a compact bright blob) in the title bar."""
+    bboxes = _icon_bbox_candidates(image)
+    return bboxes[0] if bboxes else None
+
+
+def _icon_bbox_candidates(image: Image.Image) -> list[tuple[int, int, int, int]]:
+    """Return all icon-shaped bbox candidates in the top title-bar strip.
+
+    The Warframe title bar contains several icon-like regions (platform
+    glyph next to handle, platinum/credit indicators on the right). We
+    return every reasonably-sized square run so the scoring stage can
+    pick the one that actually matches a platform reference, rather than
+    relying on a fragile "rightmost" heuristic that picks the platinum
+    icon on 4K screenshots.
+    """
     width, height = image.size
     strip_h = max(8, int(height * 0.12))
     top = image.convert("RGB").crop((0, 0, width, strip_h))
@@ -198,15 +212,8 @@ def _icon_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
     sh, sw = hsv_arr.shape[:2]
     s = hsv_arr[..., 1]
     v = hsv_arr[..., 2]
-    # Foreground = saturated colored OR bright white-on-dark glyph pixels.
-    # The bright-V cutoff is loose (>=190) so anti-aliased edges of
-    # white-rendered Warframe icons (Xbox/PC/Mobile) still count.
     fg_mask = ((s >= 80) & (v >= 100)) | (v >= 190)
     col_counts = fg_mask.sum(axis=0)
-    # Column threshold has to accept thin glyphs (the Xbox X has only a
-    # handful of bright pixels per column) while still rejecting noise.
-    # sh//5 was calibrated for solid colored rings and rejected white X
-    # glyphs outright -> _icon_bbox returned None -> (unknown).
     threshold = max(3, sh // 12)
 
     runs: list[tuple[int, int]] = []
@@ -221,12 +228,8 @@ def _icon_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
     if start is not None:
         runs.append((start, sw - 1))
     if not runs:
-        return None
+        return []
 
-    # Merge runs whose horizontal gap is small (< sh//3). Thin white-on-dark
-    # glyphs like the Xbox X produce multiple short column-runs separated by
-    # the dark interior between arms; without merging we'd pick a single
-    # arm fragment and lose the icon's true extent.
     merge_gap = max(2, sh // 3)
     merged: list[tuple[int, int]] = []
     for r in runs:
@@ -236,28 +239,36 @@ def _icon_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
             merged.append(r)
     runs = merged
 
-    square = [r for r in runs if (r[1] - r[0] + 1) <= sh * 1.5]
-    runs = square or runs
-    runs_right_half = [r for r in runs if r[0] >= sw // 3]
-    if runs_right_half:
-        runs = runs_right_half
-    x0, x1 = runs[-1]
+    # Real platform icons are roughly square and modestly sized: somewhere
+    # between sh*0.15 and sh*0.7 wide. Anything wider is almost certainly
+    # a UI element (platinum/credits indicators, the handle text itself).
+    min_w = max(6, int(sh * 0.15))
+    max_w = max(min_w + 1, int(sh * 0.7))
+    sized = [r for r in runs if min_w <= (r[1] - r[0] + 1) <= max_w]
+    if not sized:
+        # Fall back to the original looser filter so we still produce
+        # something on weird resolutions/aspect ratios.
+        sized = [r for r in runs if (r[1] - r[0] + 1) <= sh * 1.5]
+    if not sized:
+        return []
 
-    ys = np.where(fg_mask[:, x0 : x1 + 1].any(axis=1))[0]
-    if ys.size == 0:
-        return None
-    y_min = int(ys.min())
-    y_max = int(ys.max())
-
-    # Pad generously so anti-aliased glyph edges (which fall below the
-    # bright-V cutoff) are still included in the cropped ROI.
     pad = max(2, sh // 12)
-    return (
-        max(0, x0 - pad),
-        max(0, y_min - pad),
-        min(width, x1 + 1 + pad),
-        min(strip_h, y_max + 1 + pad),
-    )
+    bboxes: list[tuple[int, int, int, int]] = []
+    for x0, x1 in sized:
+        ys = np.where(fg_mask[:, x0 : x1 + 1].any(axis=1))[0]
+        if ys.size == 0:
+            continue
+        y_min = int(ys.min())
+        y_max = int(ys.max())
+        bboxes.append(
+            (
+                max(0, x0 - pad),
+                max(0, y_min - pad),
+                min(width, x1 + 1 + pad),
+                min(strip_h, y_max + 1 + pad),
+            )
+        )
+    return bboxes
 
 
 def _binarize_and_crop(
@@ -554,9 +565,9 @@ def _candidate_rois(
     # Crop first, convert after: PIL's convert() allocates a full-image
     # buffer (≈8 MB for 1920×1080), whereas converting a 64×64 crop is
     # essentially free. Same applies to the anchor candidates below.
-    bbox = _icon_bbox(image)
-    if bbox is not None:
-        candidates.append(("title_strip", bbox, image.crop(bbox).convert("RGBA")))
+    for idx, bbox in enumerate(_icon_bbox_candidates(image)):
+        label = "title_strip" if idx == 0 else f"title_strip_{idx}"
+        candidates.append((label, bbox, image.crop(bbox).convert("RGBA")))
 
     if anchor_bbox is not None:
         iw, ih = image.size
