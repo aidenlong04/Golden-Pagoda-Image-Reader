@@ -219,5 +219,60 @@ class DetectPlatformAmbiguityTests(unittest.TestCase):
         )
 
 
+class DetectPlatformRobustnessTests(unittest.TestCase):
+    """Stress the ensemble against rescaling, blur, and JPEG compression."""
+
+    PLATFORMS = ("PC", "Xbox", "PlayStation", "Switch", "Mobile")
+
+    def _canvas_with(self, icon: Image.Image) -> Image.Image:
+        from logic import detect_platform_from_image  # noqa: F401  (sanity)
+        canvas = Image.new("RGB", (1200, 600), (15, 15, 18))
+        canvas.paste(icon, (1200 - 80, 12), icon)
+        return canvas
+
+    def _resized_icon(self, key: str, size: int) -> Image.Image:
+        from logic import load_default_references
+        refs = load_default_references()
+        if key not in refs:
+            self.skipTest(f"reference icon for {key} not available")
+        return refs[key].resize((size, size), Image.LANCZOS)
+
+    def test_detects_at_small_scale_24px(self) -> None:
+        from logic import detect_platform_from_image
+        for key in self.PLATFORMS:
+            with self.subTest(platform=key):
+                canvas = self._canvas_with(self._resized_icon(key, 24))
+                self.assertEqual(detect_platform_from_image(canvas), key)
+
+    def test_detects_at_large_scale_56px(self) -> None:
+        from logic import detect_platform_from_image
+        for key in self.PLATFORMS:
+            with self.subTest(platform=key):
+                canvas = self._canvas_with(self._resized_icon(key, 56))
+                self.assertEqual(detect_platform_from_image(canvas), key)
+
+    def test_detects_through_gaussian_blur(self) -> None:
+        from PIL import ImageFilter
+        from logic import detect_platform_from_image
+        for key in self.PLATFORMS:
+            with self.subTest(platform=key):
+                icon = self._resized_icon(key, 48)
+                blurred = icon.filter(ImageFilter.GaussianBlur(radius=0.6))
+                canvas = self._canvas_with(blurred)
+                self.assertEqual(detect_platform_from_image(canvas), key)
+
+    def test_detects_after_jpeg_round_trip(self) -> None:
+        import io
+        from logic import detect_platform_from_image
+        for key in self.PLATFORMS:
+            with self.subTest(platform=key):
+                canvas = self._canvas_with(self._resized_icon(key, 40))
+                buf = io.BytesIO()
+                canvas.convert("RGB").save(buf, "JPEG", quality=70)
+                buf.seek(0)
+                restored = Image.open(buf)
+                self.assertEqual(detect_platform_from_image(restored), key)
+
+
 if __name__ == "__main__":
     unittest.main()

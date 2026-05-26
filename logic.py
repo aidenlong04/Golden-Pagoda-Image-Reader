@@ -290,10 +290,126 @@ def _iou(mask_a, mask_b) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+# --- Perceptual hashes & normalized cross-correlation ----------------------
+#
+# Pictogram-recognition primitives. All numpy + Pillow, no extra deps.
+#
+# dhash (difference hash): compare adjacent column brightness; produces a
+#   (size, size) bool grid. Robust to scaling/blur/AA. Hamming distance is
+#   the per-bit disagreement count.
+# phash (perceptual hash): 2D DCT-II via numpy.fft on a downsampled grayscale
+#   image, take the low-frequency 8x8 block (minus DC), threshold at median.
+#   Stronger than dhash against subtle distortions; same Hamming-distance
+#   compare.
+# ncc (normalized cross-correlation): zero-mean unit-norm dot product
+#   between two equal-sized grayscale arrays; 1.0 = identical, 0.0 = no
+#   correlation. Cheap when both are pre-resized to 32x32.
+#
+# Each returns a similarity in 0..1 (1 = identical). The ensemble in
+# _score_candidate fuses dhash + phash + ncc + iou with shape-only weights.
+
+_DHASH_SIZE = 16  # 256 bits — discriminative enough for 5 classes
+_PHASH_LOW = 8    # keep the 8x8 low-frequency block (64 bits, ex-DC)
+_PHASH_DOWN = 32  # downsample size before DCT
+_TEMPLATE_SIZE = 32  # NCC template size
+
+
+def _grayscale_array(img: Image.Image, size: int) -> np.ndarray:
+    g = img.convert("L").resize((size, size), Image.LANCZOS)
+    return np.asarray(g, dtype=np.float32)
+
+
+def _tight_crop_to_fg(img: Image.Image) -> Image.Image:
+    """Crop to the same foreground bbox _binarize_and_crop uses.
+
+    Keeps hash/NCC inputs invariant to slack padding around the icon
+    (the title-bar bbox finder pads generously and can extend to the
+    canvas edge). Falls back to the original image if no foreground.
+    """
+    rgba = np.asarray(img.convert("RGBA"))
+    mask = (rgba[..., :3].max(axis=-1) >= 60) & (rgba[..., 3] >= 128)
+    if not mask.any():
+        return img
+    ys, xs = np.where(mask)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    return img.crop((x0, y0, x1, y1))
+
+
+def _dhash_bits(img: Image.Image) -> np.ndarray:
+    cropped = _tight_crop_to_fg(img)
+    g = cropped.convert("L").resize((_DHASH_SIZE + 1, _DHASH_SIZE), Image.LANCZOS)
+    arr = np.asarray(g, dtype=np.int16)
+    return arr[:, 1:] > arr[:, :-1]
+
+
+def _dct1d(a: np.ndarray) -> np.ndarray:
+    """DCT-II along the last axis using numpy.fft.rfft (Makhoul's method)."""
+    N = a.shape[-1]
+    # Build the 2N-length even-symmetric extension.
+    v = np.empty(a.shape[:-1] + (2 * N,), dtype=np.float64)
+    v[..., :N] = a
+    v[..., N:] = a[..., ::-1]
+    V = np.fft.rfft(v, axis=-1)
+    k = np.arange(N)
+    phase = np.exp(-1j * np.pi * k / (2 * N))
+    return (V[..., :N] * phase).real
+
+
+def _dct2(a: np.ndarray) -> np.ndarray:
+    return _dct1d(_dct1d(a).T).T
+
+
+def _phash_bits(img: Image.Image) -> np.ndarray:
+    cropped = _tight_crop_to_fg(img)
+    g = cropped.convert("L").resize((_PHASH_DOWN, _PHASH_DOWN), Image.LANCZOS)
+    arr = np.asarray(g, dtype=np.float64)
+    dct = _dct2(arr)
+    low = dct[:_PHASH_LOW, :_PHASH_LOW].copy()
+    low_flat = low.flatten()
+    med = float(np.median(low_flat[1:]))
+    return low > med
+
+
+def _hash_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Random-baseline-corrected Hamming similarity.
+
+    Two unrelated bit-hashes agree on ~50% of bits by chance, so a naive
+    ``1 - hamming/N`` similarity bottoms out near 0.5 and compresses the
+    discriminative gap between classes. Rescale to ``max(0, 2*s - 1)`` so
+    chance-level agreement maps to 0.0 and identical hashes still map to 1.0.
+    """
+    if a.shape != b.shape:
+        return 0.0
+    total = a.size
+    hamming = int(np.count_nonzero(a != b))
+    raw = 1.0 - (hamming / total)
+    return max(0.0, 2.0 * raw - 1.0)
+
+
+def _ncc_template(img: Image.Image) -> np.ndarray:
+    """Zero-mean unit-norm grayscale template (size _TEMPLATE_SIZE)."""
+    cropped = _tight_crop_to_fg(img)
+    arr = _grayscale_array(cropped, _TEMPLATE_SIZE)
+    arr -= arr.mean()
+    norm = float(np.sqrt((arr * arr).sum()))
+    return arr / norm if norm > 0 else arr
+
+
+def _ncc_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    if a.shape != b.shape:
+        return 0.0
+    # Both are zero-mean unit-norm; correlation is just the dot product in
+    # the range [-1, 1]. Clamp negatives (anticorrelation isn't useful here)
+    # and treat as a 0..1 similarity.
+    val = float((a * b).sum())
+    return max(0.0, min(1.0, val))
+
+
 def _extract_reference_features(
     references: dict[str, Image.Image]
 ) -> dict[str, dict]:
-    """Extract binarized mask for each reference icon."""
+    """Precompute mask + dhash + phash + NCC template for each reference."""
     features: dict[str, dict] = {}
     for key, ref in references.items():
         mask, fg_count = _binarize_and_crop(ref, size=(32, 32))
@@ -301,6 +417,9 @@ def _extract_reference_features(
             "mask": mask,
             "mask_np": np.asarray(mask, dtype=bool),
             "fg_count": fg_count,
+            "dhash": _dhash_bits(ref),
+            "phash": _phash_bits(ref),
+            "ncc": _ncc_template(ref),
         }
     return features
 
@@ -321,11 +440,39 @@ def _score_candidate(
     if cand_fg < 50:
         return None, {p: 0.0 for p in features}
     cand_mask_np = np.asarray(cand_mask, dtype=bool)
+    cand_dhash = _dhash_bits(candidate_crop)
+    cand_phash = _phash_bits(candidate_crop)
+    cand_ncc = _ncc_template(candidate_crop)
+
+    # Ensemble weights. IoU on the binarized silhouette stays the strongest
+    # signal (the Warframe title-bar icons are simple white-on-dark shapes
+    # whose foreground masks are very class-discriminative). Phash + dhash +
+    # NCC add robustness against compression artefacts, mild rescaling, and
+    # AA-edge variation that can erode IoU on real screenshots. Weights sum
+    # to 1.0 so the existing 0.45 / 0.15 strict and 0.30 / 0.10 relaxed gates
+    # keep their calibration.
+    W_PHASH, W_DHASH, W_NCC, W_IOU = 0.15, 0.15, 0.20, 0.50
 
     scores: dict[str, float] = {}
+    components: dict[str, dict[str, float]] = {}
     for platform, feat in features.items():
         ref_mask = feat.get("mask_np", feat["mask"])
-        scores[platform] = _iou(cand_mask_np, ref_mask)
+        iou = _iou(cand_mask_np, ref_mask)
+        dhash_sim = _hash_similarity(cand_dhash, feat["dhash"])
+        phash_sim = _hash_similarity(cand_phash, feat["phash"])
+        ncc = _ncc_similarity(cand_ncc, feat["ncc"])
+        components[platform] = {
+            "iou": iou,
+            "dhash": dhash_sim,
+            "phash": phash_sim,
+            "ncc": ncc,
+        }
+        scores[platform] = (
+            W_PHASH * phash_sim
+            + W_DHASH * dhash_sim
+            + W_NCC * ncc
+            + W_IOU * iou
+        )
 
     sorted_platforms = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     if not sorted_platforms:
