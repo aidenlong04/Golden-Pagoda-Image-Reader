@@ -128,8 +128,10 @@ ALL_PLATFORMS = (
     PLATFORM_MOBILE,
 )
 
-# Reference icons from the Warframe wiki MMF symbol set (brand-colored variants).
-# Cross-Play icon is intentionally excluded.
+# Reference icons from the Warframe wiki MMF symbol set. The in-game profile
+# UI renders every platform glyph as white-on-dark, so the matching engine is
+# colour-agnostic (see _score_candidate). Cross-Play icon is intentionally
+# excluded.
 PLATFORM_ICON_URLS: dict[str, str] = {
     PLATFORM_PC: "https://wiki.warframe.com/w/Special:FilePath/IconWindows.png",
     PLATFORM_XBOX: "https://wiki.warframe.com/w/Special:FilePath/IconXbox.png",
@@ -624,24 +626,6 @@ def detect_platform_near_anchor(
     """
     platform, _ = detect_platform(image, anchor_bbox)
     return platform
-
-
-def _classify_platform_color(
-    h: int, s: int, v: int, r: int, g: int, b: int
-) -> str | None:
-    """Classify a saturated pixel into a Warframe platform brand colour."""
-    hue = (h / 255.0) * 360.0
-
-    if 90 <= hue <= 160 and g > r * 1.2 and g > b * 1.2:
-        return PLATFORM_XBOX
-    if (hue <= 10 or hue >= 350) and r > g * 1.5 and r > b * 1.4 and g < 40 and b < 50:
-        return PLATFORM_SWITCH
-    if 190 <= hue <= 230 and b >= r:
-        if v >= 190 and hue <= 215:
-            return PLATFORM_PC
-        if v < 180 and 200 <= hue <= 230:
-            return PLATFORM_PLAYSTATION
-    return None
 
 
 # --- Clan slot configuration ------------------------------------------------

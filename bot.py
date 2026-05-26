@@ -9,15 +9,26 @@ import os
 import re
 import sys
 import time
+import warnings
 from collections.abc import Callable
 from datetime import timedelta
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 
-import discord
-import requests
-from discord import app_commands
-from PIL import Image, ImageOps
+# Suppress discord.py's audioop DeprecationWarning on Python 3.12. The bot
+# never uses voice, but discord.player imports audioop unconditionally and
+# stdlib audioop is slated for removal in 3.13. Filter before importing
+# discord so the warning never reaches the log.
+warnings.filterwarnings(
+    "ignore",
+    message=r"'audioop' is deprecated.*",
+    category=DeprecationWarning,
+)
+
+import discord  # noqa: E402
+import requests  # noqa: E402
+from discord import app_commands  # noqa: E402
+from PIL import Image, ImageOps  # noqa: E402
 
 try:
     import pytesseract  # optional local fallback
