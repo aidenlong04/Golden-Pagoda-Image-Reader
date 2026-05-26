@@ -922,8 +922,12 @@ async def _process_screenshot(message: discord.Message) -> None:
     if platform is None:
         # TEMP fallback: platform detection failed but clan was readable.
         # Skip platform role assignment instead of blocking the user.
+        # Log scores + OCR snippet so engine misses are diagnosable from
+        # `docker logs` without round-tripping to the original screenshot.
+        snippet = " ".join(ocr_text.split())[:240]
         logger.info(
-            "Passing without platform role (clan=%r, profile=%r)", clan_name, profile_name
+            "Passing without platform role (clan=%r, profile=%r) scores=%s ocr=%r",
+            clan_name, profile_name, platform_scores, snippet,
         )
         role_lines.append("Platform: skipped (icon not detected)")
     else:
