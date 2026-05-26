@@ -162,13 +162,7 @@ def load_default_references(
 
     icons: dict[str, Image.Image] = {}
     for key, url in PLATFORM_ICON_URLS.items():
-        path = target_dir / f"{key}.colored.png"
-        # Back-compat: also accept a plain "{key}.png" file dropped in by hand
-        # (older deploys / manual seeding).
-        if not path.exists():
-            legacy = target_dir / f"{key}.png"
-            if legacy.exists():
-                path = legacy
+        path = target_dir / f"{key}.png"
         if not path.exists():
             if requests is None:
                 continue
