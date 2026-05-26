@@ -7,9 +7,11 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from collections.abc import Callable
 from datetime import timedelta
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 
 import discord
@@ -1707,13 +1709,15 @@ def _status_page_bot(interaction: discord.Interaction) -> str:
         hb_line = f"\u2705 healthy ({hb}s ago)"
     guilds = len(client.guilds)
     members = sum(g.member_count or 0 for g in client.guilds)
+    py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     return (
         f"**Bot**\n"
         f"-# User: `{user}` (`{getattr(user, 'id', '?')}`)\n"
         f"-# Latency: `{latency_ms} ms`\n"
         f"-# Uptime: `{uptime}`\n"
         f"-# Health: `{hb_line}`\n"
-        f"-# Guilds: `{guilds}` \u2022 Members: `{members}`"
+        f"-# Guilds: `{guilds}` \u2022 Members: `{members}`\n"
+        f"-# Python: `{py}` \u2022 discord.py: `{discord.__version__}`"
     )
 
 
@@ -1785,6 +1789,20 @@ def _status_page_misc(interaction: discord.Interaction) -> str:
         "Tesseract (local)" if pytesseract else "*(none configured)*"
     )
     icons = len(PLATFORM_ICONS)
+    try:
+        pillow_ver = importlib_metadata.version("Pillow")
+    except importlib_metadata.PackageNotFoundError:
+        pillow_ver = "?"
+    try:
+        numpy_ver = importlib_metadata.version("numpy")
+    except importlib_metadata.PackageNotFoundError:
+        numpy_ver = "?"
+    last_seen = _load_catchup_state()
+    catchup = (
+        f"`{CATCHUP_LOOKBACK_HOURS}h` lookback \u2022 last id: "
+        f"`{last_seen}`" if last_seen else
+        f"`{CATCHUP_LOOKBACK_HOURS}h` lookback \u2022 last id: *(none)*"
+    )
     return (
         f"**OCR / Misc**\n"
         f"-# OCR: `{ocr}`\n"
@@ -1793,7 +1811,9 @@ def _status_page_misc(interaction: discord.Interaction) -> str:
         f"-# OCR max upload: `{OCR_MAX_UPLOAD_BYTES} bytes`\n"
         f"-# Pass reaction: `:{PASS_REACTION_NAME}:` ({PASS_REACTION_ID or '-'})\n"
         f"-# Pending reaction: `:{PENDING_REACTION_NAME}:` ({PENDING_REACTION_ID or '-'})\n"
-        f"-# Fail reaction: {FAIL_REACTION}"
+        f"-# Fail reaction: {FAIL_REACTION}\n"
+        f"-# Catch-up: {catchup}\n"
+        f"-# Pillow: `{pillow_ver}` \u2022 NumPy: `{numpy_ver}`"
     )
 
 

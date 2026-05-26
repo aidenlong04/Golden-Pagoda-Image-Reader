@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 try:  # optional — only needed for the lazy icon downloader
@@ -192,21 +193,18 @@ def _icon_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
     width, height = image.size
     strip_h = max(8, int(height * 0.12))
     top = image.convert("RGB").crop((0, 0, width, strip_h))
-    hsv = top.convert("HSV")
-    hsv_px = hsv.load()
-    sw, sh = top.size
-
-    def is_fg(x: int, y: int) -> bool:
-        _, s, v = hsv_px[x, y]
-        return (s >= 80 and v >= 100) or v >= 230
-
-    col_counts = [sum(1 for y in range(sh) if is_fg(x, y)) for x in range(sw)]
+    hsv_arr = np.asarray(top.convert("HSV"))
+    sh, sw = hsv_arr.shape[:2]
+    s = hsv_arr[..., 1]
+    v = hsv_arr[..., 2]
+    fg_mask = ((s >= 80) & (v >= 100)) | (v >= 230)
+    col_counts = fg_mask.sum(axis=0)
     threshold = max(3, sh // 5)
 
     runs: list[tuple[int, int]] = []
     start: int | None = None
-    for x, c in enumerate(col_counts):
-        if c >= threshold:
+    for x in range(sw):
+        if col_counts[x] >= threshold:
             if start is None:
                 start = x
         elif start is not None:
@@ -224,16 +222,11 @@ def _icon_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
         runs = runs_right_half
     x0, x1 = runs[-1]
 
-    y_min, y_max = sh, -1
-    for x in range(x0, x1 + 1):
-        for y in range(sh):
-            if is_fg(x, y):
-                if y < y_min:
-                    y_min = y
-                if y > y_max:
-                    y_max = y
-    if y_max < 0:
+    ys = np.where(fg_mask[:, x0 : x1 + 1].any(axis=1))[0]
+    if ys.size == 0:
         return None
+    y_min = int(ys.min())
+    y_max = int(ys.max())
 
     pad = 2
     return (
@@ -248,33 +241,30 @@ def _binarize_and_crop(
     img: Image.Image, size: tuple[int, int] = (32, 32)
 ) -> tuple[list[int], int]:
     """Binarize an image, tight-crop to the bounding box, resize, and return mask + count."""
-    rgba = img.convert("RGBA")
-    px = rgba.load()
-    w, h = rgba.size
-    mask_img = Image.new("1", (w, h), 0)
-    mask_px = mask_img.load()
-    fg_count = 0
-    for y in range(h):
-        for x in range(w):
-            r, g, b, a = px[x, y]
-            if max(r, g, b) >= 60 and a >= 128:
-                mask_px[x, y] = 1
-                fg_count += 1
-    bbox = mask_img.getbbox()
-    if bbox is None:
-        resized = mask_img.resize(size, Image.NEAREST)
+    rgba = np.asarray(img.convert("RGBA"))
+    mask = (rgba[..., :3].max(axis=-1) >= 60) & (rgba[..., 3] >= 128)
+    fg_count = int(mask.sum())
+    if fg_count == 0:
+        cropped = mask
     else:
-        cropped = mask_img.crop(bbox)
-        resized = cropped.resize(size, Image.NEAREST)
-    return list(resized.getdata()), fg_count
+        ys, xs = np.where(mask)
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        cropped = mask[y0:y1, x0:x1]
+    mask_img = Image.fromarray((cropped.astype(np.uint8) * 255), mode="L")
+    resized_arr = np.asarray(mask_img.resize(size, Image.NEAREST))
+    flat = (resized_arr >= 128).astype(np.uint8).flatten()
+    return flat.tolist(), fg_count
 
 
-def _iou(mask_a: list[int], mask_b: list[int]) -> float:
+def _iou(mask_a, mask_b) -> float:
     """Compute Intersection over Union of two binary masks."""
-    if len(mask_a) != len(mask_b):
+    a = np.asarray(mask_a, dtype=bool).ravel()
+    b = np.asarray(mask_b, dtype=bool).ravel()
+    if a.size != b.size:
         return 0.0
-    intersection = sum(1 for a, b in zip(mask_a, mask_b, strict=True) if a and b)
-    union = sum(1 for a, b in zip(mask_a, mask_b, strict=True) if a or b)
+    intersection = int(np.logical_and(a, b).sum())
+    union = int(np.logical_or(a, b).sum())
     return intersection / union if union > 0 else 0.0
 
 
@@ -287,6 +277,7 @@ def _extract_reference_features(
         mask, fg_count = _binarize_and_crop(ref, size=(32, 32))
         features[key] = {
             "mask": mask,
+            "mask_np": np.asarray(mask, dtype=bool),
             "fg_count": fg_count,
         }
     return features
@@ -302,30 +293,52 @@ def _score_candidate(
     cand_mask, cand_fg = _binarize_and_crop(candidate_crop, size=(32, 32))
     if cand_fg < 50:
         return None, {p: 0.0 for p in features}
-    hsv = candidate_crop.convert("HSV")
-    rgb = candidate_crop.convert("RGB")
-    hsv_px = hsv.load()
-    rgb_px = rgb.load()
-    cw, ch = hsv.size
-    
-    cand_sat_sum = 0
-    cand_sat_pixels = 0
+    cand_mask_np = np.asarray(cand_mask, dtype=bool)
+    hsv_arr = np.asarray(candidate_crop.convert("HSV"))
+    rgb_arr = np.asarray(candidate_crop.convert("RGB"))
+    ch, cw = hsv_arr.shape[:2]
+
+    h_chan = hsv_arr[..., 0].astype(np.int32)
+    s_chan = hsv_arr[..., 1].astype(np.int32)
+    v_chan = hsv_arr[..., 2].astype(np.int32)
+    r_chan = rgb_arr[..., 0].astype(np.int32)
+    g_chan = rgb_arr[..., 1].astype(np.int32)
+    b_chan = rgb_arr[..., 2].astype(np.int32)
+
+    sat_mask = s_chan >= 80
+    white_mask = (s_chan < 50) & (v_chan >= 200)
+
+    cand_sat_sum = int(s_chan[sat_mask].sum())
+    cand_sat_pixels = int(sat_mask.sum())
+    white_pixel_count = int(white_mask.sum())
+
+    hue = (h_chan / 255.0) * 360.0
     platform_color_counts = {p: 0 for p in ALL_PLATFORMS}
-    white_pixel_count = 0
-    
-    for y in range(ch):
-        for x in range(cw):
-            h_val, s, v = hsv_px[x, y]
-            if s >= 80:
-                cand_sat_sum += s
-                cand_sat_pixels += 1
-                r, g, b = rgb_px[x, y]
-                platform = _classify_platform_color(h_val, s, v, r, g, b)
-                if platform:
-                    platform_color_counts[platform] += 1
-            elif s < 50 and v >= 200:
-                white_pixel_count += 1
-    
+
+    xbox_mask = (
+        sat_mask
+        & (hue >= 90)
+        & (hue <= 160)
+        & (g_chan > r_chan * 1.2)
+        & (g_chan > b_chan * 1.2)
+    )
+    switch_mask = (
+        sat_mask
+        & ((hue <= 10) | (hue >= 350))
+        & (r_chan > g_chan * 1.5)
+        & (r_chan > b_chan * 1.4)
+        & (g_chan < 40)
+        & (b_chan < 50)
+    )
+    blueish = sat_mask & (hue >= 190) & (hue <= 230) & (b_chan >= r_chan)
+    pc_mask = blueish & (v_chan >= 190) & (hue <= 215)
+    ps_mask = blueish & (v_chan < 180) & (hue >= 200)
+
+    platform_color_counts[PLATFORM_XBOX] = int(xbox_mask.sum())
+    platform_color_counts[PLATFORM_SWITCH] = int(switch_mask.sum())
+    platform_color_counts[PLATFORM_PC] = int(pc_mask.sum())
+    platform_color_counts[PLATFORM_PLAYSTATION] = int(ps_mask.sum())
+
     cand_mean_sat = cand_sat_sum / cand_sat_pixels if cand_sat_pixels > 0 else 0
 
     # Warframe's PC (Windows) and Mobile (Apple) icons are rendered WHITE
@@ -349,7 +362,8 @@ def _score_candidate(
     total_pixels = cw * ch
     scores: dict[str, float] = {}
     for platform, feat in features.items():
-        iou = _iou(cand_mask, feat["mask"])
+        ref_mask = feat.get("mask_np", feat["mask"])
+        iou = _iou(cand_mask_np, ref_mask)
 
         color_pixel_count = platform_color_counts.get(platform, 0)
 
