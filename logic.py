@@ -197,9 +197,16 @@ def _icon_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
     sh, sw = hsv_arr.shape[:2]
     s = hsv_arr[..., 1]
     v = hsv_arr[..., 2]
-    fg_mask = ((s >= 80) & (v >= 100)) | (v >= 230)
+    # Foreground = saturated colored OR bright white-on-dark glyph pixels.
+    # The bright-V cutoff is loose (>=190) so anti-aliased edges of
+    # white-rendered Warframe icons (Xbox/PC/Mobile) still count.
+    fg_mask = ((s >= 80) & (v >= 100)) | (v >= 190)
     col_counts = fg_mask.sum(axis=0)
-    threshold = max(3, sh // 5)
+    # Column threshold has to accept thin glyphs (the Xbox X has only a
+    # handful of bright pixels per column) while still rejecting noise.
+    # sh//5 was calibrated for solid colored rings and rejected white X
+    # glyphs outright -> _icon_bbox returned None -> (unknown).
+    threshold = max(3, sh // 12)
 
     runs: list[tuple[int, int]] = []
     start: int | None = None
@@ -215,6 +222,19 @@ def _icon_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
     if not runs:
         return None
 
+    # Merge runs whose horizontal gap is small (< sh//3). Thin white-on-dark
+    # glyphs like the Xbox X produce multiple short column-runs separated by
+    # the dark interior between arms; without merging we'd pick a single
+    # arm fragment and lose the icon's true extent.
+    merge_gap = max(2, sh // 3)
+    merged: list[tuple[int, int]] = []
+    for r in runs:
+        if merged and r[0] - merged[-1][1] <= merge_gap:
+            merged[-1] = (merged[-1][0], r[1])
+        else:
+            merged.append(r)
+    runs = merged
+
     square = [r for r in runs if (r[1] - r[0] + 1) <= sh * 1.5]
     runs = square or runs
     runs_right_half = [r for r in runs if r[0] >= sw // 3]
@@ -228,7 +248,9 @@ def _icon_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
     y_min = int(ys.min())
     y_max = int(ys.max())
 
-    pad = 2
+    # Pad generously so anti-aliased glyph edges (which fall below the
+    # bright-V cutoff) are still included in the cropped ROI.
+    pad = max(2, sh // 12)
     return (
         max(0, x0 - pad),
         max(0, y_min - pad),
@@ -357,10 +379,11 @@ def _score_candidate(
     )
 
     # Warframe's PC (Windows) and Mobile (Apple) icons are rendered WHITE
-    # on a dark title bar, so their saturated-colour pixel count is ~0.
-    # Treat the candidate as a "white-on-dark glyph" when white pixels
-    # dominate any colored signal — IoU shape-match then distinguishes
-    # Windows-logo vs Apple-silhouette.
+    # on a dark title bar; the same is true for Xbox/Switch/PS in some
+    # client themes (the official 2024+ profile UI renders ALL platform
+    # glyphs as white-on-dark). When the candidate is dominated by white
+    # pixels (no saturated colour signal anywhere), colour is uninformative
+    # and shape (IoU) is the only reliable discriminator.
     white_dominant = (
         not colored_signal_present
         and white_pixel_count > 0
@@ -370,9 +393,12 @@ def _score_candidate(
     if cand_mean_sat >= 80:
         color_weight, shape_weight = 0.70, 0.30
     elif white_dominant:
-        # White glyph: lean harder on shape (IoU) since both PC and Mobile
-        # tie on colour and only the silhouette tells them apart.
-        color_weight, shape_weight = 0.20, 0.80
+        # White glyph: pure shape match. All platforms share the same
+        # white-on-dark colour signal, so attributing white pixels to any
+        # subset (PC/Mobile or otherwise) just biases the result. Let IoU
+        # alone pick the right silhouette — it separates all 5 platforms
+        # comfortably on the reference set.
+        color_weight, shape_weight = 0.0, 1.0
     else:
         color_weight, shape_weight = 0.30, 0.70
 
@@ -384,12 +410,13 @@ def _score_candidate(
         color_pixel_count = platform_color_counts.get(platform, 0)
 
         # Attribute white pixels to PC and Mobile ONLY when no colored
-        # platform has a real signal in this ROI. Otherwise the white
-        # interior of the colored logo (Xbox X, Switch glyph highlights,
-        # etc.) bleeds into PC/Mobile and competes with the true platform.
+        # platform has a real signal AND we are not in white-dominant mode.
+        # In white-dominant mode every platform shares the same white
+        # signal, so the boost would just bias against Xbox/PS/Switch.
         if (
             platform in (PLATFORM_PC, PLATFORM_MOBILE)
             and not colored_signal_present
+            and not white_dominant
         ):
             color_pixel_count += white_pixel_count
 
