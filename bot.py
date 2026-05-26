@@ -760,6 +760,89 @@ def _ocr(
 
 
 _PROFILE_TOKEN_RE = re.compile(r"#\d{2,4}")
+_TITLE_NAME_RE = re.compile(r"[A-Za-z0-9_\-\.\[\]]{2,}#\d{2,4}")
+# How much of the image height counts as "title bar" for the supplement pass.
+_TITLE_STRIP_FRAC = 0.14
+
+
+def _supplement_title_bar_ocr(
+    image_bytes: bytes,
+    ocr_text: str,
+    ocr_words: list[tuple[str, tuple[int, int, int, int]]],
+) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]]:
+    """If the main OCR missed the title-bar PlayerName#NNN token, retry just
+    the top strip with Tesseract. OCR.space engine 3 routinely drops the
+    small, low-contrast title-bar line on Warframe profile screenshots even
+    when the rest of the page reads cleanly. Tesseract on an upscaled,
+    autocontrasted top-strip crop recovers it reliably.
+
+    Returns the (possibly augmented) (text, words) tuple. No-op if pytesseract
+    is unavailable or the original OCR already contains a #NNN token in the
+    top portion of the image.
+    """
+    if pytesseract is None:
+        return ocr_text, ocr_words
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        w, h = img.size
+    except Exception:
+        return ocr_text, ocr_words
+    strip_h = max(40, int(h * _TITLE_STRIP_FRAC))
+    # If we already have a #NNN word inside the title strip, no need to retry.
+    for _text, (_x0, y0, _x1, y1) in ocr_words:
+        if y0 < strip_h and _PROFILE_TOKEN_RE.search(_text or ""):
+            return ocr_text, ocr_words
+    try:
+        strip = img.crop((0, 0, w, strip_h)).convert("L")
+        # Upscale aggressively — title-bar glyphs are ~16-22px tall on a
+        # 1080p screenshot, well below Tesseract's comfort zone.
+        strip = strip.resize((strip.width * 3, strip.height * 3), Image.LANCZOS)
+        strip = ImageOps.autocontrast(strip, cutoff=2)
+        data = pytesseract.image_to_data(
+            strip,
+            config="--oem 3 --psm 7",
+            output_type=pytesseract.Output.DICT,
+        )
+    except Exception:
+        logger.exception("Title-bar Tesseract supplement failed")
+        return ocr_text, ocr_words
+    new_words: list[tuple[str, tuple[int, int, int, int]]] = []
+    found_token = False
+    n = len(data.get("text") or [])
+    for i in range(n):
+        txt = (data["text"][i] or "").strip()
+        if not txt:
+            continue
+        try:
+            left = int(data["left"][i]) // 3
+            top = int(data["top"][i]) // 3
+            width = int(data["width"][i]) // 3
+            height = int(data["height"][i]) // 3
+        except (TypeError, ValueError, KeyError):
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        new_words.append((txt, (left, top, left + width, top + height)))
+        if _PROFILE_TOKEN_RE.search(txt):
+            found_token = True
+    if not found_token:
+        # Also try matching the joined line — Tesseract sometimes splits
+        # "Senseiwom#241" into "Senseiwom" + "#241" tokens.
+        joined = " ".join(t for t, _ in new_words)
+        if _TITLE_NAME_RE.search(joined):
+            found_token = True
+    if not found_token:
+        return ocr_text, ocr_words
+    logger.info(
+        "Title-bar OCR supplement recovered %d token(s): %r",
+        len(new_words),
+        " ".join(t for t, _ in new_words)[:120],
+    )
+    # Prepend the recovered title-bar text so parse_profile_name sees it
+    # before any CLAN-section content.
+    supplement_line = " ".join(t for t, _ in new_words)
+    augmented_text = supplement_line + "\n" + ocr_text
+    return augmented_text, new_words + ocr_words
 
 
 def _profile_name_bbox(
@@ -846,6 +929,15 @@ async def _process_screenshot(message: discord.Message) -> None:
         await _fail(message, "Not readable", "No text could be read. Upload a clearer screenshot.")
         return
     ocr_latency_ms = int((time.monotonic() - ocr_started) * 1000)
+
+    # OCR.space often drops the small title-bar text; rerun Tesseract on the
+    # top strip to recover the PlayerName#NNN token when it's missing.
+    try:
+        ocr_text, ocr_words = await asyncio.to_thread(
+            _supplement_title_bar_ocr, image_bytes, ocr_text, ocr_words
+        )
+    except Exception:
+        logger.exception("Title-bar OCR supplement raised")
 
     profile_name = parse_profile_name(ocr_text)
     clan_name = parse_clan_name(ocr_text)

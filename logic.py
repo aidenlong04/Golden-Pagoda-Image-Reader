@@ -54,13 +54,12 @@ def parse_profile_name(ocr_text: str) -> str | None:
     if match:
         return match.group(0).strip()
 
-    # Fallback: scan the full text only if the pre-header region yielded
-    # nothing (handles OCR that drops the header line entirely).
-    if header_match is not None:
-        for line in ocr_text.splitlines():
-            match = _PROFILE_NAME_RE.search(line)
-            if match:
-                return match.group(0).strip()
+    # No fallback past the CLAN header — anything after it is the clan
+    # discriminator (e.g. "Kavat Raiders#474"), never the player handle.
+    # If the title bar OCR is missing, return None so the caller can
+    # surface a clean "title bar not readable" error.
+    if header_match is None:
+        return None
     return None
 
 

@@ -30,6 +30,17 @@ class ParseProfileNameTests(unittest.TestCase):
     def test_returns_none_when_missing(self) -> None:
         self.assertIsNone(parse_profile_name("no handle here"))
 
+    def test_does_not_return_clan_discriminator_when_title_bar_missing(self) -> None:
+        # OCR.space sometimes drops the title bar entirely; the parser
+        # must not fall through to the clan tag (e.g. "Kavat Raiders#474").
+        text = (
+            "PROFILE EQUIPMENT STATS SYNDICATES TROPHIES "
+            "MASTERY RANK 1 SILVER SEEKER 349,957 "
+            "CLAN Kavat Raiders#474 MOON CLAN RANK 10 "
+            "MARKED FOR DEATH BY STALKER"
+        )
+        self.assertIsNone(parse_profile_name(text))
+
 
 class ParseClanNameTests(unittest.TestCase):
     def test_returns_clan_name_after_header(self) -> None:
