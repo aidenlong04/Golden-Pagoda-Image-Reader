@@ -341,13 +341,30 @@ def _score_candidate(
 
     cand_mean_sat = cand_sat_sum / cand_sat_pixels if cand_sat_pixels > 0 else 0
 
+    total_pixels = cw * ch
+
+    # If any colored platform has a meaningful signal (≥3% of ROI pixels),
+    # treat this candidate as a colored-icon ROI. The white pixels then
+    # belong to the colored logo's interior/anti-alias halo (e.g. the inner
+    # "X" of the Xbox glyph) — NOT to PC/Mobile. Without this guard, a real
+    # Xbox icon with a bright white "X" was inflating PC's runner-up score
+    # close enough to Xbox's to trip the 0.15-margin gate and yield
+    # (unknown).
+    colored_signal_threshold = total_pixels * 0.03
+    colored_signal_present = any(
+        platform_color_counts[p] > colored_signal_threshold
+        for p in (PLATFORM_XBOX, PLATFORM_PLAYSTATION, PLATFORM_SWITCH)
+    )
+
     # Warframe's PC (Windows) and Mobile (Apple) icons are rendered WHITE
     # on a dark title bar, so their saturated-colour pixel count is ~0.
     # Treat the candidate as a "white-on-dark glyph" when white pixels
     # dominate any colored signal — IoU shape-match then distinguishes
     # Windows-logo vs Apple-silhouette.
-    white_dominant = white_pixel_count > 0 and white_pixel_count >= max(
-        platform_color_counts.values()
+    white_dominant = (
+        not colored_signal_present
+        and white_pixel_count > 0
+        and white_pixel_count >= max(platform_color_counts.values())
     )
 
     if cand_mean_sat >= 80:
@@ -359,7 +376,6 @@ def _score_candidate(
     else:
         color_weight, shape_weight = 0.30, 0.70
 
-    total_pixels = cw * ch
     scores: dict[str, float] = {}
     for platform, feat in features.items():
         ref_mask = feat.get("mask_np", feat["mask"])
@@ -367,9 +383,14 @@ def _score_candidate(
 
         color_pixel_count = platform_color_counts.get(platform, 0)
 
-        # Unconditionally attribute white pixels to PC and Mobile. Both
-        # icons are white-on-dark; IoU above breaks the tie via shape.
-        if platform in (PLATFORM_PC, PLATFORM_MOBILE):
+        # Attribute white pixels to PC and Mobile ONLY when no colored
+        # platform has a real signal in this ROI. Otherwise the white
+        # interior of the colored logo (Xbox X, Switch glyph highlights,
+        # etc.) bleeds into PC/Mobile and competes with the true platform.
+        if (
+            platform in (PLATFORM_PC, PLATFORM_MOBILE)
+            and not colored_signal_present
+        ):
             color_pixel_count += white_pixel_count
 
         color_score = color_pixel_count / total_pixels if total_pixels > 0 else 0.0
@@ -509,6 +530,28 @@ def detect_platform(
             best_score_value = fallback_score_value
             logger.info(
                 "Platform accepted via white-glyph gate: %s score=%.3f runner_up=%.3f gap=%.3f",
+                best_platform,
+                fallback_score_value,
+                runner_up,
+                gap,
+            )
+        # Colored-platform relaxed gate: Xbox/PS/Switch in downscaled or
+        # noisy uploads land in the 0.30-0.45 band when anti-aliasing dilutes
+        # their saturated-pixel count. Accept when the leader is a colored
+        # platform, score >=0.30, and the gap over runner-up is >=0.15 (same
+        # separation requirement as the strict gate). The relaxation here is
+        # only in the absolute floor; the margin requirement still guards
+        # against ambiguous split-color regions.
+        elif (
+            fallback_platform in (PLATFORM_XBOX, PLATFORM_PLAYSTATION, PLATFORM_SWITCH)
+            and fallback_score_value >= 0.30
+            and gap >= 0.15
+        ):
+            best_platform = fallback_platform
+            best_scores = fallback_scores
+            best_score_value = fallback_score_value
+            logger.info(
+                "Platform accepted via colored relaxed gate: %s score=%.3f runner_up=%.3f gap=%.3f",
                 best_platform,
                 fallback_score_value,
                 runner_up,
