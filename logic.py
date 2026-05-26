@@ -175,7 +175,8 @@ def load_default_references(
             except Exception:
                 continue
         try:
-            icons[key] = Image.open(path).convert("RGBA")
+            with Image.open(path) as im:
+                icons[key] = im.convert("RGBA")
         except Exception:
             continue
 

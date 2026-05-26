@@ -225,7 +225,6 @@ class DetectPlatformRobustnessTests(unittest.TestCase):
     PLATFORMS = ("PC", "Xbox", "PlayStation", "Switch", "Mobile")
 
     def _canvas_with(self, icon: Image.Image) -> Image.Image:
-        from logic import detect_platform_from_image  # noqa: F401  (sanity)
         canvas = Image.new("RGB", (1200, 600), (15, 15, 18))
         canvas.paste(icon, (1200 - 80, 12), icon)
         return canvas
