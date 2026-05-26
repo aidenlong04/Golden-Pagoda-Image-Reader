@@ -1824,7 +1824,7 @@ _STATUS_PAGES: list[tuple[str, str, str, Callable]] = [
     ("misc",      "\U0001F527 OCR / Misc",   "OCR backend, TTL, reactions.",    lambda i, _s: _status_page_misc(i)),
     ("stats",     "\U0001F4C8 Stats",        "Verification totals + windows.",  lambda _i, s: _stats_page_overview(s)),
     ("platforms", "\U0001F3AE Platforms",    "Verifications by platform.",      lambda _i, s: _stats_page_platforms(s)),
-    ("clans",     "\U0001F3F0 Clans",        "Top clans by verification.",      lambda _i, s: _stats_page_clans(s)),
+    ("clans",     "\U0001F3F0 Clans",        "Configured clans + member counts.", lambda i, _s: _status_page_clans(i)),
     ("ocr",       "\u23F1\uFE0F OCR Latency","OCR latency p50/p95/avg.",        lambda _i, s: _stats_page_ocr(s)),
 ]
 _STATUS_PAGE_INDEX: dict[str, int] = {key: idx for idx, (key, *_rest) in enumerate(_STATUS_PAGES)}
@@ -2055,25 +2055,35 @@ def _stats_page_platforms(s: dict) -> str:
 
 
 def _stats_page_clans(s: dict) -> str:
-    rows = s.get("by_clan") or []
-    if not rows:
-        return "**Clans**\n-# No data yet."
-    import re as _re
-    _placeholder_re = _re.compile(r"^place[\s\-_]*holder\s*(\d+)$", _re.IGNORECASE)
-    def _key(row):
-        name, _count = row
-        slot = next((c for c in CLAN_SLOTS if c.clan_name and name and c.clan_name.lower() == name.lower()), None)
-        has_emblem = 0 if (slot and slot.emoji) else 1
-        m = _placeholder_re.match((name or "").strip())
-        if m:
-            return (has_emblem, 1, int(m.group(1)), "")
-        return (has_emblem, 0, 0, (name or "").lower())
-    rows = sorted(rows, key=_key)
-    lines = ["**Clans (top 10, A\u2013Z)**"]
-    for name, count in rows:
-        slot = next((c for c in CLAN_SLOTS if c.clan_name and name and c.clan_name.lower() == name.lower()), None)
-        glyph = (slot.emoji if slot else "") or "\u2022"
-        lines.append(f"-# {glyph} `{name}` \u2014 `{count}`")
+    """Deprecated: kept for compatibility. The Clans page now uses
+    `_status_page_clans` which sources data from live Discord roles
+    rather than from OCR'd clan-name strings in analytics (which were
+    noisy: typos, garbage OCR rows, '(none)' bucket, etc.).
+    """
+    return _status_page_clans(None)
+
+
+def _status_page_clans(interaction: discord.Interaction | None) -> str:
+    guild = interaction.guild if interaction else None
+    if guild is None:
+        return "**Clans**\n-# No guild context."
+    configured = [s for s in CLAN_SLOTS if s.clan_name]
+    if not configured:
+        return "**Clans**\n-# No clan slots configured."
+
+    rows: list[tuple[str, str, int, bool]] = []  # (label, glyph, members, missing_role)
+    for slot in configured:
+        role = guild.get_role(slot.role_id) if slot.role_id else None
+        members = len(role.members) if role else 0
+        glyph = slot.emoji or "\u2022"
+        rows.append((slot.clan_name, glyph, members, role is None))
+
+    rows.sort(key=lambda r: (-r[2], r[0].lower()))
+
+    lines = [f"**Clans** ({len(rows)} configured)"]
+    for name, glyph, members, missing in rows:
+        suffix = " \u26A0\uFE0F missing role" if missing else ""
+        lines.append(f"-# {glyph} `{name}` \u2014 `{members}` members{suffix}")
     return "\n".join(lines)
 
 

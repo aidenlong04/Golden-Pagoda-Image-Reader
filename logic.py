@@ -308,7 +308,12 @@ def _extract_reference_features(
 def _score_candidate(
     candidate_crop: Image.Image, features: dict[str, dict]
 ) -> tuple[str | None, dict[str, float]]:
-    """Score a candidate icon ROI against all reference features."""
+    """Score a candidate icon ROI against reference shapes using IoU.
+
+    Pure shape match (no colour analysis). Warframe's profile UI renders
+    every platform icon as white-on-dark, so colour signal is unreliable;
+    the silhouette alone separates all five platforms cleanly.
+    """
     cw, ch = candidate_crop.size
     if cw * ch < 100:
         return None, {p: 0.0 for p in features}
@@ -316,129 +321,24 @@ def _score_candidate(
     if cand_fg < 50:
         return None, {p: 0.0 for p in features}
     cand_mask_np = np.asarray(cand_mask, dtype=bool)
-    hsv_arr = np.asarray(candidate_crop.convert("HSV"))
-    rgb_arr = np.asarray(candidate_crop.convert("RGB"))
-    ch, cw = hsv_arr.shape[:2]
-
-    h_chan = hsv_arr[..., 0].astype(np.int32)
-    s_chan = hsv_arr[..., 1].astype(np.int32)
-    v_chan = hsv_arr[..., 2].astype(np.int32)
-    r_chan = rgb_arr[..., 0].astype(np.int32)
-    g_chan = rgb_arr[..., 1].astype(np.int32)
-    b_chan = rgb_arr[..., 2].astype(np.int32)
-
-    sat_mask = s_chan >= 80
-    white_mask = (s_chan < 50) & (v_chan >= 200)
-
-    cand_sat_sum = int(s_chan[sat_mask].sum())
-    cand_sat_pixels = int(sat_mask.sum())
-    white_pixel_count = int(white_mask.sum())
-
-    hue = (h_chan / 255.0) * 360.0
-    platform_color_counts = {p: 0 for p in ALL_PLATFORMS}
-
-    xbox_mask = (
-        sat_mask
-        & (hue >= 90)
-        & (hue <= 160)
-        & (g_chan > r_chan * 1.2)
-        & (g_chan > b_chan * 1.2)
-    )
-    switch_mask = (
-        sat_mask
-        & ((hue <= 10) | (hue >= 350))
-        & (r_chan > g_chan * 1.5)
-        & (r_chan > b_chan * 1.4)
-        & (g_chan < 40)
-        & (b_chan < 50)
-    )
-    blueish = sat_mask & (hue >= 190) & (hue <= 230) & (b_chan >= r_chan)
-    pc_mask = blueish & (v_chan >= 190) & (hue <= 215)
-    ps_mask = blueish & (v_chan < 180) & (hue >= 200)
-
-    platform_color_counts[PLATFORM_XBOX] = int(xbox_mask.sum())
-    platform_color_counts[PLATFORM_SWITCH] = int(switch_mask.sum())
-    platform_color_counts[PLATFORM_PC] = int(pc_mask.sum())
-    platform_color_counts[PLATFORM_PLAYSTATION] = int(ps_mask.sum())
-
-    cand_mean_sat = cand_sat_sum / cand_sat_pixels if cand_sat_pixels > 0 else 0
-
-    total_pixels = cw * ch
-
-    # If any colored platform has a meaningful signal (≥3% of ROI pixels),
-    # treat this candidate as a colored-icon ROI. The white pixels then
-    # belong to the colored logo's interior/anti-alias halo (e.g. the inner
-    # "X" of the Xbox glyph) — NOT to PC/Mobile. Without this guard, a real
-    # Xbox icon with a bright white "X" was inflating PC's runner-up score
-    # close enough to Xbox's to trip the 0.15-margin gate and yield
-    # (unknown).
-    colored_signal_threshold = total_pixels * 0.03
-    colored_signal_present = any(
-        platform_color_counts[p] > colored_signal_threshold
-        for p in (PLATFORM_XBOX, PLATFORM_PLAYSTATION, PLATFORM_SWITCH)
-    )
-
-    # Warframe's PC (Windows) and Mobile (Apple) icons are rendered WHITE
-    # on a dark title bar; the same is true for Xbox/Switch/PS in some
-    # client themes (the official 2024+ profile UI renders ALL platform
-    # glyphs as white-on-dark). When the candidate is dominated by white
-    # pixels (no saturated colour signal anywhere), colour is uninformative
-    # and shape (IoU) is the only reliable discriminator.
-    white_dominant = (
-        not colored_signal_present
-        and white_pixel_count > 0
-        and white_pixel_count >= max(platform_color_counts.values())
-    )
-
-    if cand_mean_sat >= 80:
-        color_weight, shape_weight = 0.70, 0.30
-    elif white_dominant:
-        # White glyph: pure shape match. All platforms share the same
-        # white-on-dark colour signal, so attributing white pixels to any
-        # subset (PC/Mobile or otherwise) just biases the result. Let IoU
-        # alone pick the right silhouette — it separates all 5 platforms
-        # comfortably on the reference set.
-        color_weight, shape_weight = 0.0, 1.0
-    else:
-        color_weight, shape_weight = 0.30, 0.70
 
     scores: dict[str, float] = {}
     for platform, feat in features.items():
         ref_mask = feat.get("mask_np", feat["mask"])
-        iou = _iou(cand_mask_np, ref_mask)
+        scores[platform] = _iou(cand_mask_np, ref_mask)
 
-        color_pixel_count = platform_color_counts.get(platform, 0)
-
-        # Attribute white pixels to PC and Mobile ONLY when no colored
-        # platform has a real signal AND we are not in white-dominant mode.
-        # In white-dominant mode every platform shares the same white
-        # signal, so the boost would just bias against Xbox/PS/Switch.
-        if (
-            platform in (PLATFORM_PC, PLATFORM_MOBILE)
-            and not colored_signal_present
-            and not white_dominant
-        ):
-            color_pixel_count += white_pixel_count
-
-        color_score = color_pixel_count / total_pixels if total_pixels > 0 else 0.0
-
-        fused = color_weight * color_score + shape_weight * iou
-        scores[platform] = fused
-    
     sorted_platforms = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     if not sorted_platforms:
         return None, scores
-    
+
     best_platform, best_score = sorted_platforms[0]
-    
     if best_score < 0.45:
         return None, scores
-    
     if len(sorted_platforms) > 1:
         runner_up_score = sorted_platforms[1][1]
         if best_score - runner_up_score < 0.15:
             return None, scores
-    
+
     return best_platform, scores
 
 
@@ -521,64 +421,22 @@ def detect_platform(
             fallback_scores = scores
             fallback_platform = max(scores.items(), key=lambda kv: kv[1])[0]
 
-    # Relaxed-gate fallback: if the strict gate rejected everything but a
-    # candidate scored confidently (top >=0.35 AND runner-up <0.30), accept
-    # it. The strict 0.45 gate is tuned for crisp title-bar crops; downscaled
-    # or noisy uploads often land just below it while still being
-    # unambiguous (clear separation from the next-best platform).
+    # Relaxed-gate fallback: if the strict gate (best>=0.45, gap>=0.15)
+    # rejected everything, accept a downscaled/noisy match where the
+    # leader is still comfortably ahead (best>=0.30, gap>=0.10). The
+    # margin requirement is what actually disambiguates one platform
+    # from another — the absolute floor is just to reject obviously
+    # off-target ROIs.
     if best_platform is None and fallback_platform is not None:
         sorted_fb = sorted(fallback_scores.values(), reverse=True)
         runner_up = sorted_fb[1] if len(sorted_fb) > 1 else 0.0
         gap = fallback_score_value - runner_up
-        if fallback_score_value >= 0.35 and runner_up < 0.30:
+        if fallback_score_value >= 0.30 and gap >= 0.10:
             best_platform = fallback_platform
             best_scores = fallback_scores
             best_score_value = fallback_score_value
             logger.info(
-                "Platform accepted via relaxed gate: %s score=%.3f runner_up=%.3f",
-                best_platform,
-                fallback_score_value,
-                runner_up,
-            )
-        # White-glyph gate: PC (Windows) and Mobile (Apple) icons are tiny
-        # white-on-dark glyphs and routinely score in the 0.20-0.30 band on
-        # downscaled uploads — well below the strict gate but still clearly
-        # the leader. Accept when the leader is PC/Mobile with any margin
-        # over the runner-up. Colored-platform leaders (Xbox/PS/Switch)
-        # still require the strict gate because their saturated colour
-        # signal is unambiguous when truly present.
-        elif (
-            fallback_platform in (PLATFORM_PC, PLATFORM_MOBILE)
-            and fallback_score_value >= 0.20
-            and gap >= 0.01
-        ):
-            best_platform = fallback_platform
-            best_scores = fallback_scores
-            best_score_value = fallback_score_value
-            logger.info(
-                "Platform accepted via white-glyph gate: %s score=%.3f runner_up=%.3f gap=%.3f",
-                best_platform,
-                fallback_score_value,
-                runner_up,
-                gap,
-            )
-        # Colored-platform relaxed gate: Xbox/PS/Switch in downscaled or
-        # noisy uploads land in the 0.30-0.45 band when anti-aliasing dilutes
-        # their saturated-pixel count. Accept when the leader is a colored
-        # platform, score >=0.30, and the gap over runner-up is >=0.15 (same
-        # separation requirement as the strict gate). The relaxation here is
-        # only in the absolute floor; the margin requirement still guards
-        # against ambiguous split-color regions.
-        elif (
-            fallback_platform in (PLATFORM_XBOX, PLATFORM_PLAYSTATION, PLATFORM_SWITCH)
-            and fallback_score_value >= 0.30
-            and gap >= 0.15
-        ):
-            best_platform = fallback_platform
-            best_scores = fallback_scores
-            best_score_value = fallback_score_value
-            logger.info(
-                "Platform accepted via colored relaxed gate: %s score=%.3f runner_up=%.3f gap=%.3f",
+                "Platform accepted via relaxed gate: %s score=%.3f runner_up=%.3f gap=%.3f",
                 best_platform,
                 fallback_score_value,
                 runner_up,

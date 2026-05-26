@@ -88,27 +88,38 @@ class DetectPlatformFromImageTests(unittest.TestCase):
                 img.putpixel((x, y), color)
         return img
 
-    def test_detects_xbox_green(self) -> None:
+    def _icon_in_title_bar(self, key: str, size: int = 40) -> Image.Image:
+        """Paste the real reference icon into a synthetic title bar."""
+        from logic import load_default_references  # local import to avoid cycle
+        refs = load_default_references()
+        if key not in refs:
+            self.skipTest(f"reference icon for {key} not available")
+        canvas = Image.new("RGB", (1200, 600), (15, 15, 18))
+        icon = refs[key].resize((size, size), Image.LANCZOS)
+        canvas.paste(icon, (1200 - 80, 12), icon)
+        return canvas
+
+    def test_detects_xbox_icon(self) -> None:
         self.assertEqual(
-            detect_platform_from_image(self._solid_top_bar((16, 124, 16))),
+            detect_platform_from_image(self._icon_in_title_bar("Xbox")),
             PLATFORM_XBOX,
         )
 
-    def test_detects_switch_red(self) -> None:
+    def test_detects_switch_icon(self) -> None:
         self.assertEqual(
-            detect_platform_from_image(self._solid_top_bar((230, 0, 18))),
+            detect_platform_from_image(self._icon_in_title_bar("Switch")),
             PLATFORM_SWITCH,
         )
 
-    def test_detects_pc_bright_blue(self) -> None:
+    def test_detects_pc_icon(self) -> None:
         self.assertEqual(
-            detect_platform_from_image(self._solid_top_bar((0, 164, 239))),
+            detect_platform_from_image(self._icon_in_title_bar("PC")),
             PLATFORM_PC,
         )
 
-    def test_detects_playstation_deep_blue(self) -> None:
+    def test_detects_playstation_icon(self) -> None:
         self.assertEqual(
-            detect_platform_from_image(self._solid_top_bar((0, 55, 145))),
+            detect_platform_from_image(self._icon_in_title_bar("PlayStation")),
             PLATFORM_PLAYSTATION,
         )
 
