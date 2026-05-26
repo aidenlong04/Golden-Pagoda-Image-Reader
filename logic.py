@@ -491,31 +491,33 @@ def _candidate_rois(
 ) -> list[Image.Image]:
     """Extract candidate icon ROIs from title bar or near anchor."""
     candidates: list[Image.Image] = []
-    
+
+    # Crop first, convert after: PIL's convert() allocates a full-image
+    # buffer (≈8 MB for 1920×1080), whereas converting a 64×64 crop is
+    # essentially free. Same applies to the anchor candidates below.
     bbox = _icon_bbox(image)
     if bbox is not None:
-        candidates.append(image.convert("RGBA").crop(bbox))
-    
+        candidates.append(image.crop(bbox).convert("RGBA"))
+
     if anchor_bbox is not None:
-        rgb = image.convert("RGB")
-        iw, ih = rgb.size
+        iw, ih = image.size
         left, top, right, bottom = anchor_bbox
         h = max(8, bottom - top)
         pad_y = max(2, h // 4)
         y0 = max(0, top - pad_y)
         y1 = min(ih, bottom + pad_y)
         box_w = max(h, 24)
-        
+
         anchor_candidates: list[tuple[int, int, int, int]] = []
         if left - 4 > 0:
             anchor_candidates.append((max(0, left - box_w - 8), y0, max(0, left - 2), y1))
         if right + 4 < iw:
             anchor_candidates.append((min(iw, right + 2), y0, min(iw, right + box_w + 8), y1))
-        
+
         for cx0, cy0, cx1, cy1 in anchor_candidates:
             if cx1 - cx0 >= 6 and cy1 - cy0 >= 6:
-                candidates.append(rgb.crop((cx0, cy0, cx1, cy1)))
-    
+                candidates.append(image.crop((cx0, cy0, cx1, cy1)).convert("RGB"))
+
     return candidates
 
 

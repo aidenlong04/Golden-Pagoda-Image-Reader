@@ -914,6 +914,11 @@ async def _process_screenshot(message: discord.Message) -> None:
             "Profile name OCR failed; using member-count fallback %r", profile_name
         )
 
+    # Resolve which Discord role coroutines to fire concurrently. Building
+    # them up front lets us issue both add_roles HTTP calls in parallel via
+    # asyncio.gather instead of paying two sequential Discord round-trips.
+    role_coros: list[tuple[str, "asyncio.Future"]] = []
+
     if platform is None:
         # TEMP fallback: platform detection failed but clan was readable.
         # Skip platform role assignment instead of blocking the user.
@@ -927,8 +932,7 @@ async def _process_screenshot(message: discord.Message) -> None:
             issues.append(f"No role for platform **{platform}**.")
             passed = False
         else:
-            _, status = await _add_role(member, role, "Screenshot platform verification")
-            role_lines.append(f"Platform: {status}")
+            role_coros.append(("Platform", _add_role(member, role, "Screenshot platform verification")))
 
     clan_emoji: str | None = None
     if clan_name:
@@ -940,30 +944,60 @@ async def _process_screenshot(message: discord.Message) -> None:
             issues.append(f"No role for clan **{_strip_clan_tag(clan_name)}**.")
             passed = False
         else:
-            _, status = await _add_role(member, role, "Screenshot clan verification")
-            role_lines.append(f"Clan: {status}")
+            role_coros.append(("Clan", _add_role(member, role, "Screenshot clan verification")))
     else:
         issues.append("Clan shown as Unaffiliated — no matching server clan role.")
         passed = False
 
-    await _react(message, "pass" if passed else "incomplete")
-    if passed:
-        await _remove_unverified_role(member)
-        await _send_v2(
-            message,
-            _pass_components(
-                profile_name, platform, clan_name, role_lines,
-                clan_emoji=clan_emoji,
-                mastery_rank=mastery_rank,
-                link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
-            ),
-        )
-    else:
-        await _add_incomplete_role(member)
-        components = _incomplete_components(" ".join(issues))
-        await _send_v2(message, components, mention_user=True, allow_role_mentions=True)
+    if role_coros:
+        results = await asyncio.gather(*(c for _, c in role_coros), return_exceptions=True)
+        for (label, _), result in zip(role_coros, results):
+            if isinstance(result, BaseException):
+                logger.exception("%s role assignment failed", label, exc_info=result)
+                role_lines.append(f"{label}: error assigning role")
+                passed = False
+            else:
+                _, status = result
+                role_lines.append(f"{label}: {status}")
 
-    analytics.record_verification(
+    # Fan out the user-visible work concurrently: reacting, removing the
+    # opposite-state role, and posting the V2 reply all hit different
+    # Discord endpoints and never depend on each other. asyncio.gather
+    # collapses ~3 sequential round-trips into a single wall-clock window.
+    if passed:
+        outbound = [
+            _react(message, "pass"),
+            _remove_unverified_role(member),
+            _send_v2(
+                message,
+                _pass_components(
+                    profile_name, platform, clan_name, role_lines,
+                    clan_emoji=clan_emoji,
+                    mastery_rank=mastery_rank,
+                    link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
+                ),
+            ),
+        ]
+    else:
+        outbound = [
+            _react(message, "incomplete"),
+            _add_incomplete_role(member),
+            _send_v2(
+                message,
+                _incomplete_components(" ".join(issues)),
+                mention_user=True,
+                allow_role_mentions=True,
+            ),
+        ]
+    for result in await asyncio.gather(*outbound, return_exceptions=True):
+        if isinstance(result, BaseException):
+            logger.exception("post-verification action failed", exc_info=result)
+
+    # Push analytics to a background task so the SQLite write never adds to
+    # the user-visible response time. record_verification is fail-soft, so
+    # losing one event on shutdown is acceptable.
+    _spawn_bg_task(asyncio.to_thread(
+        analytics.record_verification,
         outcome="pass" if passed else "incomplete",
         platform=platform,
         clan=clan_name,
@@ -972,7 +1006,7 @@ async def _process_screenshot(message: discord.Message) -> None:
         user_id=member.id,
         guild_id=message.guild.id,
         platform_scores=platform_scores,
-    )
+    ))
 
 
 # Hard cap on history fetched per scan. Guards against a corrupt state file
