@@ -11,6 +11,11 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+try:  # optional — gracefully degrade if scikit-image is unavailable at runtime
+    from skimage.feature import hog as _skimage_hog  # type: ignore
+except Exception:  # pragma: no cover
+    _skimage_hog = None  # type: ignore[assignment]
+
 try:  # optional — only needed for the lazy icon downloader
     import requests  # type: ignore
 except ImportError:  # pragma: no cover
@@ -403,6 +408,48 @@ def _ncc_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return max(0.0, min(1.0, val))
 
 
+# --- HOG (Histogram of Oriented Gradients) ---------------------------------
+#
+# Stroke-direction descriptor. The pHash / dHash / IoU ensemble compares
+# silhouettes, which can't tell Windows-flag horizontals from PlayStation
+# button-grid dots when both downsample to similar 32×32 binary masks
+# (the UnDawnedd#492 case: PS=0.450, Mobile=0.447, PC=0.437 — flat).
+# HOG explicitly bins gradient orientations per cell, so horizontal strokes
+# vs diagonals vs vertical pairs end up in disjoint feature dimensions.
+
+_HOG_SIZE = 32  # input size; matches _TEMPLATE_SIZE so we reuse the crop
+
+
+def _hog_vector(img: Image.Image) -> np.ndarray:
+    """Return a unit-norm HOG feature vector for an icon ROI.
+
+    Returns an empty array if scikit-image is unavailable; the scorer
+    treats that as a zero contribution from the HOG term.
+    """
+    if _skimage_hog is None:
+        return np.zeros(0, dtype=np.float32)
+    cropped = _tight_crop_to_fg(img)
+    arr = _grayscale_array(cropped, _HOG_SIZE) / 255.0
+    vec = _skimage_hog(
+        arr,
+        orientations=9,
+        pixels_per_cell=(8, 8),
+        cells_per_block=(2, 2),
+        block_norm="L2-Hys",
+        feature_vector=True,
+    ).astype(np.float32)
+    norm = float(np.linalg.norm(vec))
+    return vec / norm if norm > 0 else vec
+
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    if a.size == 0 or b.size == 0 or a.shape != b.shape:
+        return 0.0
+    # Both vectors are unit-norm from _hog_vector, so cosine == dot product.
+    val = float((a * b).sum())
+    return max(0.0, min(1.0, val))
+
+
 def _extract_reference_features(
     references: dict[str, Image.Image]
 ) -> dict[str, dict]:
@@ -417,6 +464,7 @@ def _extract_reference_features(
             "dhash": _dhash_bits(ref),
             "phash": _phash_bits(ref),
             "ncc": _ncc_template(ref),
+            "hog": _hog_vector(ref),
         }
     return features
 
@@ -440,15 +488,20 @@ def _score_candidate(
     cand_dhash = _dhash_bits(candidate_crop)
     cand_phash = _phash_bits(candidate_crop)
     cand_ncc = _ncc_template(candidate_crop)
+    cand_hog = _hog_vector(candidate_crop)
 
     # Ensemble weights. IoU on the binarized silhouette stays the strongest
     # signal (the Warframe title-bar icons are simple white-on-dark shapes
     # whose foreground masks are very class-discriminative). Phash + dhash +
     # NCC add robustness against compression artefacts, mild rescaling, and
-    # AA-edge variation that can erode IoU on real screenshots. Weights sum
-    # to 1.0 so the existing 0.45 / 0.15 strict and 0.30 / 0.10 relaxed gates
-    # keep their calibration.
-    W_PHASH, W_DHASH, W_NCC, W_IOU = 0.15, 0.15, 0.20, 0.50
+    # AA-edge variation that can erode IoU on real screenshots. HOG bins
+    # gradient orientation per cell, which is the discriminator IoU lacks:
+    # Windows-flag horizontals, PS dot-grid, Xbox X-diagonals, Switch joycon
+    # verticals each light up disjoint orientation bins, breaking ties when
+    # silhouettes look superficially similar. Weights sum to 1.0 so the
+    # existing 0.45 / 0.15 strict and 0.30 / 0.10 relaxed gates keep their
+    # calibration.
+    W_PHASH, W_DHASH, W_NCC, W_IOU, W_HOG = 0.10, 0.10, 0.15, 0.35, 0.30
 
     scores: dict[str, float] = {}
     components: dict[str, dict[str, float]] = {}
@@ -458,17 +511,20 @@ def _score_candidate(
         dhash_sim = _hash_similarity(cand_dhash, feat["dhash"])
         phash_sim = _hash_similarity(cand_phash, feat["phash"])
         ncc = _ncc_similarity(cand_ncc, feat["ncc"])
+        hog_sim = _cosine_similarity(cand_hog, feat.get("hog", np.zeros(0)))
         components[platform] = {
             "iou": iou,
             "dhash": dhash_sim,
             "phash": phash_sim,
             "ncc": ncc,
+            "hog": hog_sim,
         }
         scores[platform] = (
             W_PHASH * phash_sim
             + W_DHASH * dhash_sim
             + W_NCC * ncc
             + W_IOU * iou
+            + W_HOG * hog_sim
         )
 
     sorted_platforms = sorted(scores.items(), key=lambda x: x[1], reverse=True)
