@@ -1,75 +1,81 @@
-# Golden-Pagoda-Screenshot-verify
+# Golden Pagoda — Screenshot Verify
 
-A Discord bot that reads screenshot images in a specific channel and assigns roles based on detected text.
+Discord bot ("Oda Helper") that OCRs Warframe profile screenshots posted to a
+configured channel, parses the in-game name + clan, and assigns the matching
+platform / clan roles. Replies use Components V2 (containers, sections, gold
+gradient progress card).
 
 ## What it does
 
-- Watches one configured channel for Warframe profile screenshots
-- Runs Tesseract OCR (engine `--oem 3`) against the uploaded image
-- Parses the **profile name** from the title bar (top text box)
-- Detects the **platform** from the icon next to the profile name
-  (PC / Xbox / PlayStation / Switch — color-classified)
-- Parses the **clan name** from the right-hand box (or treats `UNAFFILIATED` as no clan)
-- Assigns the configured platform role and clan role
-- Clan name → role mappings can be updated at runtime via `/setclan`
+- Watches one configured channel (`TARGET_CHANNEL_ID`) for image uploads.
+- Runs OCR via [OCR.space](https://ocr.space/) engine 3 with a local
+  Tesseract fallback if `OCR_API_KEY` is unset.
+- Parses the **in-game name** from the title bar.
+- Parses the **clan name** from the right-hand panel and matches it against
+  the configured 7-slot clan list.
+- Assigns the matching clan role plus any roles the member is missing,
+  then sends a Components V2 reply with a gold progress card.
+- On startup, scans the last `CATCHUP_LOOKBACK_HOURS` hours of channel
+  history for screenshots that were missed while offline.
 
-## Setup
+## Stack
 
-1. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-2. Install the Tesseract OCR binary on your system (required by `pytesseract`).
-3. Copy `.env.example` to `.env` (or otherwise export the variables) and fill in:
-   - `DISCORD_TOKEN`, `TARGET_CHANNEL_ID`, optional `GUILD_ID`
-   - **4 platform role IDs**: `PLATFORM_ROLE_PC_ID`, `PLATFORM_ROLE_XBOX_ID`,
-     `PLATFORM_ROLE_PS_ID`, `PLATFORM_ROLE_SWITCH_ID`
-   - **6 clan role slots**: `CLAN_ROLE_1_NAME`/`CLAN_ROLE_1_ID` through
-     `CLAN_ROLE_6_NAME`/`CLAN_ROLE_6_ID`. The `_NAME` is matched against the
-     OCR'd clan name; the `_ID` is the Discord role assigned on a match.
-4. Run the bot:
-   ```bash
-   python bot.py
-   ```
+- Python 3.12, `discord.py` 2.x (raw HTTP for Components V2)
+- Pillow + NumPy for the progress card render
+- SQLite (stdlib) for analytics (WAL mode, persistent connection)
+- Pooled `aiohttp.ClientSession` for Discord REST + CDN
+- Docker + systemd on Hetzner CX22; GitHub Actions auto-deploy on push to
+  `main`
+
+## Setup (local)
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env  # or export the variables manually
+python bot.py
+```
+
+Required env: `DISCORD_TOKEN`, `TARGET_CHANNEL_ID`. See
+[.github/copilot-instructions.md](.github/copilot-instructions.md) for the
+full env reference.
 
 ## Slash commands
 
-- `/setclan slot:<1-6> clan_name:<text> role_name:<exact role>` — looks up the
-  given role by name in the server and stores its ID against the slot. Overrides
-  the env defaults and persists to `clan_roles.json` (configurable via
-  `CLAN_CONFIG_PATH`). Requires Manage Roles.
-- `/listclans` — show the current 6-slot mapping.
+- `/clan-emblems role:<role> emoji:<:name:id>` — set the per-clan emoji at
+  runtime. Updates in-memory state, `os.environ`, and rewrites the server's
+  `.env`. Requires **Manage Server**.
+- `/preview-responses` — post sample pass / fail / incomplete V2 messages
+  to the preview channel.
+- `/status` — paginated ephemeral status panel (bot, roles, channels, OCR,
+  stats, clans, latency). Surfaces uvloop, RSS, BG tasks, the pooled HTTP
+  session and the analytics SQLite WAL state. Requires **Manage Server**.
 
-## Deployment (Hetzner / any Ubuntu VPS)
+## Deployment
 
-The bot ships with a Docker image and a systemd unit. To deploy to a fresh
-Ubuntu 22.04/24.04 server:
+Push to `main` triggers `.github/workflows/deploy.yml`:
+
+1. rsync the repo to `/opt/golden-pagoda` (excludes `data/`, `icons/`, `.env`)
+2. `docker build golden-pagoda:latest`
+3. `systemctl restart golden-pagoda`
+
+The systemd unit is hardened (`--init`, `--memory=512m`, `--cpus=1.5`,
+`--pids-limit=256`, JSON log rotation). A sibling
+`golden-pagoda-watchdog.service` blocks on `docker events` and restarts the
+container on `health_status: unhealthy` or `die`, with cooldown +
+sliding-window restart cap.
+
+Server `.env` is the source of truth (`/opt/golden-pagoda/.env`); see
+`scripts/ops.sh env-get` / `env-set` for in-place edits.
+
+## Tests
 
 ```bash
-./scripts/deploy_hetzner.sh nomekui@<server-ip> ~/.ssh/hetzner
-```
-
-The remote user must be in the `docker` and `sudo` groups (NOPASSWD).
-
-The script is idempotent — re-run it any time you push new code to redeploy.
-It will:
-
-1. Install Docker if missing.
-2. Rsync the repo (including `.env` and `icons/`) to `/opt/golden-pagoda`.
-3. Install the systemd unit at `/etc/systemd/system/golden-pagoda.service`.
-4. Build the Docker image and (re)start the service.
-
-To check status / logs on the server:
-
-```bash
-ssh root@<server-ip> systemctl status golden-pagoda
-ssh root@<server-ip> docker logs golden-pagoda --tail 100 -f
+pytest tests/
 ```
 
 ## Notes
 
 - Requires Discord intents: message content, members.
-- The bot can only assign roles that already exist in the server, and that sit
-  below its own highest role.
-- Platform detection uses brand-color heuristics on the top of the screenshot;
-  unusual cropping or themes may reduce accuracy.
+- The bot can only assign roles that sit below its own highest role.
+- Container runs as uid `10001`; `data/` and `icons/` on the host are
+  chowned to that uid by the systemd unit pre-start.

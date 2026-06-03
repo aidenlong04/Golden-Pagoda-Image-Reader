@@ -458,7 +458,6 @@ def _message_already_processed(message: discord.Message) -> bool:
 
 
 async def _health_task() -> None:
-    global _HEALTH_STOPPED
     while True:
         if not _HEALTH_STOPPED:
             try:
@@ -1008,7 +1007,7 @@ def _first_image_attachment(message: discord.Message) -> discord.Attachment | No
 async def _process_screenshot(message: discord.Message) -> None:
     """Core screenshot verification logic. Extracted from on_message to support
     both live processing and catch-up scanning."""
-    global _ERROR_TIMESTAMPS, _HEALTH_STOPPED
+    global _HEALTH_STOPPED
     try:
         await _process_screenshot_impl(message)
     except Exception as e:
