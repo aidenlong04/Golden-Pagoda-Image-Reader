@@ -2463,6 +2463,37 @@ def _status_page_bot(interaction: discord.Interaction) -> str:
     guilds = len(client.guilds)
     members = sum(g.member_count or 0 for g in client.guilds)
     py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+
+    # Event loop in use — surfaces whether uvloop is active.
+    try:
+        loop_cls = type(asyncio.get_running_loop()).__module__.split(".")[0]
+        loop_label = "uvloop" if loop_cls == "uvloop" else "asyncio"
+    except RuntimeError:
+        loop_label = "?"
+
+    # Resident set size from /proc/self/status (no psutil dep).
+    rss_kb: int | None = None
+    try:
+        with open("/proc/self/status", "r") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    rss_kb = int(line.split()[1])
+                    break
+    except OSError:
+        pass
+    rss_label = f"`{rss_kb // 1024} MiB`" if rss_kb else "`?`"
+
+    # Pooled aiohttp session state — surfaces the perf optimisation.
+    sess = _HTTP_SESSION
+    if sess is None:
+        http_label = "cold (lazy)"
+    elif getattr(sess, "closed", True):
+        http_label = "closed"
+    else:
+        http_label = "pooled"
+
+    bg = len(_BG_TASKS)
+
     return (
         f"**Bot**\n"
         f"-# User: `{user}` (`{getattr(user, 'id', '?')}`)\n"
@@ -2470,7 +2501,9 @@ def _status_page_bot(interaction: discord.Interaction) -> str:
         f"-# Uptime: `{uptime}`\n"
         f"-# Health: `{hb_line}`\n"
         f"-# Guilds: `{guilds}` \u2022 Members: `{members}`\n"
-        f"-# Python: `{py}` \u2022 discord.py: `{discord.__version__}`"
+        f"-# Python: `{py}` \u2022 discord.py: `{discord.__version__}`\n"
+        f"-# Loop: `{loop_label}` \u2022 RSS: {rss_label} \u2022 BG tasks: `{bg}`\n"
+        f"-# HTTP session: `{http_label}`"
     )
 
 
@@ -2552,6 +2585,35 @@ def _status_page_misc(interaction: discord.Interaction) -> str:
         f"`{last_seen}`" if last_seen else
         f"`{CATCHUP_LOOKBACK_HOURS}h` lookback \u2022 last id: *(none)*"
     )
+
+    # Analytics SQLite state — reflects the persistent-connection + WAL
+    # change from the recent perf pass.
+    try:
+        analytics_conn = getattr(analytics, "_conn", None)
+        if analytics_conn is None:
+            sqlite_label = "`lazy (not yet opened)`"
+        else:
+            try:
+                mode_row = analytics_conn.execute(
+                    "PRAGMA journal_mode"
+                ).fetchone()
+                journal = (mode_row[0] if mode_row else "?") or "?"
+            except Exception:
+                journal = "?"
+            sqlite_label = f"`persistent` \u2022 journal=`{journal}`"
+    except Exception:
+        sqlite_label = "`?`"
+
+    # Font cache hit/miss counters — reflects the lru_cache around
+    # _load_font_cached().
+    try:
+        info = _load_font_cached.cache_info()
+        font_label = (
+            f"hits=`{info.hits}` misses=`{info.misses}` size=`{info.currsize}`"
+        )
+    except Exception:
+        font_label = "`?`"
+
     return (
         f"**OCR / Misc**\n"
         f"-# OCR: `{ocr}`\n"
@@ -2561,6 +2623,8 @@ def _status_page_misc(interaction: discord.Interaction) -> str:
         f"-# Pending reaction: `:{PENDING_REACTION_NAME}:` ({PENDING_REACTION_ID or '-'})\n"
         f"-# Fail reaction: {FAIL_REACTION}\n"
         f"-# Catch-up: {catchup}\n"
+        f"-# Analytics SQLite: {sqlite_label}\n"
+        f"-# Font cache: {font_label}\n"
         f"-# Pillow: `{pillow_ver}` \u2022 NumPy: `{numpy_ver}`"
     )
 
