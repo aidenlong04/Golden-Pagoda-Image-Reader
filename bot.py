@@ -1190,6 +1190,16 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
     # opposite-state role, and posting the V2 reply all hit different
     # Discord endpoints and never depend on each other.
     nick_target = _nickname_suggestion(member, profile_name)
+    nick_extra: list[dict] = []
+    if nick_target:
+        try:
+            nick_extra = _nickname_prompt_components(
+                nick_target, member.id,
+                current_nick=member.display_name or "",
+            )
+        except Exception:
+            logger.exception("nick prompt build failed")
+            nick_extra = []
     if passed:
         components = _pass_components(
             profile_name, clan_name,
@@ -1198,6 +1208,9 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
             link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
             progress_attachment="progress.png" if progress_png else None,
         )
+        # Append nickname prompt to the bottom of the verification message
+        # so it lives inside the same Discord message as the pass embed.
+        components.extend(nick_extra)
         outbound = [
             _react(message, "pass"),
             _remove_unverified_role(member),
@@ -1213,6 +1226,7 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
             link_buttons=_help_link_buttons(message.guild),
             progress_attachment="progress.png" if progress_png else None,
         )
+        components.extend(nick_extra)
         outbound = [
             _react(message, "incomplete"),
             _add_incomplete_role(member),
@@ -1227,20 +1241,6 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
     for result in await asyncio.gather(*outbound, return_exceptions=True):
         if isinstance(result, BaseException):
             logger.exception("post-verification action failed", exc_info=result)
-
-    # Standalone follow-up message for the in-game-name Yes/No prompt.
-    # Sent AFTER the main verification reply so the buttons' UPDATE_MESSAGE
-    # callback only edits this prompt message in place and leaves the
-    # verification card / progress bar untouched.
-    if nick_target:
-        try:
-            prompt_components = _nickname_prompt_components(
-                nick_target, member.id,
-                current_nick=member.display_name or "",
-            )
-            await _send_v2(message, prompt_components)
-        except Exception:
-            logger.exception("nick prompt send failed")
 
     # Push analytics to a background task so the SQLite write never adds to
     # the user-visible response time. record_verification is fail-soft, so
@@ -2857,12 +2857,13 @@ async def progress_cmd(
 async def _handle_nick_interaction(
     interaction: discord.Interaction, custom_id: str
 ) -> None:
-    """Handle the in-game-name buttons posted after verification.
+    """Handle the in-game-name buttons embedded at the bottom of the
+    verification reply.
 
-    On either choice we acknowledge the click silently via callback type 6
-    (DEFERRED_UPDATE_MESSAGE) and delete the prompt message — no visible
-    reply or message edit. If the user picks the in-game name we still
-    apply it as their server nickname in the background.
+    On click we apply the nickname (if Yes) and then edit the message in
+    place via UPDATE_MESSAGE (callback type 7), stripping just the
+    nick-prompt components from the bottom so the verification card +
+    progress bar above remain intact.
     """
     from urllib.parse import unquote
 
@@ -2909,30 +2910,77 @@ async def _handle_nick_interaction(
             except discord.HTTPException:
                 logger.exception("nick: edit failed")
 
-    # Silently acknowledge the click (type 6 = DEFERRED_UPDATE_MESSAGE)
-    # so Discord doesn't show "interaction failed" without any visible
-    # change to the prompt message.
-    try:
-        from discord.http import Route
-
-        route = Route(
-            "POST",
-            "/interactions/{interaction_id}/{interaction_token}/callback",
-            interaction_id=interaction.id,
-            interaction_token=interaction.token,
-        )
-        await client.http.request(route, json={"type": 6})
-    except Exception:
-        logger.exception("nick: deferred ack failed")
-
-    # Delete the prompt message so the channel doesn't get cluttered.
+    # Build the trimmed component list: keep everything from the original
+    # message EXCEPT the nick-prompt block at the bottom (banner image,
+    # gold container header, two button sections, and the separator
+    # between them). discord.py 2.x doesn't parse V2 sub-components, so
+    # fetch the raw message JSON to get authoritative component data.
+    raw: list[dict] = []
     try:
         if interaction.message is not None:
-            await interaction.message.delete()
-    except (discord.NotFound, discord.Forbidden):
-        pass
+            data = await client.http.get_message(
+                interaction.channel_id, interaction.message.id,
+            )
+            raw = data.get("components") or []
     except Exception:
-        logger.exception("nick: prompt delete failed")
+        logger.exception("nick: fetch original message failed")
+    trimmed = _strip_nick_prompt(raw)
+    if not trimmed:
+        # Nothing left to show; fall back to a silent ACK so Discord
+        # doesn't display "interaction failed".
+        try:
+            from discord.http import Route
+            route = Route(
+                "POST",
+                "/interactions/{interaction_id}/{interaction_token}/callback",
+                interaction_id=interaction.id,
+                interaction_token=interaction.token,
+            )
+            await client.http.request(route, json={"type": 6})
+        except Exception:
+            logger.exception("nick: deferred ack failed")
+        return
+    try:
+        await _interaction_callback(
+            interaction, 7, trimmed, ephemeral=False,
+        )
+    except Exception:
+        logger.exception("nick: update message failed")
+
+
+def _strip_nick_prompt(components: list[dict]) -> list[dict]:
+    """Return ``components`` with the nick-prompt block removed."""
+    def is_prompt(c: dict) -> bool:
+        t = c.get("type")
+        if t == 12:
+            items = c.get("items") or []
+            url = items[0].get("media", {}).get("url", "") if items else ""
+            if url and url == NICK_PROMPT_BANNER_URL:
+                return True
+        if t == 17 and c.get("accent_color") == 0xD4AF37:
+            return True
+        if t == 9:
+            acc = c.get("accessory") or {}
+            cid = acc.get("custom_id", "")
+            if isinstance(cid, str) and cid.startswith("nick:"):
+                return True
+        return False
+
+    # Walk from the end and prune contiguous prompt-related components
+    # (sections, separators, container, banner). We only strip trailing
+    # elements so any future content above is unaffected.
+    out = list(components)
+    while out:
+        last = out[-1]
+        if is_prompt(last):
+            out.pop()
+            continue
+        if last.get("type") == 14 and len(out) >= 2 and is_prompt(out[-2]):
+            # Separator that sat between two prompt sections.
+            out.pop()
+            continue
+        break
+    return out
 
 
 @client.event
