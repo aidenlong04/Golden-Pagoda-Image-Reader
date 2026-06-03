@@ -1809,7 +1809,7 @@ def _nickname_prompt_components(
     components.extend([
         {
             "type": 17,
-            "accent_color": ACCENT_INCOMPLETE,
+            "accent_color": 0xD4AF37,
             "components": [{
                 "type": 10,
                 "content": (
