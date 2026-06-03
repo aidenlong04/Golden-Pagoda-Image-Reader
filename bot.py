@@ -1566,18 +1566,15 @@ def _incomplete_components(
     image_url: str | None = None,
     link_buttons: list[tuple[str, str]] | None = None,
     progress_attachment: str | None = None,
+    nick_suggestion: str | None = None,
+    user_id: int | None = None,
 ) -> list[dict]:
-    outreach = " / ".join(f"<@&{rid}>" for rid in OUTREACH_ROLE_IDS) or "staff"
     header = {
         "type": 10,
-        "content": "### \u26A0\uFE0F  Verification Incomplete\n-# Manual review required",
+        "content": "### \u26A0\uFE0F  Please select the missing roles",
     }
     children: list[dict] = [
         {"type": 10, "content": f"-# {reason}"},
-        {
-            "type": 10,
-            "content": f"-# {outreach} will reach out to verify.",
-        },
     ]
     if image_url:
         children.insert(
@@ -1608,6 +1605,8 @@ def _incomplete_components(
             "items": [{"media": {"url": f"attachment://{progress_attachment}"}}],
         })
     top_level.extend([header, container])
+    if nick_suggestion and user_id is not None:
+        top_level.extend(_nickname_prompt_top_level(nick_suggestion, user_id))
     return top_level
 
 
