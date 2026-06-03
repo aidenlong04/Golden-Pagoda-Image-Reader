@@ -418,7 +418,12 @@ def _load_catchup_state() -> int | None:
     except Exception:
         logger.warning("Failed to load catch-up state from %s", CATCHUP_STATE_PATH, exc_info=True)
         return None
-    return data.get("last_message_id")
+    if not isinstance(data, dict):
+        return None
+    last = data.get("last_message_id")
+    if not isinstance(last, int):
+        return None
+    return last
 
 
 def _save_catchup_state(message_id: int) -> None:
@@ -882,36 +887,37 @@ def _supplement_title_bar_ocr(
     """
     if pytesseract is None:
         return ocr_text, ocr_words
+    img = None
     try:
         img = Image.open(io.BytesIO(image_bytes))
         w, h = img.size
+        strip_h = max(40, int(h * _TITLE_STRIP_FRAC))
+        # If we already have a #NNN word inside the title strip, no need to retry.
+        for _text, (_x0, y0, _x1, y1) in ocr_words:
+            if y0 < strip_h and _PROFILE_TOKEN_RE.search(_text or ""):
+                return ocr_text, ocr_words
+        try:
+            strip = img.crop((0, 0, w, strip_h)).convert("L")
+            try:
+                # Upscale aggressively — title-bar glyphs are ~16-22px tall on a
+                # 1080p screenshot, well below Tesseract's comfort zone.
+                strip = strip.resize((strip.width * 3, strip.height * 3), Image.LANCZOS)
+                strip = ImageOps.autocontrast(strip, cutoff=2)
+                data = pytesseract.image_to_data(
+                    strip,
+                    config="--oem 3 --psm 7",
+                    output_type=pytesseract.Output.DICT,
+                )
+            finally:
+                strip.close()
+        except Exception:
+            logger.exception("Title-bar Tesseract supplement failed")
+            return ocr_text, ocr_words
     except Exception:
         return ocr_text, ocr_words
     finally:
-        if 'img' in locals():
+        if img is not None:
             img.close()
-    strip_h = max(40, int(h * _TITLE_STRIP_FRAC))
-    # If we already have a #NNN word inside the title strip, no need to retry.
-    for _text, (_x0, y0, _x1, y1) in ocr_words:
-        if y0 < strip_h and _PROFILE_TOKEN_RE.search(_text or ""):
-            return ocr_text, ocr_words
-    try:
-        strip = img.crop((0, 0, w, strip_h)).convert("L")
-        try:
-            # Upscale aggressively — title-bar glyphs are ~16-22px tall on a
-            # 1080p screenshot, well below Tesseract's comfort zone.
-            strip = strip.resize((strip.width * 3, strip.height * 3), Image.LANCZOS)
-            strip = ImageOps.autocontrast(strip, cutoff=2)
-            data = pytesseract.image_to_data(
-                strip,
-                config="--oem 3 --psm 7",
-                output_type=pytesseract.Output.DICT,
-            )
-        finally:
-            strip.close()
-    except Exception:
-        logger.exception("Title-bar Tesseract supplement failed")
-        return ocr_text, ocr_words
     new_words: list[tuple[str, tuple[int, int, int, int]]] = []
     found_token = False
     n = len(data.get("text") or [])
@@ -1755,6 +1761,29 @@ def _nickname_suggestion(
     return suggestion
 
 
+def _nick_custom_ids(suggestion: str, user_id: int) -> tuple[str, str]:
+    """Return (yes_id, no_id) for the nick prompt, URL-encoding the
+    suggestion and truncating to fit Discord's 100-char custom_id cap.
+
+    Both IDs use the wider ``nick:y:<uid>:`` prefix length so the two
+    branches stay symmetric. Truncation is bounded by ``len(suggestion)``
+    iterations because each pass shortens ``truncated`` by one char.
+    """
+    from urllib.parse import quote
+
+    prefix_len = len(f"nick:y:{user_id}:")
+    max_encoded_len = max(0, 100 - prefix_len)
+    truncated = suggestion[:max_encoded_len]
+    encoded = quote(truncated, safe="")
+    while len(encoded) > max_encoded_len and truncated:
+        truncated = truncated[:-1]
+        encoded = quote(truncated, safe="")
+    return (
+        f"nick:y:{user_id}:{encoded}",
+        f"nick:n:{user_id}:{encoded}",
+    )
+
+
 def _nickname_prompt_top_level(suggestion: str, user_id: int) -> list[dict]:
     """Return top-level V2 components for the in-game-name Yes/No prompt.
 
@@ -1762,19 +1791,7 @@ def _nickname_prompt_top_level(suggestion: str, user_id: int) -> list[dict]:
     handler can address the user by their in-game name on either branch
     without cross-message state.
     """
-    from urllib.parse import quote
-
-    # Discord custom_id cap is 100 chars. Reserve the wider prefix
-    # ("nick:y:<uid>:") so both yes and no IDs fit identically.
-    prefix_len = len(f"nick:y:{user_id}:")
-    max_encoded_len = 100 - prefix_len
-    truncated = suggestion[:max_encoded_len]
-    encoded = quote(truncated, safe="")
-    while len(encoded) > max_encoded_len and truncated:
-        truncated = truncated[:-1]
-        encoded = quote(truncated, safe="")
-    yes_id = f"nick:y:{user_id}:{encoded}"
-    no_id = f"nick:n:{user_id}:{encoded}"
+    yes_id, no_id = _nick_custom_ids(suggestion, user_id)
     return [
         {"type": 14},  # Separator
         {
@@ -1828,17 +1845,7 @@ def _nickname_prompt_components(
     ``nick:n:<uid>:<encoded>`` custom_id scheme so ``_handle_nick_interaction``
     can edit this whole prompt message in place via UPDATE_MESSAGE.
     """
-    from urllib.parse import quote
-
-    prefix_len = len(f"nick:y:{user_id}:")
-    max_encoded_len = 100 - prefix_len
-    truncated = suggestion[:max_encoded_len]
-    encoded = quote(truncated, safe="")
-    while len(encoded) > max_encoded_len and truncated:
-        truncated = truncated[:-1]
-        encoded = quote(truncated, safe="")
-    yes_id = f"nick:y:{user_id}:{encoded}"
-    no_id = f"nick:n:{user_id}:{encoded}"
+    yes_id, no_id = _nick_custom_ids(suggestion, user_id)
     ingame_label = (suggestion or "In-game name")[:80]
     server_label = (current_nick or "Current nickname")[:80]
 
@@ -2015,11 +2022,13 @@ async def _send_v2(
                     data = await resp.json()
         else:
             data = await client.http.request(route, json=payload)
-        if isinstance(data, dict) and data.get("id"):
-            try:
-                sent_id = int(data["id"])
-            except (TypeError, ValueError):
-                sent_id = None
+        if isinstance(data, dict):
+            raw_id = data.get("id")
+            if isinstance(raw_id, (str, int)):
+                try:
+                    sent_id = int(raw_id)
+                except (TypeError, ValueError):
+                    sent_id = None
     except discord.HTTPException:
         logger.exception("v2 component reply failed; falling back to plain text")
         text = next(

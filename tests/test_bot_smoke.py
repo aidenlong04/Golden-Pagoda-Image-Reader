@@ -49,6 +49,46 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
         )
         self.assertIsInstance(result, list)
 
+    def test_pass_components_structure(self):
+        """Output payload conforms to Discord V2 component shape."""
+        result = self.bot_module._pass_components(
+            profile="Tenno#1234",
+            clan="Golden Pagoda",
+            clan_emoji="<:e:1>",
+            mastery_rank="MR 12",
+            link_buttons=[
+                ("Pick Roles", "https://discord.com/channels/1/2"),
+                ("Clan Chat", "https://discord.com/channels/1/3"),
+            ],
+            missing_categories=["Platform"],
+        )
+        # Must produce at least one top-level container.
+        self.assertTrue(
+            any(c.get("type") == 17 for c in result),
+            "expected at least one type:17 container",
+        )
+        # Every action row (type:1) must respect Discord's 5-button cap.
+        for top in result:
+            for inner in top.get("components", []) or []:
+                if inner.get("type") == 1:
+                    self.assertLessEqual(
+                        len(inner.get("components") or []), 5,
+                        "action row exceeds 5-button cap",
+                    )
+
+    def test_nick_custom_ids_within_100_chars(self):
+        """_nick_custom_ids never produces a custom_id over Discord's 100-char cap."""
+        # Long unicode suggestion forces URL-encoding to expand bytes.
+        yes, no = self.bot_module._nick_custom_ids("A" * 200, 1234567890123456789)
+        self.assertLessEqual(len(yes), 100)
+        self.assertLessEqual(len(no), 100)
+        # Emoji-only stress test (each char -> %XX%XX%XX%XX bytes).
+        yes2, no2 = self.bot_module._nick_custom_ids(
+            "\U0001F3AF" * 30, 100000000000000000
+        )
+        self.assertLessEqual(len(yes2), 100)
+        self.assertLessEqual(len(no2), 100)
+
     def test_incomplete_components_signature(self):
         """_incomplete_components accepts all kwargs used in production."""
         # Call site: bot.py line ~1158
