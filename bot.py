@@ -1579,27 +1579,21 @@ def _pass_components(
         inner_lines.append("please assign the missing roles here")
     inner = "\n".join(inner_lines)
 
-    # The Pick Roles button is the section accessory so the verification
-    # card stays a single visual block; any other link buttons we receive
-    # are ignored (the clan-chat button was retired).
-    pick_roles_btn: dict | None = None
+    # Pick Roles lives in an action row at the bottom of the card (the
+    # slot Clan Chat used to occupy). Any other link buttons received
+    # are appended to the same row, capped at Discord's 5-per-row max.
+    container_children: list[dict] = [{"type": 10, "content": inner}]
+    action_row_buttons: list[dict] = []
     for label, url in (link_buttons or []):
-        if label == "Pick Roles":
-            btn: dict = {"type": 2, "style": 5, "label": label, "url": url}
-            if PICK_ROLES_EMOJI_PAYLOAD is not None:
-                btn["emoji"] = PICK_ROLES_EMOJI_PAYLOAD
-            pick_roles_btn = btn
-            break
-
-    if pick_roles_btn is not None:
-        section: dict = {
-            "type": 9,
-            "components": [{"type": 10, "content": inner}],
-            "accessory": pick_roles_btn,
-        }
-        container_children: list[dict] = [section]
-    else:
-        container_children = [{"type": 10, "content": inner}]
+        btn: dict = {"type": 2, "style": 5, "label": label, "url": url}
+        if label == "Pick Roles" and PICK_ROLES_EMOJI_PAYLOAD is not None:
+            btn["emoji"] = PICK_ROLES_EMOJI_PAYLOAD
+        action_row_buttons.append(btn)
+    if action_row_buttons:
+        container_children.append({
+            "type": 1,
+            "components": action_row_buttons[:5],
+        })
 
     container = {
         "type": 17,
