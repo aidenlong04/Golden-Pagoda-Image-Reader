@@ -2558,7 +2558,7 @@ def _render_progress_card_png(
     if complete:
         draw.text(
             (text_x, bar_y + bar_h + 8),
-            "\u2605  Target reached!",
+            "Operator, all roles have been registered!",
             font=footer_font,
             fill=_PROGRESS_AVATAR_RING,
         )
