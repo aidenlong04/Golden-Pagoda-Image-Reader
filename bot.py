@@ -683,9 +683,12 @@ def _shrink_for_ocr(
         return image_bytes, filename, content_type or "image/png"
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=OCR_RECOMPRESS_QUALITY, optimize=True)
-        shrunk = buf.getvalue()
+        try:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=OCR_RECOMPRESS_QUALITY, optimize=True)
+            shrunk = buf.getvalue()
+        finally:
+            img.close()
     except Exception:
         logger.exception("Failed to recompress image for OCR; sending original")
         return image_bytes, filename, content_type or "image/png"
@@ -765,7 +768,10 @@ def _ocr_via_api(
 def _preprocess_for_tesseract(image_bytes: bytes) -> Image.Image:
     """Upscale + grayscale + autocontrast. Tesseract is dramatically more
     accurate on Warframe's stylized UI font when the input is enlarged and
-    contrast-normalized first."""
+    contrast-normalized first.
+
+    Caller is responsible for closing the returned Image.
+    """
     img = Image.open(io.BytesIO(image_bytes))
     if img.mode != "L":
         img = ImageOps.grayscale(img)
@@ -787,7 +793,10 @@ def _ocr_via_tesseract(
     except Exception:
         logger.exception("Tesseract preprocess failed; falling back to raw image")
         prepared = Image.open(io.BytesIO(image_bytes))
-    text = pytesseract.image_to_string(prepared, config=TESSERACT_CONFIG)
+    try:
+        text = pytesseract.image_to_string(prepared, config=TESSERACT_CONFIG)
+    finally:
+        prepared.close()
     return text, []
 
 
@@ -866,6 +875,9 @@ def _supplement_title_bar_ocr(
         w, h = img.size
     except Exception:
         return ocr_text, ocr_words
+    finally:
+        if 'img' in locals():
+            img.close()
     strip_h = max(40, int(h * _TITLE_STRIP_FRAC))
     # If we already have a #NNN word inside the title strip, no need to retry.
     for _text, (_x0, y0, _x1, y1) in ocr_words:
@@ -956,7 +968,11 @@ async def _process_screenshot(message: discord.Message) -> None:
     try:
         image_bytes = await attachment.read()
         # Probe-decode to fail fast on corrupt uploads before paying OCR cost.
-        Image.open(io.BytesIO(image_bytes)).verify()
+        probe = Image.open(io.BytesIO(image_bytes))
+        try:
+            probe.verify()
+        finally:
+            probe.close()
     except Exception:
         logger.exception("Failed to read uploaded image")
         await _fail(message, "Invalid image", "Image could not be opened. Re-upload a valid PNG/JPG.")
@@ -1400,7 +1416,6 @@ ALLIANCE_EMOJI_PAYLOAD = _emoji_to_button_payload(ALLIANCE_EMOJI_RAW)
 def _pass_components(
     profile: str,
     clan: str | None,
-    role_lines: list[str],  # kept for API parity / preview
     *,
     clan_emoji: str | None = None,
     mastery_rank: str | None = None,
@@ -2005,9 +2020,7 @@ async def preview_responses(interaction: discord.Interaction) -> None:
     samples = [
         _pass_components(
             "GoldenTenno#200",
-            "PC",
             sample_clan,
-            [],
             clan_emoji=sample_emoji,
             mastery_rank="MR 30",
             link_buttons=_resolve_pass_link_buttons(interaction.guild, sample_clan),
@@ -2388,27 +2401,33 @@ def _circular_avatar(
             "RGBA", (diameter, diameter), _PROGRESS_AVATAR_RING + (255,)
         )
 
-    src = ImageOps.fit(src, (diameter, diameter), Image.LANCZOS)
+    # src from Image.open needs to be closed after processing.
+    needs_close = avatar_bytes is not None
+    try:
+        src = ImageOps.fit(src, (diameter, diameter), Image.LANCZOS)
 
-    # Antialiased circular mask: render at 4x and downsample.
-    scale = 4
-    mask = Image.new("L", (diameter * scale, diameter * scale), 0)
-    ImageDraw.Draw(mask).ellipse(
-        (0, 0, diameter * scale - 1, diameter * scale - 1), fill=255
-    )
-    mask = mask.resize((diameter, diameter), Image.LANCZOS)
+        # Antialiased circular mask: render at 4x and downsample.
+        scale = 4
+        mask = Image.new("L", (diameter * scale, diameter * scale), 0)
+        ImageDraw.Draw(mask).ellipse(
+            (0, 0, diameter * scale - 1, diameter * scale - 1), fill=255
+        )
+        mask = mask.resize((diameter, diameter), Image.LANCZOS)
 
-    avatar = Image.new("RGBA", (diameter, diameter), (0, 0, 0, 0))
-    avatar.paste(src, (0, 0), mask)
+        avatar = Image.new("RGBA", (diameter, diameter), (0, 0, 0, 0))
+        avatar.paste(src, (0, 0), mask)
 
-    ring = Image.new("RGBA", (diameter, diameter), (0, 0, 0, 0))
-    ImageDraw.Draw(ring).ellipse(
-        (0, 0, diameter - 1, diameter - 1),
-        outline=_PROGRESS_AVATAR_RING + (255,),
-        width=4,
-    )
-    avatar.alpha_composite(ring)
-    return avatar
+        ring = Image.new("RGBA", (diameter, diameter), (0, 0, 0, 0))
+        ImageDraw.Draw(ring).ellipse(
+            (0, 0, diameter - 1, diameter - 1),
+            outline=_PROGRESS_AVATAR_RING + (255,),
+            width=4,
+        )
+        avatar.alpha_composite(ring)
+        return avatar
+    finally:
+        if needs_close:
+            src.close()
 
 
 def _gradient_bar(
@@ -2886,15 +2905,6 @@ def _stats_page_overview(s: dict) -> str:
         f"-# Last seen: {_fmt_age(s.get('last_ts'))}\n"
         f"-# DB size: `{_fmt_bytes(s.get('db_size_bytes', 0))}`"
     )
-
-
-def _stats_page_clans(s: dict) -> str:
-    """Deprecated: kept for compatibility. The Clans page now uses
-    `_status_page_clans` which sources data from live Discord roles
-    rather than from OCR'd clan-name strings in analytics (which were
-    noisy: typos, garbage OCR rows, '(none)' bucket, etc.).
-    """
-    return _status_page_clans(None)
 
 
 def _status_page_clans(interaction: discord.Interaction | None) -> str:
