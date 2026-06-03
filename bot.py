@@ -1439,15 +1439,15 @@ def _pass_components(
         "accent_color": ACCENT_PASS,
         "components": container_children,
     }
-    top_level: list[dict] = [header, container]
-    # Progress card as a top-level media gallery so it renders as its own
-    # attachment bubble OUTSIDE the verification container but still in
-    # the same Discord message.
+    top_level: list[dict] = []
+    # Progress card pinned to the TOP of the message (above the verification
+    # card) so the bar / count is the first thing the user sees.
     if progress_attachment:
         top_level.append({
             "type": 12,
             "items": [{"media": {"url": f"attachment://{progress_attachment}"}}],
         })
+    top_level.extend([header, container])
     # Inline nickname prompt as additional top-level components so the
     # whole verification flow lives in one message.
     if nick_suggestion and user_id is not None:
@@ -1583,12 +1583,13 @@ def _incomplete_components(
         "accent_color": ACCENT_INCOMPLETE,
         "components": children,
     }
-    top_level: list[dict] = [header, container]
+    top_level: list[dict] = []
     if progress_attachment:
         top_level.append({
             "type": 12,
             "items": [{"media": {"url": f"attachment://{progress_attachment}"}}],
         })
+    top_level.extend([header, container])
     return top_level
 
 
@@ -1617,12 +1618,14 @@ def _nickname_suggestion(
 def _nickname_prompt_top_level(suggestion: str, user_id: int) -> list[dict]:
     """Return top-level V2 components for the in-game-name Yes/No prompt.
 
-    Emitted as a separator + text + action row at the message's top level
-    (not inside a container) so the buttons sit below the verification
-    card / progress image in the same message.
+    Both yes/no custom IDs carry the URL-encoded suggestion so the
+    handler can address the user by their in-game name on either branch
+    without cross-message state.
     """
     from urllib.parse import quote
 
+    # Discord custom_id cap is 100 chars. Reserve the wider prefix
+    # ("nick:y:<uid>:") so both yes and no IDs fit identically.
     prefix_len = len(f"nick:y:{user_id}:")
     max_encoded_len = 100 - prefix_len
     truncated = suggestion[:max_encoded_len]
@@ -1631,7 +1634,7 @@ def _nickname_prompt_top_level(suggestion: str, user_id: int) -> list[dict]:
         truncated = truncated[:-1]
         encoded = quote(truncated, safe="")
     yes_id = f"nick:y:{user_id}:{encoded}"
-    no_id = f"nick:n:{user_id}"
+    no_id = f"nick:n:{user_id}:{encoded}"
     return [
         {"type": 14},  # Separator
         {
@@ -2368,9 +2371,14 @@ def _circular_avatar(
     diameter = size
     if avatar_bytes:
         try:
-            src = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
+            src = Image.open(io.BytesIO(avatar_bytes))
+            src.load()  # force full decode now to surface truncation
+            src = src.convert("RGBA")
         except Exception:
-            logger.warning("progress: avatar decode failed", exc_info=True)
+            logger.warning(
+                "progress: avatar decode failed (%d bytes)",
+                len(avatar_bytes), exc_info=True,
+            )
             src = Image.new(
                 "RGBA", (diameter, diameter), _PROGRESS_AVATAR_RING + (255,)
             )
@@ -2546,15 +2554,15 @@ async def _fetch_avatar_bytes(url: str) -> bytes | None:
     """Best-effort fetch of an avatar URL; returns None on any failure.
 
     Discord's CDN occasionally 403s requests that lack a recognisable
-    User-Agent, so we send one explicitly. Avatars are tiny (<512 KiB),
-    but we cap at 2 MiB defensively in case Discord ever serves an
-    animated GIF for an upgraded user.
+    User-Agent, so we send one explicitly. Returns the full response body
+    (avatars are <512 KiB; aiohttp's resp.read() handles transfer-encoded
+    chunks correctly where resp.content.read(n) can return short reads).
     """
     try:
         import aiohttp
 
         headers = {
-            "User-Agent": "GoldenPagoda (https://github.com/aidenlong04, 1.0)",
+            "User-Agent": "DiscordBot (https://github.com/aidenlong04/Golden-Pagoda-Image-Reader, 1.0)",
             "Accept": "image/png,image/webp,image/*;q=0.8",
         }
         timeout = aiohttp.ClientTimeout(total=8)
@@ -2566,7 +2574,7 @@ async def _fetch_avatar_bytes(url: str) -> bytes | None:
                         resp.status, url,
                     )
                     return None
-                data = await resp.content.read(2 * 1024 * 1024)
+                data = await resp.read()
                 return data or None
     except Exception:
         logger.warning("progress: avatar fetch failed", exc_info=True)
@@ -2684,7 +2692,13 @@ async def progress_cmd(
 async def _handle_nick_interaction(
     interaction: discord.Interaction, custom_id: str
 ) -> None:
-    """Handle the in-game-name Yes/No buttons posted after verification."""
+    """Handle the in-game-name Yes/No buttons posted after verification.
+
+    On either choice we UPDATE_MESSAGE the original verification reply so
+    the prompt is replaced with a confirmation block addressing the user
+    by their in-game name. Omitting ``attachments`` from the edit payload
+    preserves the existing progress-card attachment.
+    """
     from urllib.parse import unquote
 
     parts = custom_id.split(":", 3)
@@ -2696,6 +2710,10 @@ async def _handle_nick_interaction(
         target_uid = int(parts[2])
     except ValueError:
         return
+
+    suggestion = ""
+    if len(parts) >= 4:
+        suggestion = unquote(parts[3])[:32].strip()
 
     if interaction.user.id != target_uid:
         try:
@@ -2710,52 +2728,51 @@ async def _handle_nick_interaction(
             logger.exception("nick: deny ack failed")
         return
 
-    if action == "n":
-        components = _nickname_resolved_components(
-            "-# Kept your current server nickname.", ACCENT_INCOMPLETE,
-        )
-        try:
-            await _interaction_callback(interaction, 4, components)
-        except Exception:
-            logger.exception("nick: no ack failed")
+    if action not in ("y", "n"):
         return
 
-    if action != "y" or len(parts) < 4:
-        return
+    # Default username for the confirmation header is the in-game name
+    # carried in the custom_id; fall back to the member's display name
+    # if we don't have one.
+    username = suggestion or interaction.user.display_name
 
-    suggestion = unquote(parts[3])[:32].strip()
-    if not suggestion:
-        return
-
-    # interaction.user is already the member object when invoked in a guild
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        msg = "-# Couldn't find your server membership."
-        accent = ACCENT_FAIL
-    else:
-        member = interaction.user
-        msg = f"-# Nickname set to **{suggestion}**."
+    if action == "y":
+        if (
+            suggestion
+            and interaction.guild
+            and isinstance(interaction.user, discord.Member)
+        ):
+            try:
+                await interaction.user.edit(
+                    nick=suggestion,
+                    reason="In-game name applied via verification prompt",
+                )
+            except discord.Forbidden:
+                logger.info("nick: forbidden setting %s", suggestion)
+            except discord.HTTPException:
+                logger.exception("nick: edit failed")
+        selection_line = "-# In-game alias selected"
         accent = ACCENT_PASS
-        try:
-            await member.edit(
-                nick=suggestion,
-                reason="In-game name applied via verification prompt",
-            )
-        except discord.Forbidden:
-            msg = (
-                "-# I don't have permission to change your nickname. "
-                "Set it manually in your profile."
-            )
-            accent = ACCENT_FAIL
-        except discord.HTTPException:
-            logger.exception("nick edit failed")
-            msg = "-# Failed to set nickname. Try again or set it manually."
-            accent = ACCENT_FAIL
+    else:
+        selection_line = "-# Base Discord alias selected"
+        accent = ACCENT_INCOMPLETE
 
-    components = _nickname_resolved_components(msg, accent)
+    text = f"### Understood Tenno - {username}\n{selection_line}"
+    components = [
+        {
+            "type": 17,
+            "accent_color": accent,
+            "components": [{"type": 10, "content": text}],
+        }
+    ]
     try:
-        await _interaction_callback(interaction, 4, components)
+        # type 7 = UPDATE_MESSAGE; non-ephemeral so the original public
+        # message is edited in place.
+        await _interaction_callback(
+            interaction, 7, components, ephemeral=False,
+        )
     except Exception:
-        logger.exception("nick: yes ack failed")
+        logger.exception("nick: update message failed")
 
 
 @client.event
