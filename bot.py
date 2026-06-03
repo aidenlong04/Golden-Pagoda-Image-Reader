@@ -1197,8 +1197,6 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
             mastery_rank=mastery_rank,
             link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
             progress_attachment="progress.png" if progress_png else None,
-            nick_suggestion=nick_target,
-            user_id=member.id,
         )
         outbound = [
             _react(message, "pass"),
@@ -1214,8 +1212,6 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
             " ".join(issues),
             link_buttons=_help_link_buttons(message.guild),
             progress_attachment="progress.png" if progress_png else None,
-            nick_suggestion=nick_target,
-            user_id=member.id,
         )
         outbound = [
             _react(message, "incomplete"),
@@ -1231,6 +1227,17 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
     for result in await asyncio.gather(*outbound, return_exceptions=True):
         if isinstance(result, BaseException):
             logger.exception("post-verification action failed", exc_info=result)
+
+    # Standalone follow-up message for the in-game-name Yes/No prompt.
+    # Sent AFTER the main verification reply so the buttons' UPDATE_MESSAGE
+    # callback only edits this prompt message in place and leaves the
+    # verification card / progress bar untouched.
+    if nick_target:
+        try:
+            prompt_components = _nickname_prompt_components(nick_target, member.id)
+            await _send_v2(message, prompt_components)
+        except Exception:
+            logger.exception("nick prompt send failed")
 
     # Push analytics to a background task so the SQLite write never adds to
     # the user-visible response time. record_verification is fail-soft, so
@@ -1730,6 +1737,53 @@ def _nickname_prompt_top_level(suggestion: str, user_id: int) -> list[dict]:
             ],
         },
     ]
+
+
+def _nickname_prompt_components(suggestion: str, user_id: int) -> list[dict]:
+    """Standalone V2 message for the in-game-name Yes/No prompt.
+
+    Wraps the prompt text + Yes/No row in a single Container (type 17) so
+    when the handler issues UPDATE_MESSAGE (callback type 7) the
+    confirmation card replaces this whole message cleanly and the
+    verification reply / progress bar above are left untouched.
+    """
+    from urllib.parse import quote
+
+    prefix_len = len(f"nick:y:{user_id}:")
+    max_encoded_len = 100 - prefix_len
+    truncated = suggestion[:max_encoded_len]
+    encoded = quote(truncated, safe="")
+    while len(encoded) > max_encoded_len and truncated:
+        truncated = truncated[:-1]
+        encoded = quote(truncated, safe="")
+    yes_id = f"nick:y:{user_id}:{encoded}"
+    no_id = f"nick:n:{user_id}:{encoded}"
+    return [{
+        "type": 17,
+        "accent_color": ACCENT_INCOMPLETE,
+        "components": [
+            {
+                "type": 10,
+                "content": (
+                    f"### Use your in-game name?\n"
+                    f"-# Set your server nickname to **{suggestion}**."
+                ),
+            },
+            {
+                "type": 1,
+                "components": [
+                    {
+                        "type": 2, "style": 3, "label": "Yes",
+                        "custom_id": yes_id,
+                    },
+                    {
+                        "type": 2, "style": 4, "label": "No",
+                        "custom_id": no_id,
+                    },
+                ],
+            },
+        ],
+    }]
 
 
 def _nickname_resolved_components(text: str, accent: int) -> list[dict]:
