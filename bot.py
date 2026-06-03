@@ -2532,104 +2532,6 @@ async def _fetch_avatar_bytes(url: str) -> bytes | None:
         return None
 
 
-async def _interaction_callback_with_file(
-    interaction: discord.Interaction,
-    callback_type: int,
-    components: list[dict],
-    *,
-    file_bytes: bytes,
-    filename: str,
-    content_type: str = "image/png",
-    ephemeral: bool = False,
-) -> None:
-    """POST a Components V2 interaction callback with a single attached file.
-
-    discord.py 2.x has no native V2 support, so we bypass it entirely and
-    talk to the interaction-callback endpoint directly. Interaction
-    callbacks accept the interaction token in the URL (no Authorization
-    header needed) and have generous per-token rate limits — well within
-    a single-shot slash-command response.
-    """
-    import aiohttp
-
-    flags = COMPONENTS_V2_FLAG
-    if ephemeral:
-        flags |= EPHEMERAL_FLAG
-    payload = {
-        "type": callback_type,
-        "data": {
-            "flags": flags,
-            "components": components,
-            "allowed_mentions": {"parse": []},
-            "attachments": [{"id": 0, "filename": filename}],
-        },
-    }
-    form = aiohttp.FormData()
-    form.add_field(
-        "payload_json", json.dumps(payload), content_type="application/json"
-    )
-    form.add_field(
-        "files[0]", file_bytes, filename=filename, content_type=content_type
-    )
-    url = (
-        f"https://discord.com/api/v10/interactions/"
-        f"{interaction.id}/{interaction.token}/callback"
-    )
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, data=form) as resp:
-            if resp.status >= 400:
-                text = await resp.text()
-                raise RuntimeError(
-                    f"interaction callback failed: {resp.status} {text}"
-                )
-    with contextlib.suppress(AttributeError):
-        interaction.response._responded = True  # type: ignore[attr-defined]
-
-
-def _progress_components(
-    *,
-    have: int,
-    total: int,
-    missing: list[str],
-    link_buttons: list[tuple[str, str]] | None = None,
-) -> list[dict]:
-    """V2 container that hosts the rendered progress card image.
-
-    Lists missing categories under the card and surfaces a help-channel
-    link button when the member is short any role.
-    """
-    complete = have >= total and total > 0
-    if complete:
-        footer = "-# \u2605 Verification complete \u2014 all roles assigned."
-    elif missing:
-        bullets = ", ".join(f"**{m}**" for m in missing)
-        footer = f"-# Missing: {bullets}"
-    else:
-        footer = "-# No verification categories are configured for this server."
-
-    children: list[dict] = [
-        {
-            "type": 12,
-            "items": [{"media": {"url": "attachment://progress.png"}}],
-        },
-        {"type": 10, "content": footer},
-    ]
-    if link_buttons and not complete:
-        children.append({
-            "type": 1,
-            "components": [
-                {"type": 2, "style": 5, "label": label, "url": url}
-                for label, url in link_buttons[:5]
-            ],
-        })
-    return [{
-        "type": 17,
-        "accent_color": ACCENT_PASS if complete else 0x5DD0F3,
-        "components": children,
-    }]
-
-
 @tree.command(
     name="progress",
     description="Show your verification role progress (0-100% complete).",
@@ -2645,8 +2547,6 @@ async def progress_cmd(
 ) -> None:
     target = user or interaction.user
     if not isinstance(target, discord.Member):
-        # Slash commands always carry a Member when invoked in a guild, but
-        # defensively handle the User edge case (DMs, stale cache).
         await interaction.response.send_message(
             "\u274C /progress can only be used in a server.", ephemeral=True
         )
@@ -2661,6 +2561,7 @@ async def progress_cmd(
     total = len(cats)
     have = sum(1 for _, ok in cats if ok)
     missing = [name for name, ok in cats if not ok]
+    complete = have >= total and total > 0
 
     avatar_bytes = await _fetch_avatar_bytes(avatar_url)
     png = await asyncio.to_thread(
@@ -2670,17 +2571,37 @@ async def progress_cmd(
         count=have,
         target=total,
     )
-    components = _progress_components(
-        have=have,
-        total=total,
-        missing=missing,
-        link_buttons=_help_link_buttons(interaction.guild),
-    )
+
+    if complete:
+        content = "\u2605 Verification complete \u2014 all roles assigned."
+    elif missing:
+        bullets = ", ".join(f"**{m}**" for m in missing)
+        content = f"-# Missing: {bullets}"
+    else:
+        content = "-# No verification categories are configured for this server."
+
+    # Mirror the verification flow: the progress card is a plain
+    # attachment (its own bubble), and the missing-roles summary +
+    # help link travel in the same message as content + a Link button.
+    view: discord.ui.View | None = None
+    if not complete:
+        link_buttons = _help_link_buttons(interaction.guild)
+        if link_buttons:
+            view = discord.ui.View(timeout=None)
+            for label, url in link_buttons[:5]:
+                view.add_item(
+                    discord.ui.Button(
+                        style=discord.ButtonStyle.link, label=label, url=url,
+                    )
+                )
+
     try:
-        await _interaction_callback_with_file(
-            interaction, 4, components,
-            file_bytes=png, filename="progress.png",
+        await interaction.response.send_message(
+            content=content,
+            file=discord.File(io.BytesIO(png), filename="progress.png"),
+            view=view if view is not None else discord.utils.MISSING,
             ephemeral=ephemeral,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
     except Exception:
         logger.exception("/progress failed")
