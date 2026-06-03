@@ -1506,7 +1506,7 @@ def _pass_components(
     # directly underneath so the verified identity reads top-to-bottom.
     inner_lines = [f"### \u2705  `{display_profile}`", clan_part]
     if mastery_rank:
-        inner_lines.append(f"-# > {mastery_rank}")
+        inner_lines.append(f"-# {mastery_rank}")
     inner = "\n".join(inner_lines)
     container_children: list[dict] = [{"type": 10, "content": inner}]
     if link_buttons:
@@ -1634,21 +1634,20 @@ def _incomplete_components(
     nick_suggestion: str | None = None,
     user_id: int | None = None,
 ) -> list[dict]:
-    header = {
-        "type": 10,
-        "content": "### \u26a0\ufe0f  Please select the missing roles",
-    }
     children: list[dict] = [
-        {"type": 10, "content": f"-# {reason}"},
+        {
+            "type": 10,
+            "content": (
+                "### \u26a0\ufe0f  Please select the missing roles\n"
+                f"-# {reason}"
+            ),
+        },
     ]
     if image_url:
-        children.insert(
-            1,
-            {
-                "type": 12,
-                "items": [{"media": {"url": image_url}}],
-            },
-        )
+        children.append({
+            "type": 12,
+            "items": [{"media": {"url": image_url}}],
+        })
     if link_buttons:
         # Discord caps action rows at 5 buttons; we never exceed that here.
         children.append({
@@ -1669,7 +1668,7 @@ def _incomplete_components(
             "type": 12,
             "items": [{"media": {"url": f"attachment://{progress_attachment}"}}],
         })
-    top_level.extend([header, container])
+    top_level.append(container)
     if nick_suggestion and user_id is not None:
         top_level.extend(_nickname_prompt_top_level(nick_suggestion, user_id))
     return top_level
@@ -1804,8 +1803,8 @@ def _nickname_prompt_components(
             "components": [{
                 "type": 10,
                 "content": (
-                    " ### Hello Operator!\n"
-                    "-# > Please Select your call sign."
+                    "### Hello Operator!\n"
+                    "-# Pick your call sign."
                 ),
             }],
         },
@@ -2479,7 +2478,7 @@ async def status_cmd(interaction: discord.Interaction) -> None:
 # member's avatar (circular, left) with a rounded gradient progress bar
 # and inline text overlay so a single PNG carries the whole message.
 _PROGRESS_CARD_W = 860
-_PROGRESS_CARD_H = 200
+_PROGRESS_CARD_H = 160
 _PROGRESS_BG = (30, 31, 34)            # #1E1F22 Discord dark
 _PROGRESS_BG_EDGE = (24, 25, 28)       # subtle inner shadow
 _PROGRESS_TRACK = (43, 45, 49)         # #2B2D31
@@ -2488,7 +2487,7 @@ _PROGRESS_FILL_END = (134, 230, 168)   # mint — gradient end
 _PROGRESS_FILL_GOLD = (212, 168, 87)   # gold for finished bars
 _PROGRESS_TEXT = (236, 238, 240)
 _PROGRESS_MUTED = (163, 166, 170)
-_PROGRESS_AVATAR_SIZE = 144
+_PROGRESS_AVATAR_SIZE = 112
 _PROGRESS_AVATAR_RING = (212, 168, 87)
 
 
@@ -2613,7 +2612,7 @@ def _render_progress_card_png(
     count: int,
     target: int,
 ) -> bytes:
-    """Render an 860x200 progress card and return PNG bytes.
+    """Render an 860x160 progress card and return PNG bytes.
 
     Composition: circular avatar (left) + gradient bar with overlay text
     on the right. The whole composition is a single PNG so the V2 message
@@ -2630,7 +2629,7 @@ def _render_progress_card_png(
         radius=22, outline=_PROGRESS_BG_EDGE + (255,), width=2,
     )
 
-    pad = 28
+    pad = 22
     avatar = _circular_avatar(avatar_bytes, _PROGRESS_AVATAR_SIZE)
     avatar_y = (_PROGRESS_CARD_H - _PROGRESS_AVATAR_SIZE) // 2
 
@@ -2648,14 +2647,14 @@ def _render_progress_card_png(
     canvas.alpha_composite(shadow)
     canvas.alpha_composite(avatar, (pad, avatar_y))
 
-    text_x = pad + _PROGRESS_AVATAR_SIZE + 28
+    text_x = pad + _PROGRESS_AVATAR_SIZE + 22
     right_x = _PROGRESS_CARD_W - pad
     draw = ImageDraw.Draw(canvas)
 
-    name_font = _load_font(34, bold=True)
-    label_font = _load_font(18, bold=True)
-    count_font = _load_font(26, bold=True)
-    footer_font = _load_font(16)
+    name_font = _load_font(28, bold=True)
+    label_font = _load_font(16, bold=True)
+    count_font = _load_font(22, bold=True)
+    footer_font = _load_font(14)
 
     name = display_name or "Member"
     max_name_w = right_x - text_x - 10
@@ -2665,12 +2664,12 @@ def _render_progress_card_png(
         ) > max_name_w:
             name = name[:-1]
         name = name + "\u2026"
-    draw.text((text_x, 24), name, font=name_font, fill=_PROGRESS_TEXT)
+    draw.text((text_x, 18), name, font=name_font, fill=_PROGRESS_TEXT)
 
     count_text = f"{count} / {target}"
     count_w = draw.textlength(count_text, font=count_font)
     draw.text(
-        (right_x - count_w, 78),
+        (right_x - count_w, 60),
         count_text,
         font=count_font,
         fill=_PROGRESS_TEXT,
@@ -2678,15 +2677,15 @@ def _render_progress_card_png(
 
     pct_label = f"{int(round(progress * 100))}%"
     draw.text(
-        (text_x, 84),
+        (text_x, 64),
         f"PROGRESS  \u2022  {pct_label}",
         font=label_font,
         fill=_PROGRESS_MUTED,
     )
 
-    bar_h = 28
+    bar_h = 22
     bar_w = right_x - text_x
-    bar_y = 124
+    bar_y = 100
     bar = _gradient_bar(bar_w, bar_h, progress, complete=complete)
     canvas.alpha_composite(bar, (text_x, bar_y))
 
