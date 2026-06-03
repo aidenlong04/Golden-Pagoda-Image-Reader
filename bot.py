@@ -199,14 +199,33 @@ CATCHUP_DELAY_SECONDS = float(os.getenv("CATCHUP_DELAY_SECONDS") or "1.0")
 # member counts as having the category if they hold ANY of the listed roles.
 # Empty list disables the category (it stays at 0/0 and doesn't drag the
 # completion percentage down).
-MR_ROLE_IDS: list[int] = [
-    int(x) for x in (os.getenv("MR_ROLE_IDS") or "").split(",")
-    if x.strip().isdigit()
-]
-SYNDICATE_ROLE_IDS: list[int] = [
-    int(x) for x in (os.getenv("SYNDICATE_ROLE_IDS") or "").split(",")
-    if x.strip().isdigit()
-]
+#
+# Operators normally configure these by NAME via MR_ROLE_NAMES /
+# SYNDICATE_ROLE_NAMES: on every reconnect those names are resolved
+# against each guild's role list and the IDs are written back to
+# MR_ROLE_IDS / SYNDICATE_ROLE_IDS in .env. The _IDS vars are still
+# the source of truth at runtime (and can be hand-edited as a fallback).
+def _csv(name: str, default: str = "") -> list[str]:
+    return [
+        x.strip() for x in (os.getenv(name) or default).split(",") if x.strip()
+    ]
+
+
+def _csv_ids(name: str) -> list[int]:
+    return [int(x) for x in _csv(name) if x.isdigit()]
+
+
+MR_ROLE_NAMES: list[str] = _csv(
+    "MR_ROLE_NAMES",
+    "MR 1-10,MR 11-15,MR 16-22,MR 22-29,MR 30,LR 1-7",
+)
+SYNDICATE_ROLE_NAMES: list[str] = _csv(
+    "SYNDICATE_ROLE_NAMES",
+    "Steel Meridian,Arbiters of Hexis,Cephalon Suda,"
+    "The Perrin Sequence,Red Veil,New Loka",
+)
+MR_ROLE_IDS: list[int] = _csv_ids("MR_ROLE_IDS")
+SYNDICATE_ROLE_IDS: list[int] = _csv_ids("SYNDICATE_ROLE_IDS")
 # Channel users are directed to when they're missing MR/Platform/Syndicate.
 # Surfaces as a link button on the incomplete card.
 HELP_CHANNEL_ID = _int_env("HELP_CHANNEL_ID", 1392582268769271950)
@@ -332,6 +351,28 @@ def _update_env_platform_ids(ids: dict[str, int | None]) -> bool:
     return True
 
 
+def _update_env_id_list(env_key: str, ids: list[int]) -> bool:
+    """Rewrite (or append) ``ENV_KEY=id1,id2,...`` in the .env file."""
+    if not ENV_FILE_PATH.exists():
+        return False
+    value = ",".join(str(i) for i in ids)
+    lines = ENV_FILE_PATH.read_text().splitlines()
+    pattern = re.compile(rf"^(\s*){re.escape(env_key)}\s*=.*$")
+    replaced = False
+    for idx, line in enumerate(lines):
+        m = pattern.match(line)
+        if m:
+            lines[idx] = f"{m.group(1)}{env_key}={value}"
+            replaced = True
+            break
+    if not replaced:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(f"{env_key}={value}")
+    _atomic_write_text(ENV_FILE_PATH, "\n".join(lines) + "\n")
+    return True
+
+
 # ---------- Discord client --------------------------------------------------
 
 intents = discord.Intents.default()
@@ -429,6 +470,7 @@ async def on_ready() -> None:
         client._health_started = True  # type: ignore[attr-defined]
     _sync_clan_slots_from_guilds()
     _sync_platform_roles_from_guilds()
+    _sync_named_role_lists_from_guilds()
     try:
         synced = await tree.sync()
         logger.info("Synced %d slash command(s)", len(synced))
@@ -487,6 +529,54 @@ def _sync_platform_roles_from_guilds() -> list[str]:
             _update_env_platform_ids(PLATFORM_ROLE_IDS)
         except Exception:
             logger.exception("Failed to update %s", ENV_FILE_PATH)
+    return changes
+
+
+def _resolve_named_roles(names: list[str]) -> list[int]:
+    """Look up each role name across the connected guilds (case-insensitive,
+    first match wins) and return the resolved IDs in input order. Names
+    that don't match any guild role are silently skipped.
+    """
+    if not names or not client.guilds:
+        return []
+    ids: list[int] = []
+    for name in names:
+        for guild in client.guilds:
+            role = _find_role(guild, name)
+            if role is not None:
+                ids.append(role.id)
+                break
+    return ids
+
+
+def _sync_named_role_lists_from_guilds() -> list[str]:
+    """Resolve MR_ROLE_NAMES / SYNDICATE_ROLE_NAMES against the server's
+    role list and write the resulting ID lists back to .env. Mirrors
+    the platform/clan auto-resolve flow.
+    """
+    global MR_ROLE_IDS, SYNDICATE_ROLE_IDS
+    if not client.guilds:
+        return []
+    changes: list[str] = []
+    for label, names, env_id_key, current in (
+        ("MR", MR_ROLE_NAMES, "MR_ROLE_IDS", MR_ROLE_IDS),
+        ("Syndicate", SYNDICATE_ROLE_NAMES, "SYNDICATE_ROLE_IDS", SYNDICATE_ROLE_IDS),
+    ):
+        resolved = _resolve_named_roles(names)
+        if not resolved or resolved == current:
+            continue
+        logger.info(
+            "%s role IDs: %s → %s (from %s)", label, current, resolved, names,
+        )
+        if label == "MR":
+            MR_ROLE_IDS = resolved
+        else:
+            SYNDICATE_ROLE_IDS = resolved
+        try:
+            _update_env_id_list(env_id_key, resolved)
+        except Exception:
+            logger.exception("Failed to update %s in %s", env_id_key, ENV_FILE_PATH)
+        changes.append(f"{label}: {current} → {resolved}")
     return changes
 
 
