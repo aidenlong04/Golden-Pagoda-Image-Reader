@@ -25,13 +25,14 @@ ExecStartPre=-/bin/chmod 0600 /opt/golden-pagoda/.env
 ExecStart=/usr/bin/docker run --rm --name golden-pagoda --init \
     --pull=never \
     --memory=512m --memory-swap=512m \
-    --cpus=1 \
+    --cpus=1.5 \
     --pids-limit=256 \
     --log-driver=json-file \
     --log-opt max-size=10m \
     --log-opt max-file=3 \
     --env-file /opt/golden-pagoda/.env \
     -e ENV_FILE_PATH=/app/.env \
+    -e PYTHONOPTIMIZE=1 \
     -v /opt/golden-pagoda/.env:/app/.env \
     -v /opt/golden-pagoda/icons:/app/icons \
     -v /opt/golden-pagoda/data:/app/data \

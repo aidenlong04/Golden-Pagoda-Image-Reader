@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import io
 import json
 import logging
@@ -477,6 +478,33 @@ def _spawn_bg_task(coro) -> asyncio.Task:
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
     return task
+
+
+# Persistent aiohttp session for Discord REST + CDN fetches. Reusing a
+# single session avoids paying the TLS handshake (~100-200ms on a CX22
+# AMD Rome core) on every reply, progress edit, and avatar fetch.
+_HTTP_SESSION = None  # type: ignore[var-annotated]
+_HTTP_SESSION_LOCK = asyncio.Lock()
+
+
+async def _get_http_session():
+    """Return the process-wide aiohttp ClientSession, creating it lazily.
+
+    The session is bound to the running event loop. Callers must await
+    this from within the bot's loop (everywhere we use it already does).
+    """
+    global _HTTP_SESSION
+    if _HTTP_SESSION is not None and not _HTTP_SESSION.closed:
+        return _HTTP_SESSION
+    import aiohttp
+
+    async with _HTTP_SESSION_LOCK:
+        if _HTTP_SESSION is None or _HTTP_SESSION.closed:
+            connector = aiohttp.TCPConnector(
+                limit=20, ttl_dns_cache=300, enable_cleanup_closed=True
+            )
+            _HTTP_SESSION = aiohttp.ClientSession(connector=connector)
+    return _HTTP_SESSION
 
 
 @client.event
@@ -2014,12 +2042,14 @@ async def _send_v2(
                 "User-Agent": "GoldenPagoda (https://github.com/aidenlong04, 1.0)",
             }
             timeout = aiohttp.ClientTimeout(total=15)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, data=form, headers=headers) as resp:
-                    if resp.status >= 400:
-                        text = await resp.text()
-                        raise discord.HTTPException(resp, text)  # type: ignore[arg-type]
-                    data = await resp.json()
+            session = await _get_http_session()
+            async with session.post(
+                url, data=form, headers=headers, timeout=timeout
+            ) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    raise discord.HTTPException(resp, text)  # type: ignore[arg-type]
+                data = await resp.json()
         else:
             data = await client.http.request(route, json=payload)
         if isinstance(data, dict):
@@ -2096,13 +2126,15 @@ async def _edit_message_v2_with_file(
         "User-Agent": "GoldenPagoda (https://github.com/aidenlong04, 1.0)",
     }
     timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.patch(url, data=form, headers=headers) as resp:
-            if resp.status >= 400:
-                text = await resp.text()
-                raise RuntimeError(
-                    f"PATCH message {message_id} failed: {resp.status} {text}"
-                )
+    session = await _get_http_session()
+    async with session.patch(
+        url, data=form, headers=headers, timeout=timeout
+    ) as resp:
+        if resp.status >= 400:
+            text = await resp.text()
+            raise RuntimeError(
+                f"PATCH message {message_id} failed: {resp.status} {text}"
+            )
 
 
 async def _delete_after(channel_id: int, message_id: int, delay: float) -> None:
@@ -2675,10 +2707,15 @@ _PROGRESS_AVATAR_RING = (212, 168, 87)
 def _load_font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
     """Load DejaVu Sans at ``size``; fall back to PIL default on any error.
 
-    DejaVu ships with ``fonts-dejavu-core`` (Debian) and is installed in
-    the container image. The fallback keeps unit tests + dev environments
-    without the package from crashing.
+    Results are memoized — fonts are immutable for a given (size, bold)
+    pair and the truetype open is the single hottest call inside
+    ``_render_progress_card_png`` (invoked 4-5 times per render).
     """
+    return _load_font_cached(size, bold)
+
+
+@functools.lru_cache(maxsize=32)
+def _load_font_cached(size: int, bold: bool) -> ImageFont.FreeTypeFont:
     name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
     candidates = [
         f"/usr/share/fonts/truetype/dejavu/{name}",
@@ -2894,23 +2931,23 @@ async def _fetch_avatar_bytes(url: str) -> bytes | None:
     chunks correctly where resp.content.read(n) can return short reads).
     """
     try:
-        import aiohttp
-
         headers = {
             "User-Agent": "DiscordBot (https://github.com/aidenlong04/Golden-Pagoda-Image-Reader, 1.0)",
             "Accept": "image/png,image/webp,image/*;q=0.8",
         }
+        import aiohttp
+
         timeout = aiohttp.ClientTimeout(total=8)
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    logger.warning(
-                        "progress: avatar fetch returned HTTP %s for %s",
-                        resp.status, url,
-                    )
-                    return None
-                data = await resp.read()
-                return data or None
+        session = await _get_http_session()
+        async with session.get(url, headers=headers, timeout=timeout) as resp:
+            if resp.status != 200:
+                logger.warning(
+                    "progress: avatar fetch returned HTTP %s for %s",
+                    resp.status, url,
+                )
+                return None
+            data = await resp.read()
+            return data or None
     except Exception:
         logger.warning("progress: avatar fetch failed", exc_info=True)
         return None
@@ -3385,6 +3422,16 @@ def _stats_page_ocr(s: dict) -> str:
 
 
 if __name__ == "__main__":
+    # uvloop is a drop-in C event loop; ~2-4x faster than asyncio default
+    # for I/O-heavy workloads. Optional dependency — fall back silently
+    # if it isn't installed (dev shells, ARM builds without wheels, etc.).
+    try:
+        import uvloop  # type: ignore
+
+        uvloop.install()
+        logger.info("uvloop event loop installed")
+    except ImportError:
+        pass
     # log_handler=None disables discord.py's own setup_logging so we don't
     # get duplicate handlers on the root + `discord` loggers (which would
     # double every log line emitted by discord.py).
