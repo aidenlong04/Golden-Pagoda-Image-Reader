@@ -1464,6 +1464,12 @@ def _quote(text: str) -> str:
 
 CLAN_EMOJI = os.getenv("CLAN_EMOJI", "").strip() or "\U0001F6E1\ufe0f"  # 🛡️
 ALLIANCE_EMOJI_RAW = os.getenv("ALLIANCE_EMOJI", "<:GoldenPagoda_Emblem:1416905638428020877>").strip()
+OPERATOR_EMOJI_RAW = os.getenv(
+    "OPERATOR_EMOJI", "<:operator:1467922510908494098>"
+).strip()
+PICK_ROLES_EMOJI_RAW = os.getenv(
+    "PICK_ROLES_EMOJI", "<:roles:1502055976830894291>"
+).strip()
 
 
 def _emoji_to_button_payload(raw: str) -> dict | None:
@@ -1479,6 +1485,7 @@ def _emoji_to_button_payload(raw: str) -> dict | None:
 
 
 ALLIANCE_EMOJI_PAYLOAD = _emoji_to_button_payload(ALLIANCE_EMOJI_RAW)
+PICK_ROLES_EMOJI_PAYLOAD = _emoji_to_button_payload(PICK_ROLES_EMOJI_RAW)
 
 
 def _pass_components(
@@ -1495,7 +1502,7 @@ def _pass_components(
 ) -> list[dict]:
     emoji = (clan_emoji or "").strip() or CLAN_EMOJI
     display_clan = _strip_clan_tag(clan) if clan else None
-    clan_part = f"{emoji} **{display_clan}**" if display_clan else f"{emoji} *Unaffiliated*"
+    clan_part = f"> {emoji} **{display_clan}**" if display_clan else f"> {emoji} *Unaffiliated*"
     # Profile names normally render without the #NNN discriminator for
     # cleaner display. The "Tenno #<member_count>" fallback (used when
     # OCR can't read the real handle) intentionally keeps the suffix so
@@ -1506,13 +1513,13 @@ def _pass_components(
         display_profile = _strip_clan_tag(profile)
     # In-game name shown as the heading inside the container, with clan
     # directly underneath so the verified identity reads top-to-bottom.
-    inner_lines = [f"### \u2705  `{display_profile}`", clan_part]
+    inner_lines = [f"> {OPERATOR_EMOJI_RAW} **`{display_profile}`**", clan_part]
     if mastery_rank:
-        inner_lines.append(f"-# {mastery_rank}")
+        inner_lines.append(f"> -# {mastery_rank}")
     if missing_categories:
         joined = ", ".join(f"**{c}**" for c in missing_categories)
         inner_lines.append(
-            f"-# \u26a0\ufe0f Still missing: {joined} \u2014 please pick them."
+            f"> -# \u26a0\ufe0f Still missing: {joined} \u2014 please pick them."
         )
     inner = "\n".join(inner_lines)
     container_children: list[dict] = [{"type": 10, "content": inner}]
@@ -1522,6 +1529,8 @@ def _pass_components(
             btn: dict = {"type": 2, "style": 5, "label": label, "url": url}
             if label == "Clan Chat" and ALLIANCE_EMOJI_PAYLOAD is not None:
                 btn["emoji"] = ALLIANCE_EMOJI_PAYLOAD
+            elif label == "Pick Roles" and PICK_ROLES_EMOJI_PAYLOAD is not None:
+                btn["emoji"] = PICK_ROLES_EMOJI_PAYLOAD
             button_payloads.append(btn)
         container_children.append({"type": 1, "components": button_payloads})
     container = {
@@ -1604,6 +1613,9 @@ def _resolve_pass_link_buttons(
     if info is not None:
         label = f"#{info.name}"
         buttons.append((label, _channel_url(guild.id, info.id)))
+    pick = guild.get_channel(PASS_INFO_CHANNEL_ID)
+    if pick is not None:
+        buttons.append(("Pick Roles", _channel_url(guild.id, pick.id)))
     return buttons
 
 
