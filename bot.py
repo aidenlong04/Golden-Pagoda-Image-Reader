@@ -1801,11 +1801,6 @@ def _nickname_prompt_components(
         return section
 
     components: list[dict] = []
-    if NICK_PROMPT_BANNER_URL:
-        components.append({
-            "type": 12,
-            "items": [{"media": {"url": NICK_PROMPT_BANNER_URL}}],
-        })
     components.extend([
         {
             "type": 17,
