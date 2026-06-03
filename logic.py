@@ -62,15 +62,32 @@ def parse_mastery_rank(ocr_text: str) -> str | None:
     for index, line in enumerate(lines):
         if not _MASTERY_HEADER_RE.search(line):
             continue
-        for candidate in lines[index + 1 : index + 5]:
+        # Widen the search window: on some captures (esp. console UI with
+        # an offset HUD), the credit count from the top bar can leak onto
+        # the line right after the header, pushing the actual badge
+        # number a few lines further down.
+        for candidate in lines[index + 1 : index + 10]:
             if not candidate:
                 continue
             upper = candidate.upper()
             if "UNRANKED" in upper:
                 return "Unranked"
+            # Skip lines that look like XP / credit totals (digit groups
+            # with thousands separators e.g. "2,037,372" or "3 837 977"
+            # or pure 4+ digit runs like "65128"). The MR badge itself
+            # is always a small 1-3 digit standalone integer.
+            if re.search(r"\d[\d,\s\.]*\d{3}\b", candidate):
+                continue
+            if re.search(r"\b\d{4,}\b", candidate):
+                continue
             m = re.search(r"\b(\d{1,3})\b", candidate)
             if m:
-                return f"MR {int(m.group(1))}"
+                value = int(m.group(1))
+                # Warframe MR currently caps well under 100; treat
+                # anything above 50 as a stray match and keep scanning.
+                if value > 50:
+                    continue
+                return f"MR {value}"
     return None
 
 

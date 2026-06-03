@@ -55,6 +55,24 @@ class ParseMasteryRankTests(unittest.TestCase):
     def test_returns_none_when_missing(self) -> None:
         self.assertIsNone(parse_mastery_rank("no header here"))
 
+    def test_skips_thousands_separated_xp_and_credits(self) -> None:
+        # Real failure: top-bar credits "3,837,977" landed on the line
+        # right after "MASTERY RANK", causing the parser to return MR 3
+        # before seeing the actual badge "28" further down.
+        text = (
+            "MASTERY RANK\n"
+            "3,837,977\n"
+            "28\n"
+            "MASTER\n"
+            "2,037,372\n"
+            "NEXT RANK: MIDDLE MASTER IN 65,128\n"
+        )
+        self.assertEqual(parse_mastery_rank(text), "MR 28")
+
+    def test_ignores_implausibly_large_rank_value(self) -> None:
+        text = "MASTERY RANK\n200\n14\nCLAN\n"
+        self.assertEqual(parse_mastery_rank(text), "MR 14")
+
 
 class FindClanSlotTests(unittest.TestCase):
     def test_matches_case_insensitively(self) -> None:
