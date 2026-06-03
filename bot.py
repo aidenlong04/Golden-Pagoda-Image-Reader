@@ -10,6 +10,7 @@ import re
 import sys
 import time
 import warnings
+from collections import deque
 from collections.abc import Callable
 from datetime import timedelta
 from importlib import metadata as importlib_metadata
@@ -395,6 +396,16 @@ _COMMAND_IDS: dict[str, int] = {}
 # garbage-collected mid-await. We discard each task once it completes.
 _BG_TASKS: set[asyncio.Task] = set()
 
+# Sliding-window error tracking for the healthcheck. When >= 3 errors
+# occur in a 60s window, the health-tick task stops writing the signal
+# file so the watchdog sees the container as unhealthy and restarts it.
+# This catches systemic functional failures (e.g. every screenshot raising
+# TypeError) that the current "asyncio loop is alive" check misses.
+_ERROR_TIMESTAMPS: deque[float] = deque(maxlen=10)
+_ERROR_THRESHOLD = 3
+_ERROR_WINDOW_SECONDS = 60
+_HEALTH_STOPPED = False
+
 
 # ---------- Catch-up state persistence --------------------------------------
 
@@ -444,12 +455,14 @@ def _message_already_processed(message: discord.Message) -> bool:
 
 
 async def _health_task() -> None:
+    global _HEALTH_STOPPED
     while True:
-        try:
-            with open(HEALTH_PATH, "w") as fh:
-                fh.write(str(int(time.time())))
-        except OSError:
-            logger.exception("health write failed")
+        if not _HEALTH_STOPPED:
+            try:
+                with open(HEALTH_PATH, "w") as fh:
+                    fh.write(str(int(time.time())))
+            except OSError:
+                logger.exception("health write failed")
         await asyncio.sleep(HEALTH_INTERVAL)
 
 
@@ -885,15 +898,18 @@ def _supplement_title_bar_ocr(
             return ocr_text, ocr_words
     try:
         strip = img.crop((0, 0, w, strip_h)).convert("L")
-        # Upscale aggressively — title-bar glyphs are ~16-22px tall on a
-        # 1080p screenshot, well below Tesseract's comfort zone.
-        strip = strip.resize((strip.width * 3, strip.height * 3), Image.LANCZOS)
-        strip = ImageOps.autocontrast(strip, cutoff=2)
-        data = pytesseract.image_to_data(
-            strip,
-            config="--oem 3 --psm 7",
-            output_type=pytesseract.Output.DICT,
-        )
+        try:
+            # Upscale aggressively — title-bar glyphs are ~16-22px tall on a
+            # 1080p screenshot, well below Tesseract's comfort zone.
+            strip = strip.resize((strip.width * 3, strip.height * 3), Image.LANCZOS)
+            strip = ImageOps.autocontrast(strip, cutoff=2)
+            data = pytesseract.image_to_data(
+                strip,
+                config="--oem 3 --psm 7",
+                output_type=pytesseract.Output.DICT,
+            )
+        finally:
+            strip.close()
     except Exception:
         logger.exception("Title-bar Tesseract supplement failed")
         return ocr_text, ocr_words
@@ -957,6 +973,40 @@ def _first_image_attachment(message: discord.Message) -> discord.Attachment | No
 async def _process_screenshot(message: discord.Message) -> None:
     """Core screenshot verification logic. Extracted from on_message to support
     both live processing and catch-up scanning."""
+    global _ERROR_TIMESTAMPS, _HEALTH_STOPPED
+    try:
+        await _process_screenshot_impl(message)
+    except Exception as e:
+        # Top-level catch-all: log systemic bugs at ERROR and track them
+        # in the sliding window. Transient user errors (e.g. discord.Forbidden
+        # on role assignment) are already caught + logged deeper in the stack
+        # and don't propagate here.
+        if isinstance(e, (TypeError, AttributeError, NameError, KeyError, ValueError)):
+            logger.error(
+                "_process_screenshot: unexpected exception (systemic bug): %s",
+                e.__class__.__name__, exc_info=True,
+            )
+            _ERROR_TIMESTAMPS.append(time.time())
+            # If we have >= ERROR_THRESHOLD errors in the last ERROR_WINDOW_SECONDS,
+            # stop the health signal so the watchdog restarts the container.
+            now = time.time()
+            recent = sum(1 for ts in _ERROR_TIMESTAMPS if now - ts < _ERROR_WINDOW_SECONDS)
+            if recent >= _ERROR_THRESHOLD:
+                if not _HEALTH_STOPPED:
+                    logger.critical(
+                        "_process_screenshot: %d errors in %ds window; stopping health signal",
+                        recent, _ERROR_WINDOW_SECONDS,
+                    )
+                    _HEALTH_STOPPED = True
+        else:
+            # Transient network / Discord API errors — log but don't count
+            # toward the systemic-failure threshold.
+            logger.exception("_process_screenshot: transient error")
+        raise
+
+
+async def _process_screenshot_impl(message: discord.Message) -> None:
+    """Core screenshot verification logic implementation (wrapped by error-tracking)."""
     attachment = _first_image_attachment(message)
     if attachment is None:
         await _fail(message, "Not an image", "Upload a PNG/JPG screenshot of your Warframe profile.")
@@ -1396,7 +1446,7 @@ def _quote(text: str) -> str:
     return "\n".join(f"> {line}" if line else ">" for line in text.splitlines() or [text])
 
 
-CLAN_EMOJI = os.getenv("CLAN_EMOJI", "").strip() or "\U0001F6E1\uFE0F"  # 🛡️
+CLAN_EMOJI = os.getenv("CLAN_EMOJI", "").strip() or "\U0001F6E1\ufe0f"  # 🛡️
 ALLIANCE_EMOJI_RAW = os.getenv("ALLIANCE_EMOJI", "<:GoldenPagoda_Emblem:1416905638428020877>").strip()
 
 
@@ -1571,7 +1621,7 @@ def _incomplete_components(
 ) -> list[dict]:
     header = {
         "type": 10,
-        "content": "### \u26A0\uFE0F  Please select the missing roles",
+        "content": "### \u26a0\ufe0f  Please select the missing roles",
     }
     children: list[dict] = [
         {"type": 10, "content": f"-# {reason}"},
@@ -2102,7 +2152,7 @@ def _status_page_bot(interaction: discord.Interaction) -> str:
     uptime = _fmt_uptime(time.time() - BOT_START_TIME)
     hb = _health_age()
     if hb is None:
-        hb_line = "\u26A0\uFE0F unhealthy (no signal)"
+        hb_line = "\u26a0\ufe0f unhealthy (no signal)"
     elif hb > 90:
         hb_line = f"\u274C unhealthy ({hb}s stale)"
     else:
@@ -2216,12 +2266,12 @@ def _status_page_misc(interaction: discord.Interaction) -> str:
 
 _STATUS_PAGES: list[tuple[str, str, str, Callable]] = [
     ("bot",       "\U0001F916 Bot",          "Bot identity, latency, uptime.",  lambda i, _s: _status_page_bot(i)),
-    ("roles",     "\U0001F6E1\uFE0F Roles",  "Configured roles + slot map.",    lambda i, _s: _status_page_roles(i)),
+    ("roles",     "\U0001F6E1\ufe0f Roles",  "Configured roles + slot map.",    lambda i, _s: _status_page_roles(i)),
     ("channels",  "\U0001F4FA Channels",     "Target/info/preview channels.",   lambda i, _s: _status_page_channels(i)),
     ("misc",      "\U0001F527 OCR / Misc",   "OCR backend, TTL, reactions.",    lambda i, _s: _status_page_misc(i)),
     ("stats",     "\U0001F4C8 Stats",        "Verification totals + windows.",  lambda _i, s: _stats_page_overview(s)),
     ("clans",     "\U0001F3F0 Clans",        "Configured clans + member counts.", lambda i, _s: _status_page_clans(i)),
-    ("ocr",       "\u23F1\uFE0F OCR Latency","OCR latency p50/p95/avg.",        lambda _i, s: _stats_page_ocr(s)),
+    ("ocr",       "\u23f1\ufe0f OCR Latency","OCR latency p50/p95/avg.",        lambda _i, s: _stats_page_ocr(s)),
 ]
 _STATUS_PAGE_INDEX: dict[str, int] = {key: idx for idx, (key, *_rest) in enumerate(_STATUS_PAGES)}
 
@@ -2612,11 +2662,11 @@ def _progress_components(
         body = "\u2605 Verification complete \u2014 all roles assigned."
         accent = ACCENT_PASS
     elif total == 0:
-        icon = "\u26A0\uFE0F"
+        icon = "\u26a0\ufe0f"
         body = "-# No verification categories are configured for this server."
         accent = ACCENT_INCOMPLETE
     else:
-        icon = "\u26A0\uFE0F"
+        icon = "\u26a0\ufe0f"
         bullets = ", ".join(f"**{m}**" for m in missing)
         body = f"-# Missing: {bullets}"
         accent = ACCENT_INCOMPLETE
@@ -2923,7 +2973,7 @@ def _status_page_clans(interaction: discord.Interaction | None) -> str:
 
     lines = [f"**Clans** ({len(rows)} configured)"]
     for name, glyph, members, missing in rows:
-        suffix = " \u26A0\uFE0F missing role" if missing else ""
+        suffix = " \u26a0\ufe0f missing role" if missing else ""
         lines.append(f"-# {glyph} `{name}` \u2014 `{members}` members{suffix}")
     return "\n".join(lines)
 
