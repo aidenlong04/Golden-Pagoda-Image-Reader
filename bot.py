@@ -535,16 +535,19 @@ def _sync_platform_roles_from_guilds() -> list[str]:
 def _resolve_named_roles(names: list[str]) -> list[int]:
     """Look up each role name across the connected guilds (case-insensitive,
     first match wins) and return the resolved IDs in input order. Names
-    that don't match any guild role are silently skipped.
+    that don't match any guild role are silently skipped. Duplicates are
+    removed while preserving order.
     """
     if not names or not client.guilds:
         return []
     ids: list[int] = []
+    seen: set[int] = set()
     for name in names:
         for guild in client.guilds:
             role = _find_role(guild, name)
-            if role is not None:
+            if role is not None and role.id not in seen:
                 ids.append(role.id)
+                seen.add(role.id)
                 break
     return ids
 
@@ -1606,9 +1609,19 @@ def _nickname_prompt_components(suggestion: str, user_id: int) -> list[dict]:
     """
     from urllib.parse import quote
 
-    encoded = quote(suggestion, safe="")
-    yes_id = f"nick:y:{user_id}:{encoded}"[:100]
-    no_id = f"nick:n:{user_id}"[:100]
+    # Discord custom_id limit is 100 chars. Reserve space for prefix + uid.
+    # Format: "nick:y:<uid>:<encoded>" → prefix is ~15 chars for 18-digit uid.
+    prefix_len = len(f"nick:y:{user_id}:")
+    max_encoded_len = 100 - prefix_len
+    # Pre-truncate suggestion so the encoded form fits without slicing mid-escape.
+    truncated = suggestion[:max_encoded_len]
+    encoded = quote(truncated, safe="")
+    # If encoding expanded beyond the limit, iteratively shrink until it fits.
+    while len(encoded) > max_encoded_len and truncated:
+        truncated = truncated[:-1]
+        encoded = quote(truncated, safe="")
+    yes_id = f"nick:y:{user_id}:{encoded}"
+    no_id = f"nick:n:{user_id}"
     return [{
         "type": 17,
         "accent_color": ACCENT_PASS,
@@ -2087,9 +2100,8 @@ def _status_page_roles_split(
     rest_lines = ["**Platform roles**"]
     for plat in PLATFORM_ROLE_ID_ENV_KEYS:
         rid = PLATFORM_ROLE_IDS.get(plat) or 0
-        glyph = _platform_glyph(plat)
         mention = f"<@&{rid}>" if rid else "*(unset)*"
-        rest_lines.append(f"-# {glyph} {plat} \u2192 {mention}")
+        rest_lines.append(f"-# {plat} \u2192 {mention}")
 
     rest_lines.append("")
     rest_lines.append("**Special roles**")
@@ -2724,15 +2736,14 @@ async def _handle_nick_interaction(
     if not suggestion:
         return
 
-    member = (
-        interaction.guild.get_member(target_uid) if interaction.guild else None
-    )
-    msg = f"-# Nickname set to **{suggestion}**."
-    accent = ACCENT_PASS
-    if member is None:
+    # interaction.user is already the member object when invoked in a guild
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
         msg = "-# Couldn't find your server membership."
         accent = ACCENT_FAIL
     else:
+        member = interaction.user
+        msg = f"-# Nickname set to **{suggestion}**."
+        accent = ACCENT_PASS
         try:
             await member.edit(
                 nick=suggestion,
