@@ -1036,10 +1036,7 @@ async def _process_screenshot(message: discord.Message) -> None:
                     clan_emoji=clan_emoji,
                     mastery_rank=mastery_rank,
                     link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
-                    has_progress=progress_png is not None,
                 ),
-                file_bytes=progress_png,
-                file_name="progress.png",
             ),
         ]
     else:
@@ -1051,14 +1048,27 @@ async def _process_screenshot(message: discord.Message) -> None:
                 _incomplete_components(
                     " ".join(issues),
                     link_buttons=_help_link_buttons(message.guild),
-                    has_progress=progress_png is not None,
                 ),
                 mention_user=True,
                 allow_role_mentions=True,
-                file_bytes=progress_png,
-                file_name="progress.png",
             ),
         ]
+    # Progress card is sent as a separate plain reply so it renders
+    # outside the verification card (a real attachment bubble, not an
+    # embedded media-gallery item).
+    if progress_png is not None:
+        outbound.append(_send_progress_attachment(message, progress_png))
+    # Offer to apply the OCR'd in-game name as the member's server
+    # nickname when it differs from what they already use.
+    nick_target = _nickname_suggestion(member, profile_name)
+    if nick_target is not None:
+        outbound.append(
+            _send_v2(
+                message,
+                _nickname_prompt_components(nick_target, member.id),
+                mention_user=False,
+            )
+        )
     for result in await asyncio.gather(*outbound, return_exceptions=True):
         if isinstance(result, BaseException):
             logger.exception("post-verification action failed", exc_info=result)
@@ -1309,7 +1319,6 @@ def _pass_components(
     clan_emoji: str | None = None,
     mastery_rank: str | None = None,
     link_buttons: list[tuple[str, str]] | None = None,
-    has_progress: bool = False,
 ) -> list[dict]:
     emoji = (clan_emoji or "").strip() or CLAN_EMOJI
     display_clan = _strip_clan_tag(clan) if clan else None
@@ -1328,11 +1337,6 @@ def _pass_components(
         inner_lines.append(f"-# > {mastery_rank}")
     inner = "\n".join(inner_lines)
     container_children: list[dict] = [{"type": 10, "content": inner}]
-    if has_progress:
-        container_children.append({
-            "type": 12,
-            "items": [{"media": {"url": "attachment://progress.png"}}],
-        })
     if link_buttons:
         button_payloads: list[dict] = []
         for label, url in link_buttons[:5]:
@@ -1441,7 +1445,6 @@ def _incomplete_components(
     *,
     image_url: str | None = None,
     link_buttons: list[tuple[str, str]] | None = None,
-    has_progress: bool = False,
 ) -> list[dict]:
     outreach = " / ".join(f"<@&{rid}>" for rid in OUTREACH_ROLE_IDS) or "staff"
     header = {
@@ -1455,11 +1458,6 @@ def _incomplete_components(
             "content": f"-# {outreach} will reach out to verify.",
         },
     ]
-    if has_progress:
-        children.append({
-            "type": 12,
-            "items": [{"media": {"url": "attachment://progress.png"}}],
-        })
     if image_url:
         children.insert(
             1,
@@ -1485,6 +1483,89 @@ def _incomplete_components(
             "components": children,
         },
     ]
+
+
+# ---------- Nickname suggestion --------------------------------------------
+
+
+def _nickname_suggestion(
+    member: discord.Member, profile_name: str | None
+) -> str | None:
+    """Return a cleaned in-game nickname worth suggesting, or None.
+
+    Skips the "Tenno #N" fallback (which is synthetic, not OCR'd) and
+    cases where the member's current display name already matches.
+    Discord nicknames cap at 32 characters.
+    """
+    if not profile_name or profile_name.startswith("Tenno #"):
+        return None
+    suggestion = _strip_clan_tag(profile_name).strip()[:32]
+    if not suggestion:
+        return None
+    if suggestion.lower() == (member.display_name or "").strip().lower():
+        return None
+    return suggestion
+
+
+def _nickname_prompt_components(suggestion: str, user_id: int) -> list[dict]:
+    """V2 components for the 'use in-game name?' prompt.
+
+    The custom IDs encode the target user so a different member can't
+    hijack the buttons, and the suggested nickname (URL-encoded) so the
+    handler doesn't need cross-message state.
+    """
+    from urllib.parse import quote
+
+    encoded = quote(suggestion, safe="")
+    yes_id = f"nick:y:{user_id}:{encoded}"[:100]
+    no_id = f"nick:n:{user_id}"[:100]
+    return [{
+        "type": 17,
+        "accent_color": ACCENT_PASS,
+        "components": [
+            {
+                "type": 10,
+                "content": (
+                    f"### Use your in-game name?\n"
+                    f"-# Set your server nickname to **{suggestion}**."
+                ),
+            },
+            {
+                "type": 1,
+                "components": [
+                    {
+                        "type": 2, "style": 3, "label": "Yes",
+                        "custom_id": yes_id,
+                    },
+                    {
+                        "type": 2, "style": 4, "label": "No",
+                        "custom_id": no_id,
+                    },
+                ],
+            },
+        ],
+    }]
+
+
+def _nickname_resolved_components(text: str, accent: int) -> list[dict]:
+    return [{
+        "type": 17,
+        "accent_color": accent,
+        "components": [{"type": 10, "content": text}],
+    }]
+
+
+async def _send_progress_attachment(
+    reply_to: discord.Message, png: bytes
+) -> None:
+    """Post the progress card as a plain reply (outside any V2 container)."""
+    try:
+        await reply_to.reply(
+            file=discord.File(io.BytesIO(png), filename="progress.png"),
+            mention_author=False,
+        )
+    except Exception:
+        logger.exception("progress attachment reply failed")
 
 
 # ---------- Role category tracking -----------------------------------------
@@ -1544,15 +1625,8 @@ async def _send_v2(
     *,
     mention_user: bool = False,
     allow_role_mentions: bool = False,
-    file_bytes: bytes | None = None,
-    file_name: str = "attachment.png",
-    file_content_type: str = "image/png",
 ) -> None:
-    """Send a Components V2 message as a reply via raw HTTP (discord.py 2.x has no native v2).
-
-    When ``file_bytes`` is provided, the message is posted as multipart so
-    a media-gallery item with ``attachment://<file_name>`` can resolve.
-    """
+    """Send a Components V2 message as a reply via raw HTTP (discord.py 2.x has no native v2)."""
     from discord.http import Route
 
     parse: list[str] = []
@@ -1576,8 +1650,6 @@ async def _send_v2(
     }
     if reply_to.guild is not None:
         payload["message_reference"]["guild_id"] = reply_to.guild.id
-    if file_bytes is not None:
-        payload["attachments"] = [{"id": 0, "filename": file_name}]
 
     route = Route(
         "POST",
@@ -1586,44 +1658,7 @@ async def _send_v2(
     )
     sent_id: int | None = None
     try:
-        if file_bytes is not None:
-            # discord.py's HTTPClient.request doesn't expose a clean way to
-            # post arbitrary multipart bodies (its `files=` path expects
-            # discord.File objects + builds its own payload_json), so we
-            # POST directly with aiohttp using the bot token. Channel
-            # message rate limits apply but a single reply is well within
-            # the per-channel bucket.
-            import aiohttp
-
-            form = aiohttp.FormData()
-            form.add_field(
-                "payload_json",
-                json.dumps(payload),
-                content_type="application/json",
-            )
-            form.add_field(
-                "files[0]",
-                file_bytes,
-                filename=file_name,
-                content_type=file_content_type,
-            )
-            url = (
-                f"https://discord.com/api/v10/channels/"
-                f"{reply_to.channel.id}/messages"
-            )
-            headers = {
-                "Authorization": f"Bot {DISCORD_TOKEN}",
-                "User-Agent": "GoldenPagoda (https://github.com/aidenlong04, 1.0)",
-            }
-            timeout = aiohttp.ClientTimeout(total=15)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, data=form, headers=headers) as resp:
-                    if resp.status >= 400:
-                        text = await resp.text()
-                        raise discord.HTTPException(resp, text)  # type: ignore[arg-type]
-                    data = await resp.json()
-        else:
-            data = await client.http.request(route, json=payload)
+        data = await client.http.request(route, json=payload)
         if isinstance(data, dict) and data.get("id"):
             try:
                 sent_id = int(data["id"])
@@ -2553,6 +2588,84 @@ async def progress_cmd(
             )
 
 
+async def _handle_nick_interaction(
+    interaction: discord.Interaction, custom_id: str
+) -> None:
+    """Handle the in-game-name Yes/No buttons posted after verification."""
+    from urllib.parse import unquote
+
+    parts = custom_id.split(":", 3)
+    # ["nick", "y"|"n", uid, encoded_name?]
+    if len(parts) < 3:
+        return
+    action = parts[1]
+    try:
+        target_uid = int(parts[2])
+    except ValueError:
+        return
+
+    if interaction.user.id != target_uid:
+        try:
+            await _interaction_callback(
+                interaction, 4,
+                _nickname_resolved_components(
+                    "-# Only the verified member can use these buttons.",
+                    ACCENT_FAIL,
+                ),
+            )
+        except Exception:
+            logger.exception("nick: deny ack failed")
+        return
+
+    if action == "n":
+        components = _nickname_resolved_components(
+            "-# Kept your current server nickname.", ACCENT_INCOMPLETE,
+        )
+        try:
+            await _interaction_callback(interaction, 7, components)
+        except Exception:
+            logger.exception("nick: no update failed")
+        return
+
+    if action != "y" or len(parts) < 4:
+        return
+
+    suggestion = unquote(parts[3])[:32].strip()
+    if not suggestion:
+        return
+
+    member = (
+        interaction.guild.get_member(target_uid) if interaction.guild else None
+    )
+    msg = f"-# Nickname set to **{suggestion}**."
+    accent = ACCENT_PASS
+    if member is None:
+        msg = "-# Couldn't find your server membership."
+        accent = ACCENT_FAIL
+    else:
+        try:
+            await member.edit(
+                nick=suggestion,
+                reason="In-game name applied via verification prompt",
+            )
+        except discord.Forbidden:
+            msg = (
+                "-# I don't have permission to change your nickname. "
+                "Set it manually in your profile."
+            )
+            accent = ACCENT_FAIL
+        except discord.HTTPException:
+            logger.exception("nick edit failed")
+            msg = "-# Failed to set nickname. Try again or set it manually."
+            accent = ACCENT_FAIL
+
+    components = _nickname_resolved_components(msg, accent)
+    try:
+        await _interaction_callback(interaction, 7, components)
+    except Exception:
+        logger.exception("nick: yes update failed")
+
+
 @client.event
 async def on_interaction(interaction: discord.Interaction) -> None:
     if interaction.type != discord.InteractionType.component:
@@ -2563,6 +2676,9 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     # Backwards-compatible: accept legacy "stats:N" buttons too.
     if custom_id.startswith("stats:"):
         custom_id = "status:" + custom_id.split(":", 1)[1]
+    if custom_id.startswith("nick:"):
+        await _handle_nick_interaction(interaction, custom_id)
+        return
     if not custom_id.startswith("status:"):
         return
 
