@@ -2228,9 +2228,14 @@ async def _interaction_callback(
     interaction: discord.Interaction,
     callback_type: int,
     components: list[dict],
+    *,
+    ephemeral: bool = True,
 ) -> None:
     from discord.http import Route
 
+    flags = COMPONENTS_V2_FLAG
+    if ephemeral:
+        flags |= EPHEMERAL_FLAG
     route = Route(
         "POST",
         "/interactions/{interaction_id}/{interaction_token}/callback",
@@ -2242,7 +2247,7 @@ async def _interaction_callback(
         json={
             "type": callback_type,
             "data": {
-                "flags": EPHEMERAL_FLAG | COMPONENTS_V2_FLAG,
+                "flags": flags,
                 "components": components,
                 "allowed_mentions": {"parse": []},
             },
@@ -2532,6 +2537,49 @@ async def _fetch_avatar_bytes(url: str) -> bytes | None:
         return None
 
 
+def _progress_components(
+    *, display_name: str, have: int, total: int, missing: list[str],
+    link_buttons: list[tuple[str, str]] | None = None,
+) -> list[dict]:
+    """Mirror the _pass_components shape so /progress feels identical to the
+    verification reply: header with the member's name + status icon, then a
+    container with the completion summary and an optional help-link button.
+    """
+    complete = have >= total and total > 0
+    if complete:
+        icon = "\u2705"
+        body = "\u2605 Verification complete \u2014 all roles assigned."
+        accent = ACCENT_PASS
+    elif total == 0:
+        icon = "\u26A0\uFE0F"
+        body = "-# No verification categories are configured for this server."
+        accent = ACCENT_INCOMPLETE
+    else:
+        icon = "\u26A0\uFE0F"
+        bullets = ", ".join(f"**{m}**" for m in missing)
+        body = f"-# Missing: {bullets}"
+        accent = ACCENT_INCOMPLETE
+
+    safe_name = _strip_clan_tag(display_name) or display_name
+    header = {"type": 10, "content": f"### {icon}  `{safe_name}`"}
+    container_children: list[dict] = [
+        {"type": 10, "content": body},
+        {"type": 10, "content": f"-# Progress: {have}/{total}"},
+    ]
+    if link_buttons and not complete:
+        container_children.append({
+            "type": 1,
+            "components": [
+                {"type": 2, "style": 5, "label": label, "url": url}
+                for label, url in link_buttons[:5]
+            ],
+        })
+    return [header, {
+        "type": 17, "accent_color": accent,
+        "components": container_children,
+    }]
+
+
 @tree.command(
     name="progress",
     description="Show your verification role progress (0-100% complete).",
@@ -2561,7 +2609,6 @@ async def progress_cmd(
     total = len(cats)
     have = sum(1 for _, ok in cats if ok)
     missing = [name for name, ok in cats if not ok]
-    complete = have >= total and total > 0
 
     avatar_bytes = await _fetch_avatar_bytes(avatar_url)
     png = await asyncio.to_thread(
@@ -2572,34 +2619,21 @@ async def progress_cmd(
         target=total,
     )
 
-    if complete:
-        content = "\u2605 Verification complete \u2014 all roles assigned."
-    elif missing:
-        bullets = ", ".join(f"**{m}**" for m in missing)
-        content = f"-# Missing: {bullets}"
-    else:
-        content = "-# No verification categories are configured for this server."
+    components = _progress_components(
+        display_name=display_name, have=have, total=total, missing=missing,
+        link_buttons=_help_link_buttons(interaction.guild),
+    )
 
-    # Mirror the verification flow: the progress card is a plain
-    # attachment (its own bubble), and the missing-roles summary +
-    # help link travel in the same message as content + a Link button.
-    view: discord.ui.View | None = None
-    if not complete:
-        link_buttons = _help_link_buttons(interaction.guild)
-        if link_buttons:
-            view = discord.ui.View(timeout=None)
-            for label, url in link_buttons[:5]:
-                view.add_item(
-                    discord.ui.Button(
-                        style=discord.ButtonStyle.link, label=label, url=url,
-                    )
-                )
-
+    # Mirror the verification flow exactly:
+    # 1. V2 card as the initial response (same shape as _pass_components).
+    # 2. The progress card PNG as a separate plain followup message — its
+    #    own attachment bubble, no media-gallery wrapper.
     try:
-        await interaction.response.send_message(
-            content=content,
+        await _interaction_callback(
+            interaction, 4, components, ephemeral=ephemeral,
+        )
+        await interaction.followup.send(
             file=discord.File(io.BytesIO(png), filename="progress.png"),
-            view=view if view is not None else discord.utils.MISSING,
             ephemeral=ephemeral,
             allowed_mentions=discord.AllowedMentions.none(),
         )
