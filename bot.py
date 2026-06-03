@@ -44,9 +44,7 @@ except ImportError:
 
 from logic import (
     ClanSlot,
-    detect_platform,
     find_clan_slot,
-    load_default_references,
     parse_clan_name,
     parse_mastery_rank,
     parse_profile_name,
@@ -128,9 +126,6 @@ PLATFORM_ROLE_IDS: dict[str, int | None] = {
     for platform, key in PLATFORM_ROLE_ID_ENV_KEYS.items()
 }
 
-# Directory where reference platform icons are cached on disk.
-PLATFORM_ICON_DIR = Path(os.getenv("PLATFORM_ICON_DIR", "icons"))
-
 # Clan slots (auto-synced with the .env file on connect).
 CLAN_SLOT_COUNT = 7
 ENV_FILE_PATH = Path(os.getenv("ENV_FILE_PATH", ".env"))
@@ -189,13 +184,6 @@ OUTREACH_ROLE_IDS: list[int] = [
 
 # Auto-delete bot replies after this many seconds (0 = keep forever).
 REPLY_TTL_SECONDS = _int_env("REPLY_TTL_SECONDS", 180)
-
-# URL of an image shown in the failure card when the platform icon can't be
-# detected (helps the user spot where the icon should appear).
-ICON_EXAMPLE_URL = os.getenv(
-    "ICON_EXAMPLE_URL",
-    "https://ik.imagekit.io/qcxbyrkgu/image_2026-05-20_154003027.png",
-).strip()
 
 # Role removed from a member on successful verification (e.g. an "unverified"
 # gate role). Set to 0 to disable.
@@ -342,16 +330,6 @@ def _update_env_platform_ids(ids: dict[str, int | None]) -> bool:
 
     _atomic_write_text(ENV_FILE_PATH, "\n".join(lines) + "\n")
     return True
-
-
-# ---------- Platform reference icons ----------------------------------------
-
-try:
-    PLATFORM_ICONS = load_default_references(PLATFORM_ICON_DIR)
-    logger.info("Loaded %d platform reference icons", len(PLATFORM_ICONS))
-except Exception:
-    logger.exception("Failed to load platform reference icons")
-    PLATFORM_ICONS = {}
 
 
 # ---------- Discord client --------------------------------------------------
@@ -588,15 +566,6 @@ def _find_role(guild: discord.Guild, *candidates: str) -> discord.Role | None:
         if _normalize(role.name) in wanted:
             return role
     return None
-
-
-def _find_platform_role(guild: discord.Guild, platform: str) -> discord.Role | None:
-    role_id = PLATFORM_ROLE_IDS.get(platform)
-    if role_id:
-        role = guild.get_role(role_id)
-        if role is not None:
-            return role
-    return _find_role(guild, *PLATFORM_ROLE_ALIASES.get(platform, (platform,)))
 
 
 def _find_clan_role(guild: discord.Guild, clan_name: str) -> discord.Role | None:
@@ -870,35 +839,6 @@ def _supplement_title_bar_ocr(
     return augmented_text, new_words + ocr_words
 
 
-def _profile_name_bbox(
-    words: list[tuple[str, tuple[int, int, int, int]]],
-) -> tuple[int, int, int, int] | None:
-    """Return the union bbox of words forming the profile name (handle + #NNN)."""
-    if not words:
-        return None
-    # Locate the word that contains the '#NNN' suffix; the handle may be split
-    # across one or two adjacent words on the same line.
-    for idx, (text, _bbox) in enumerate(words):
-        if _PROFILE_TOKEN_RE.search(text or ""):
-            cluster = [words[idx]]
-            tail_top = words[idx][1][1]
-            tail_bottom = words[idx][1][3]
-            line_h = tail_bottom - tail_top
-            for prev in reversed(words[:idx]):
-                _ptext, pbbox = prev
-                if abs(pbbox[1] - tail_top) > line_h:
-                    break
-                if pbbox[2] < cluster[0][1][0] - line_h * 2:
-                    break
-                cluster.insert(0, prev)
-                if len(cluster) >= 3:
-                    break
-            xs = [b[0] for _, b in cluster] + [b[2] for _, b in cluster]
-            ys = [b[1] for _, b in cluster] + [b[3] for _, b in cluster]
-            return (min(xs), min(ys), max(xs), max(ys))
-    return None
-
-
 # ---------- Screenshot processing -------------------------------------------
 
 
@@ -922,7 +862,8 @@ async def _process_screenshot(message: discord.Message) -> None:
 
     try:
         image_bytes = await attachment.read()
-        image = Image.open(io.BytesIO(image_bytes))
+        # Probe-decode to fail fast on corrupt uploads before paying OCR cost.
+        Image.open(io.BytesIO(image_bytes)).verify()
     except Exception:
         logger.exception("Failed to read uploaded image")
         await _fail(message, "Invalid image", "Image could not be opened. Re-upload a valid PNG/JPG.")
@@ -968,9 +909,6 @@ async def _process_screenshot(message: discord.Message) -> None:
     clan_name = parse_clan_name(ocr_text)
     mastery_rank = parse_mastery_rank(ocr_text)
 
-    anchor_bbox = _profile_name_bbox(ocr_words) if profile_name else None
-    platform, platform_scores = detect_platform(image, anchor_bbox)
-
     # Fallback name when OCR can't read the profile handle: use the
     # guild's current member count as a pseudo-discriminator so the
     # pass response still shows something meaningful (e.g. "Tenno #1234").
@@ -980,40 +918,30 @@ async def _process_screenshot(message: discord.Message) -> None:
         profile_name = f"Tenno #{member_count}"
         profile_name_fallback_used = True
 
-    # TEMP: platform detection is flaky on downscaled / noisy uploads.
-    # If we have a profile name AND a clan name, accept the verification
-    # without a platform role rather than blocking the user. The clan role
-    # is the more important assignment for community use.
-    if not platform and not clan_name:
-        # Log a compact OCR snippet + which fields we did/didn't parse so
-        # failures can be diagnosed without having to reach into the
-        # screenshot. ocr_text is truncated to keep journal lines bounded.
+    if not clan_name:
+        # Without a clan name we can't assign the only role the bot
+        # auto-grants from the screenshot. Surface a clean failure.
         snippet = " ".join(ocr_text.split())[:240]
         logger.warning(
-            "Unreadable: engine=%s profile=%r clan=%r mastery=%r platform=%r scores=%s ocr=%r",
+            "Unreadable: engine=%s profile=%r clan=%r mastery=%r ocr=%r",
             ocr_engine,
             profile_name,
             clan_name,
             mastery_rank,
-            platform,
-            platform_scores,
             snippet,
         )
         analytics.record_verification(
             outcome="unreadable",
-            platform=platform,
             clan=clan_name,
             ocr_engine=ocr_engine,
             ocr_latency_ms=ocr_latency_ms,
             user_id=message.author.id,
             guild_id=message.guild.id,
-            platform_scores=platform_scores,
         )
         await _fail(
             message,
             "Profile not found",
-            "Make sure your title bar (PlayerName#NNN) and platform icon are visible at the top.",
-            image_url=ICON_EXAMPLE_URL or None,
+            "Make sure your title bar (PlayerName#NNN) and CLAN are visible at the top.",
         )
         return
 
@@ -1032,44 +960,20 @@ async def _process_screenshot(message: discord.Message) -> None:
         )
 
     # Resolve which Discord role coroutines to fire concurrently. Building
-    # them up front lets us issue both add_roles HTTP calls in parallel via
-    # asyncio.gather instead of paying two sequential Discord round-trips.
+    # them up front lets us issue role-add HTTP calls in parallel via
+    # asyncio.gather instead of paying sequential Discord round-trips.
     role_coros: list[tuple[str, "discord.Role", "asyncio.Future"]] = []
 
-    if platform is None:
-        # Platform icon could not be confidently identified. Surface a
-        # failure rather than silently skipping the platform role so the
-        # user knows what's missing instead of getting a partially-applied
-        # role set.
-        snippet = " ".join(ocr_text.split())[:240]
-        logger.info(
-            "Platform unreadable (clan=%r, profile=%r) scores=%s ocr=%r",
-            clan_name, profile_name, platform_scores, snippet,
-        )
-        issues.append("Platform icon not detected.")
-        passed = False
-    else:
-        role = _find_platform_role(message.guild, platform)
-        if role is None:
-            issues.append(f"No role for platform **{platform}**.")
-            passed = False
-        else:
-            role_coros.append(("Platform", role, _add_role(member, role, "Screenshot platform verification")))
-
     clan_emoji: str | None = None
-    if clan_name:
-        slot = find_clan_slot(CLAN_SLOTS, clan_name)
-        if slot is not None:
-            clan_emoji = slot.emoji
-        role = _find_clan_role(message.guild, clan_name)
-        if role is None:
-            issues.append(f"No role for clan **{_strip_clan_tag(clan_name)}**.")
-            passed = False
-        else:
-            role_coros.append(("Clan", role, _add_role(member, role, "Screenshot clan verification")))
-    else:
-        issues.append("Clan shown as Unaffiliated — no matching server clan role.")
+    slot = find_clan_slot(CLAN_SLOTS, clan_name)
+    if slot is not None:
+        clan_emoji = slot.emoji
+    role = _find_clan_role(message.guild, clan_name)
+    if role is None:
+        issues.append(f"No role for clan **{_strip_clan_tag(clan_name)}**.")
         passed = False
+    else:
+        role_coros.append(("Clan", role, _add_role(member, role, "Screenshot clan verification")))
 
     assigned_role_ids: set[int] = set()
     if role_coros:
@@ -1089,20 +993,38 @@ async def _process_screenshot(message: discord.Message) -> None:
                 # locally so the post-verify role check sees fresh state.
                 assigned_role_ids.add(role_obj.id)
 
-    # Post-verify category check: even if the screenshot was perfect, the
-    # member may still be missing MR / Syndicate roles configured server-
-    # side. Surface those so the incomplete card lists everything that
-    # needs attention in one round-trip.
+    # Post-verify category check: list every required category the member
+    # is still missing (Platform / MR / Syndicate). Platform is no longer
+    # auto-assigned \u2014 the user picks it themselves in the help channel.
     effective_role_ids = {r.id for r in member.roles} | assigned_role_ids
-    extra_missing = _missing_categories(effective_role_ids)
+    cats = _role_categories_for(effective_role_ids)
+    have = sum(1 for _, ok in cats if ok)
+    total = len(cats)
+    extra_missing = [name for name, ok in cats if not ok]
     if extra_missing:
         issues.extend(f"Missing **{cat}** role." for cat in extra_missing)
         passed = False
 
+    # Render the progress card once; both pass and incomplete embeds attach it.
+    progress_png: bytes | None = None
+    try:
+        avatar_url = (member.display_avatar or member.default_avatar).replace(
+            size=256, format="png"
+        ).url
+        avatar_bytes = await _fetch_avatar_bytes(avatar_url)
+        progress_png = await asyncio.to_thread(
+            _render_progress_card_png,
+            avatar_bytes=avatar_bytes,
+            display_name=member.display_name,
+            count=have,
+            target=total,
+        )
+    except Exception:
+        logger.warning("verify: progress card render failed", exc_info=True)
+
     # Fan out the user-visible work concurrently: reacting, removing the
     # opposite-state role, and posting the V2 reply all hit different
-    # Discord endpoints and never depend on each other. asyncio.gather
-    # collapses ~3 sequential round-trips into a single wall-clock window.
+    # Discord endpoints and never depend on each other.
     if passed:
         outbound = [
             _react(message, "pass"),
@@ -1110,11 +1032,14 @@ async def _process_screenshot(message: discord.Message) -> None:
             _send_v2(
                 message,
                 _pass_components(
-                    profile_name, platform, clan_name, role_lines,
+                    profile_name, clan_name, role_lines,
                     clan_emoji=clan_emoji,
                     mastery_rank=mastery_rank,
                     link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
+                    has_progress=progress_png is not None,
                 ),
+                file_bytes=progress_png,
+                file_name="progress.png",
             ),
         ]
     else:
@@ -1126,9 +1051,12 @@ async def _process_screenshot(message: discord.Message) -> None:
                 _incomplete_components(
                     " ".join(issues),
                     link_buttons=_help_link_buttons(message.guild),
+                    has_progress=progress_png is not None,
                 ),
                 mention_user=True,
                 allow_role_mentions=True,
+                file_bytes=progress_png,
+                file_name="progress.png",
             ),
         ]
     for result in await asyncio.gather(*outbound, return_exceptions=True):
@@ -1141,13 +1069,11 @@ async def _process_screenshot(message: discord.Message) -> None:
     _spawn_bg_task(asyncio.to_thread(
         analytics.record_verification,
         outcome="pass" if passed else "incomplete",
-        platform=platform,
         clan=clan_name,
         ocr_engine=ocr_engine,
         ocr_latency_ms=ocr_latency_ms,
         user_id=member.id,
         guild_id=message.guild.id,
-        platform_scores=platform_scores,
     ))
 
 
@@ -1356,22 +1282,6 @@ def _quote(text: str) -> str:
     return "\n".join(f"> {line}" if line else ">" for line in text.splitlines() or [text])
 
 
-_PLATFORM_GLYPH_FALLBACK = {
-    "PC": "\U0001F5A5\uFE0F",         # 🖥️
-    "Xbox": "\U0001F7E2",             # 🟢
-    "PlayStation": "\U0001F535",      # 🔵
-    "Switch": "\U0001F534",           # 🔴
-    "Mobile": "\U0001F4F1",           # 📱
-}
-
-_PLATFORM_EMOJI_ENV = {
-    "PC": "PLATFORM_EMOJI_PC",
-    "Xbox": "PLATFORM_EMOJI_XBOX",
-    "PlayStation": "PLATFORM_EMOJI_PLAYSTATION",
-    "Switch": "PLATFORM_EMOJI_SWITCH",
-    "Mobile": "PLATFORM_EMOJI_MOBILE",
-}
-
 CLAN_EMOJI = os.getenv("CLAN_EMOJI", "").strip() or "\U0001F6E1\uFE0F"  # 🛡️
 ALLIANCE_EMOJI_RAW = os.getenv("ALLIANCE_EMOJI", "<:GoldenPagoda_Emblem:1416905638428020877>").strip()
 
@@ -1391,23 +1301,15 @@ def _emoji_to_button_payload(raw: str) -> dict | None:
 ALLIANCE_EMOJI_PAYLOAD = _emoji_to_button_payload(ALLIANCE_EMOJI_RAW)
 
 
-def _platform_glyph(platform: str | None) -> str:
-    if not platform:
-        return "\U0001F3AE"  # 🎮
-    env_key = _PLATFORM_EMOJI_ENV.get(platform)
-    custom = (os.getenv(env_key) or "").strip() if env_key else ""
-    return custom or _PLATFORM_GLYPH_FALLBACK.get(platform, "\U0001F3AE")
-
-
 def _pass_components(
     profile: str,
-    platform: str | None,
     clan: str | None,
     role_lines: list[str],  # kept for API parity / preview
     *,
     clan_emoji: str | None = None,
     mastery_rank: str | None = None,
     link_buttons: list[tuple[str, str]] | None = None,
+    has_progress: bool = False,
 ) -> list[dict]:
     emoji = (clan_emoji or "").strip() or CLAN_EMOJI
     display_clan = _strip_clan_tag(clan) if clan else None
@@ -1422,13 +1324,15 @@ def _pass_components(
         display_profile = _strip_clan_tag(profile)
     header = {"type": 10, "content": f"### \u2705  `{display_profile}`"}
     inner_lines = [clan_part]
-    if platform:
-        plat_emoji = _platform_glyph(platform)
-        inner_lines.append(f"> **{platform}** {plat_emoji}")
     if mastery_rank:
         inner_lines.append(f"-# > {mastery_rank}")
     inner = "\n".join(inner_lines)
     container_children: list[dict] = [{"type": 10, "content": inner}]
+    if has_progress:
+        container_children.append({
+            "type": 12,
+            "items": [{"media": {"url": "attachment://progress.png"}}],
+        })
     if link_buttons:
         button_payloads: list[dict] = []
         for label, url in link_buttons[:5]:
@@ -1537,6 +1441,7 @@ def _incomplete_components(
     *,
     image_url: str | None = None,
     link_buttons: list[tuple[str, str]] | None = None,
+    has_progress: bool = False,
 ) -> list[dict]:
     outreach = " / ".join(f"<@&{rid}>" for rid in OUTREACH_ROLE_IDS) or "staff"
     header = {
@@ -1550,6 +1455,11 @@ def _incomplete_components(
             "content": f"-# {outreach} will reach out to verify.",
         },
     ]
+    if has_progress:
+        children.append({
+            "type": 12,
+            "items": [{"media": {"url": "attachment://progress.png"}}],
+        })
     if image_url:
         children.insert(
             1,
@@ -1634,8 +1544,15 @@ async def _send_v2(
     *,
     mention_user: bool = False,
     allow_role_mentions: bool = False,
+    file_bytes: bytes | None = None,
+    file_name: str = "attachment.png",
+    file_content_type: str = "image/png",
 ) -> None:
-    """Send a Components V2 message as a reply via raw HTTP (discord.py 2.x has no native v2)."""
+    """Send a Components V2 message as a reply via raw HTTP (discord.py 2.x has no native v2).
+
+    When ``file_bytes`` is provided, the message is posted as multipart so
+    a media-gallery item with ``attachment://<file_name>`` can resolve.
+    """
     from discord.http import Route
 
     parse: list[str] = []
@@ -1659,6 +1576,8 @@ async def _send_v2(
     }
     if reply_to.guild is not None:
         payload["message_reference"]["guild_id"] = reply_to.guild.id
+    if file_bytes is not None:
+        payload["attachments"] = [{"id": 0, "filename": file_name}]
 
     route = Route(
         "POST",
@@ -1667,7 +1586,44 @@ async def _send_v2(
     )
     sent_id: int | None = None
     try:
-        data = await client.http.request(route, json=payload)
+        if file_bytes is not None:
+            # discord.py's HTTPClient.request doesn't expose a clean way to
+            # post arbitrary multipart bodies (its `files=` path expects
+            # discord.File objects + builds its own payload_json), so we
+            # POST directly with aiohttp using the bot token. Channel
+            # message rate limits apply but a single reply is well within
+            # the per-channel bucket.
+            import aiohttp
+
+            form = aiohttp.FormData()
+            form.add_field(
+                "payload_json",
+                json.dumps(payload),
+                content_type="application/json",
+            )
+            form.add_field(
+                "files[0]",
+                file_bytes,
+                filename=file_name,
+                content_type=file_content_type,
+            )
+            url = (
+                f"https://discord.com/api/v10/channels/"
+                f"{reply_to.channel.id}/messages"
+            )
+            headers = {
+                "Authorization": f"Bot {DISCORD_TOKEN}",
+                "User-Agent": "GoldenPagoda (https://github.com/aidenlong04, 1.0)",
+            }
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, data=form, headers=headers) as resp:
+                    if resp.status >= 400:
+                        text = await resp.text()
+                        raise discord.HTTPException(resp, text)  # type: ignore[arg-type]
+                    data = await resp.json()
+        else:
+            data = await client.http.request(route, json=payload)
         if isinstance(data, dict) and data.get("id"):
             try:
                 sent_id = int(data["id"])
@@ -2040,7 +1996,6 @@ def _status_page_misc(interaction: discord.Interaction) -> str:
     ocr = "OCR.space (engine 3)" if OCR_API_KEY else (
         "Tesseract (local)" if pytesseract else "*(none configured)*"
     )
-    icons = len(PLATFORM_ICONS)
     try:
         pillow_ver = importlib_metadata.version("Pillow")
     except importlib_metadata.PackageNotFoundError:
@@ -2058,7 +2013,6 @@ def _status_page_misc(interaction: discord.Interaction) -> str:
     return (
         f"**OCR / Misc**\n"
         f"-# OCR: `{ocr}`\n"
-        f"-# Reference icons loaded: `{icons}`\n"
         f"-# Reply TTL: `{REPLY_TTL_SECONDS}s`\n"
         f"-# OCR max upload: `{OCR_MAX_UPLOAD_BYTES} bytes`\n"
         f"-# Pass reaction: `:{PASS_REACTION_NAME}:` ({PASS_REACTION_ID or '-'})\n"
@@ -2075,7 +2029,6 @@ _STATUS_PAGES: list[tuple[str, str, str, Callable]] = [
     ("channels",  "\U0001F4FA Channels",     "Target/info/preview channels.",   lambda i, _s: _status_page_channels(i)),
     ("misc",      "\U0001F527 OCR / Misc",   "OCR backend, TTL, reactions.",    lambda i, _s: _status_page_misc(i)),
     ("stats",     "\U0001F4C8 Stats",        "Verification totals + windows.",  lambda _i, s: _stats_page_overview(s)),
-    ("platforms", "\U0001F3AE Platforms",    "Verifications by platform.",      lambda _i, s: _stats_page_platforms(s)),
     ("clans",     "\U0001F3F0 Clans",        "Configured clans + member counts.", lambda i, _s: _status_page_clans(i)),
     ("ocr",       "\u23F1\uFE0F OCR Latency","OCR latency p50/p95/avg.",        lambda _i, s: _stats_page_ocr(s)),
 ]
@@ -2412,16 +2365,29 @@ def _render_progress_card_png(
 
 
 async def _fetch_avatar_bytes(url: str) -> bytes | None:
-    """Best-effort fetch of an avatar URL; returns None on any failure."""
+    """Best-effort fetch of an avatar URL; returns None on any failure.
+
+    Discord's CDN occasionally 403s requests that lack a recognisable
+    User-Agent, so we send one explicitly. Avatars are tiny (<512 KiB),
+    but we cap at 2 MiB defensively in case Discord ever serves an
+    animated GIF for an upgraded user.
+    """
     try:
         import aiohttp
 
-        timeout = aiohttp.ClientTimeout(total=5)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        headers = {
+            "User-Agent": "GoldenPagoda (https://github.com/aidenlong04, 1.0)",
+            "Accept": "image/png,image/webp,image/*;q=0.8",
+        }
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
             async with session.get(url) as resp:
                 if resp.status != 200:
+                    logger.warning(
+                        "progress: avatar fetch returned HTTP %s for %s",
+                        resp.status, url,
+                    )
                     return None
-                # Cap at 2 MiB defensively (Discord avatars are <512 KiB).
                 data = await resp.content.read(2 * 1024 * 1024)
                 return data or None
     except Exception:
@@ -2694,17 +2660,6 @@ def _stats_page_overview(s: dict) -> str:
         f"-# Last seen: {_fmt_age(s.get('last_ts'))}\n"
         f"-# DB size: `{_fmt_bytes(s.get('db_size_bytes', 0))}`"
     )
-
-
-def _stats_page_platforms(s: dict) -> str:
-    rows = s.get("by_platform") or []
-    if not rows:
-        return "**Platforms**\n-# No data yet."
-    lines = ["**Platforms**"]
-    for name, count in rows:
-        glyph = _platform_glyph(name) if name and name != "(unknown)" else "?"
-        lines.append(f"-# {glyph} `{name}` \u2014 `{count}`")
-    return "\n".join(lines)
 
 
 def _stats_page_clans(s: dict) -> str:

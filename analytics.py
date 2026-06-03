@@ -98,13 +98,11 @@ def _init() -> None:
 def record_verification(
     *,
     outcome: str,
-    platform: str | None = None,
     clan: str | None = None,
     ocr_engine: str | None = None,
     ocr_latency_ms: int | None = None,
     user_id: int | None = None,
     guild_id: int | None = None,
-    platform_scores: dict | None = None,
 ) -> None:
     if _disabled:
         return
@@ -113,7 +111,6 @@ def record_verification(
         if _disabled:
             return
         try:
-            scores_json = json.dumps(platform_scores, sort_keys=True) if platform_scores else None
             with _connect() as conn:
                 conn.execute(
                     "INSERT INTO events"
@@ -122,13 +119,13 @@ def record_verification(
                     (
                         int(time.time()),
                         outcome,
-                        platform,
+                        None,
                         clan,
                         ocr_engine,
                         ocr_latency_ms,
                         user_id,
                         guild_id,
-                        scores_json,
+                        None,
                     ),
                 )
                 conn.commit()
@@ -150,7 +147,6 @@ def summary() -> dict:
         "available": False,
         "total": 0,
         "by_outcome": {},
-        "by_platform": [],
         "by_clan": [],
         "windows": {},
         "ocr": {"engines": [], "avg_ms": 0, "p50_ms": 0, "p95_ms": 0, "samples": 0},
@@ -181,13 +177,6 @@ def summary() -> dict:
                         "SELECT outcome, COUNT(*) AS c FROM events GROUP BY outcome"
                     )
                 }
-
-                out["by_platform"] = [
-                    (r["platform"] or "(unknown)", r["c"])
-                    for r in conn.execute(
-                        "SELECT platform, COUNT(*) AS c FROM events GROUP BY platform ORDER BY c DESC"
-                    )
-                ]
 
                 out["by_clan"] = [
                     (r["clan"] or "(none)", r["c"])
