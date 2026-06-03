@@ -13,6 +13,7 @@ RUN apt-get update \
         tesseract-ocr \
         libjpeg62-turbo \
         zlib1g \
+        fonts-dejavu-core \
         ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 

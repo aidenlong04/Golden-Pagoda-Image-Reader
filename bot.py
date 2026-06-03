@@ -28,7 +28,7 @@ warnings.filterwarnings(
 import discord  # noqa: E402
 import requests  # noqa: E402
 from discord import app_commands  # noqa: E402
-from PIL import Image, ImageDraw, ImageOps  # noqa: E402
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps  # noqa: E402
 
 try:
     import pytesseract  # optional local fallback
@@ -2100,38 +2100,245 @@ async def status_cmd(interaction: discord.Interaction) -> None:
 
 # ---------- /progress (submission tracker, V2 with attached PNG) ------------
 
-# Visual styling for the rendered progress bar PNG. Matches the dark
-# "Lost Programme" XP-bar aesthetic referenced in the spec.
-_PROGRESS_BAR_BG = (43, 45, 49)       # Discord dark surface
-_PROGRESS_BAR_FG = (93, 208, 243)     # bright cyan fill
-_PROGRESS_BAR_W = 720
-_PROGRESS_BAR_H = 56
+# Visual styling for the rendered progress card. The card composites the
+# member's avatar (circular, left) with a rounded gradient progress bar
+# and inline text overlay so a single PNG carries the whole message.
+_PROGRESS_CARD_W = 860
+_PROGRESS_CARD_H = 200
+_PROGRESS_BG = (30, 31, 34)            # #1E1F22 Discord dark
+_PROGRESS_BG_EDGE = (24, 25, 28)       # subtle inner shadow
+_PROGRESS_TRACK = (43, 45, 49)         # #2B2D31
+_PROGRESS_FILL_START = (93, 208, 243)  # cyan
+_PROGRESS_FILL_END = (134, 230, 168)   # mint — gradient end
+_PROGRESS_FILL_GOLD = (212, 168, 87)   # gold for finished bars
+_PROGRESS_TEXT = (236, 238, 240)
+_PROGRESS_MUTED = (163, 166, 170)
+_PROGRESS_AVATAR_SIZE = 144
+_PROGRESS_AVATAR_RING = (212, 168, 87)
 
 
-def _render_progress_bar_png(progress: float) -> bytes:
-    """Render a rounded-end progress bar PNG and return raw bytes.
+def _load_font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
+    """Load DejaVu Sans at ``size``; fall back to PIL default on any error.
 
-    Uses the ellipse + rectangle technique so the caps stay perfectly
-    circular at any width. ``progress`` is clamped to [0.0, 1.0]. The
-    image is transparent outside the bar so it composes cleanly inside a
-    V2 container.
+    DejaVu ships with ``fonts-dejavu-core`` (Debian) and is installed in
+    the container image. The fallback keeps unit tests + dev environments
+    without the package from crashing.
     """
-    progress = max(0.0, min(1.0, float(progress)))
-    w, h = _PROGRESS_BAR_W, _PROGRESS_BAR_H
-    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    candidates = [
+        f"/usr/share/fonts/truetype/dejavu/{name}",
+        f"/usr/share/fonts/dejavu/{name}",
+        name,
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except (OSError, IOError):
+            continue
+    return ImageFont.load_default()  # type: ignore[return-value]
 
-    radius = h // 2
-    # Track (full width, rounded).
-    d.rounded_rectangle((0, 0, w, h), radius=radius, fill=_PROGRESS_BAR_BG)
-    if progress > 0:
-        # Always render at least one full cap so 1% still reads as "filled".
-        fill_w = max(h, int(round(w * progress)))
-        d.rounded_rectangle((0, 0, fill_w, h), radius=radius, fill=_PROGRESS_BAR_FG)
+
+def _circular_avatar(
+    avatar_bytes: bytes | None, size: int
+) -> Image.Image:
+    """Return an RGBA avatar cropped into a circle with a thin gold ring.
+
+    If ``avatar_bytes`` fails to decode (or is None) a flat gold disc is
+    used as a graceful placeholder.
+    """
+    diameter = size
+    if avatar_bytes:
+        try:
+            src = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
+        except Exception:
+            logger.warning("progress: avatar decode failed", exc_info=True)
+            src = Image.new(
+                "RGBA", (diameter, diameter), _PROGRESS_AVATAR_RING + (255,)
+            )
+    else:
+        src = Image.new(
+            "RGBA", (diameter, diameter), _PROGRESS_AVATAR_RING + (255,)
+        )
+
+    src = ImageOps.fit(src, (diameter, diameter), Image.LANCZOS)
+
+    # Antialiased circular mask: render at 4x and downsample.
+    scale = 4
+    mask = Image.new("L", (diameter * scale, diameter * scale), 0)
+    ImageDraw.Draw(mask).ellipse(
+        (0, 0, diameter * scale - 1, diameter * scale - 1), fill=255
+    )
+    mask = mask.resize((diameter, diameter), Image.LANCZOS)
+
+    avatar = Image.new("RGBA", (diameter, diameter), (0, 0, 0, 0))
+    avatar.paste(src, (0, 0), mask)
+
+    ring = Image.new("RGBA", (diameter, diameter), (0, 0, 0, 0))
+    ImageDraw.Draw(ring).ellipse(
+        (0, 0, diameter - 1, diameter - 1),
+        outline=_PROGRESS_AVATAR_RING + (255,),
+        width=4,
+    )
+    avatar.alpha_composite(ring)
+    return avatar
+
+
+def _gradient_bar(
+    width: int, height: int, progress: float, *, complete: bool
+) -> Image.Image:
+    """Render the rounded progress bar with a horizontal colour gradient."""
+    bar = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    radius = height // 2
+    ImageDraw.Draw(bar).rounded_rectangle(
+        (0, 0, width - 1, height - 1), radius=radius, fill=_PROGRESS_TRACK
+    )
+    if progress <= 0:
+        return bar
+
+    fill_w = max(height, int(round(width * progress)))
+
+    grad = Image.new("RGBA", (fill_w, height), (0, 0, 0, 0))
+    if complete:
+        start, end = _PROGRESS_FILL_GOLD, _PROGRESS_FILL_END
+    else:
+        start, end = _PROGRESS_FILL_START, _PROGRESS_FILL_END
+    pixels = grad.load()
+    if fill_w > 1 and pixels is not None:
+        for x in range(fill_w):
+            t = x / (fill_w - 1)
+            r = int(start[0] + (end[0] - start[0]) * t)
+            g = int(start[1] + (end[1] - start[1]) * t)
+            b = int(start[2] + (end[2] - start[2]) * t)
+            for y in range(height):
+                pixels[x, y] = (r, g, b, 255)
+
+    fill_mask = Image.new("L", (fill_w, height), 0)
+    ImageDraw.Draw(fill_mask).rounded_rectangle(
+        (0, 0, fill_w - 1, height - 1), radius=radius, fill=255
+    )
+    bar.paste(grad, (0, 0), fill_mask)
+    return bar
+
+
+def _render_progress_card_png(
+    *,
+    avatar_bytes: bytes | None,
+    display_name: str,
+    count: int,
+    target: int,
+) -> bytes:
+    """Render an 860x200 progress card and return PNG bytes.
+
+    Composition: circular avatar (left) + gradient bar with overlay text
+    on the right. The whole composition is a single PNG so the V2 message
+    only needs one media gallery item.
+    """
+    progress = max(0.0, min(1.0, count / target)) if target > 0 else 0.0
+    complete = count >= target
+
+    canvas = Image.new(
+        "RGBA", (_PROGRESS_CARD_W, _PROGRESS_CARD_H), _PROGRESS_BG + (255,)
+    )
+    ImageDraw.Draw(canvas).rounded_rectangle(
+        (0, 0, _PROGRESS_CARD_W - 1, _PROGRESS_CARD_H - 1),
+        radius=22, outline=_PROGRESS_BG_EDGE + (255,), width=2,
+    )
+
+    pad = 28
+    avatar = _circular_avatar(avatar_bytes, _PROGRESS_AVATAR_SIZE)
+    avatar_y = (_PROGRESS_CARD_H - _PROGRESS_AVATAR_SIZE) // 2
+
+    # Soft drop shadow under the avatar.
+    shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).ellipse(
+        (
+            pad + 6, avatar_y + _PROGRESS_AVATAR_SIZE - 10,
+            pad + _PROGRESS_AVATAR_SIZE - 6,
+            avatar_y + _PROGRESS_AVATAR_SIZE + 14,
+        ),
+        fill=(0, 0, 0, 120),
+    )
+    shadow = shadow.filter(ImageFilter.GaussianBlur(7))
+    canvas.alpha_composite(shadow)
+    canvas.alpha_composite(avatar, (pad, avatar_y))
+
+    text_x = pad + _PROGRESS_AVATAR_SIZE + 28
+    right_x = _PROGRESS_CARD_W - pad
+    draw = ImageDraw.Draw(canvas)
+
+    name_font = _load_font(34, bold=True)
+    label_font = _load_font(18, bold=True)
+    count_font = _load_font(26, bold=True)
+    footer_font = _load_font(16)
+
+    name = display_name or "Member"
+    max_name_w = right_x - text_x - 10
+    if draw.textlength(name, font=name_font) > max_name_w:
+        while name and draw.textlength(
+            name + "\u2026", font=name_font
+        ) > max_name_w:
+            name = name[:-1]
+        name = name + "\u2026"
+    draw.text((text_x, 24), name, font=name_font, fill=_PROGRESS_TEXT)
+
+    count_text = f"{count} / {target}"
+    count_w = draw.textlength(count_text, font=count_font)
+    draw.text(
+        (right_x - count_w, 78),
+        count_text,
+        font=count_font,
+        fill=_PROGRESS_TEXT,
+    )
+
+    pct_label = f"{int(round(progress * 100))}%"
+    draw.text(
+        (text_x, 84),
+        f"PROGRESS  \u2022  {pct_label}",
+        font=label_font,
+        fill=_PROGRESS_MUTED,
+    )
+
+    bar_h = 28
+    bar_w = right_x - text_x
+    bar_y = 124
+    bar = _gradient_bar(bar_w, bar_h, progress, complete=complete)
+    canvas.alpha_composite(bar, (text_x, bar_y))
+
+    if complete:
+        footer = "\u2605  Target reached!"
+        footer_fill = _PROGRESS_AVATAR_RING
+    else:
+        remaining = max(0, target - count)
+        footer = f"{remaining} more to reach the goal"
+        footer_fill = _PROGRESS_MUTED
+    draw.text(
+        (text_x, bar_y + bar_h + 8),
+        footer,
+        font=footer_font,
+        fill=footer_fill,
+    )
 
     buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
+    canvas.convert("RGB").save(buf, format="PNG", optimize=True)
     return buf.getvalue()
+
+
+async def _fetch_avatar_bytes(url: str) -> bytes | None:
+    """Best-effort fetch of an avatar URL; returns None on any failure."""
+    try:
+        import aiohttp
+
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                # Cap at 2 MiB defensively (Discord avatars are <512 KiB).
+                data = await resp.content.read(2 * 1024 * 1024)
+                return data or None
+    except Exception:
+        logger.warning("progress: avatar fetch failed", exc_info=True)
+        return None
 
 
 async def _interaction_callback_with_file(
@@ -2191,44 +2398,25 @@ async def _interaction_callback_with_file(
 
 def _progress_components(
     *,
-    display_name: str,
-    avatar_url: str,
     count: int,
     target: int,
     channel_id: int,
 ) -> list[dict]:
-    pct = min(1.0, count / target) if target > 0 else 0.0
-    pct_label = f"{int(round(pct * 100))}%"
+    """V2 container that hosts the rendered progress card image."""
     complete = count >= target
-    header_text = (
-        f"### {display_name}\n"
-        f"-# Submissions in <#{channel_id}>"
-    )
-    summary_text = f"## {count} / {target}  \u00B7  {pct_label}"
-    footer_text = (
+    footer = (
         "-# \u2728 Target reached!" if complete
-        else f"-# {max(0, target - count)} to go"
+        else f"-# Tracking submissions in <#{channel_id}>"
     )
     container = {
         "type": 17,
         "accent_color": ACCENT_PASS if complete else 0x5DD0F3,
         "components": [
             {
-                "type": 9,  # Section
-                "components": [
-                    {"type": 10, "content": header_text},
-                ],
-                "accessory": {
-                    "type": 11,  # Thumbnail
-                    "media": {"url": avatar_url},
-                },
-            },
-            {"type": 10, "content": summary_text},
-            {
                 "type": 12,  # Media Gallery
                 "items": [{"media": {"url": "attachment://progress.png"}}],
             },
-            {"type": 10, "content": footer_text},
+            {"type": 10, "content": footer},
         ],
     }
     return [container]
@@ -2252,19 +2440,23 @@ async def progress_cmd(
         display_name = target.display_name
     else:
         display_name = getattr(target, "global_name", None) or target.name
-    avatar = getattr(target, "display_avatar", None) or target.default_avatar
-    avatar_url = avatar.replace(size=256, format="png").url
+    avatar_asset = getattr(target, "display_avatar", None) or target.default_avatar
+    avatar_url = avatar_asset.replace(size=256, format="png").url
 
     count = await asyncio.to_thread(
         analytics.submission_count,
         user_id=target.id,
         channel_id=PROGRESS_CHANNEL_ID,
     )
-    pct = min(1.0, count / PROGRESS_TARGET) if PROGRESS_TARGET > 0 else 0.0
-    png = await asyncio.to_thread(_render_progress_bar_png, pct)
-    components = _progress_components(
+    avatar_bytes = await _fetch_avatar_bytes(avatar_url)
+    png = await asyncio.to_thread(
+        _render_progress_card_png,
+        avatar_bytes=avatar_bytes,
         display_name=display_name,
-        avatar_url=avatar_url,
+        count=count,
+        target=PROGRESS_TARGET,
+    )
+    components = _progress_components(
         count=count,
         target=PROGRESS_TARGET,
         channel_id=PROGRESS_CHANNEL_ID,
