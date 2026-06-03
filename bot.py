@@ -2263,24 +2263,83 @@ PREVIEW_CHANNEL_ID = 1378199771428163765
 async def preview_responses(interaction: discord.Interaction) -> None:
     from discord.http import Route
 
-    sample_clan = CLAN_SLOTS[0].clan_name if CLAN_SLOTS and CLAN_SLOTS[0].clan_name else "Golden Tenno"
+    sample_clan = (
+        CLAN_SLOTS[0].clan_name
+        if CLAN_SLOTS and CLAN_SLOTS[0].clan_name
+        else "Golden Tenno"
+    )
     sample_emoji = (CLAN_SLOTS[0].emoji if CLAN_SLOTS else None) or CLAN_EMOJI
+    pass_buttons = _resolve_pass_link_buttons(interaction.guild, sample_clan)
+    sample_uid = interaction.user.id
 
-    samples = [
-        _pass_components(
-            "GoldenTenno#200",
-            sample_clan,
-            clan_emoji=sample_emoji,
-            mastery_rank="MR 30",
-            link_buttons=_resolve_pass_link_buttons(interaction.guild, sample_clan),
+    samples: list[tuple[str, list[dict]]] = [
+        (
+            "PASS — mastery + missing categories",
+            _pass_components(
+                "GoldenTenno#200",
+                sample_clan,
+                clan_emoji=sample_emoji,
+                mastery_rank="MR 28",
+                link_buttons=pass_buttons,
+                missing_categories=["Platform", "Syndicate"],
+            ),
         ),
-        _fail_components(
-            "Profile name not found",
-            "Could not read your in-game name from the screenshot. "
-            "Please post a clear shot of your Warframe profile page.",
+        (
+            "PASS — mastery only, fully verified",
+            _pass_components(
+                "MonguPrime002#661",
+                sample_clan,
+                clan_emoji=sample_emoji,
+                mastery_rank="MR 30",
+                link_buttons=pass_buttons,
+            ),
         ),
-        _incomplete_components(
-            f"No role for clan **{sample_clan}**.",
+        (
+            "FAIL — Not an image",
+            _fail_components(
+                "Not an image",
+                "Upload a PNG/JPG screenshot of your Warframe profile.",
+            ),
+        ),
+        (
+            "FAIL — Invalid image",
+            _fail_components(
+                "Invalid image",
+                "Image could not be opened. Re-upload a valid PNG/JPG.",
+            ),
+        ),
+        (
+            "FAIL — Not readable",
+            _fail_components(
+                "Not readable",
+                "No text could be read. Upload a clearer screenshot.",
+            ),
+        ),
+        (
+            "FAIL — Profile not found",
+            _fail_components(
+                "Profile not found",
+                "Make sure your title bar (PlayerName#NNN) and platform "
+                "icon are visible at the top.",
+            ),
+        ),
+        (
+            "INCOMPLETE — unknown clan",
+            _incomplete_components(
+                f"No role for clan **{sample_clan}**.",
+            ),
+        ),
+        (
+            "NICKNAME PROMPT (standalone)",
+            _nickname_prompt_components(
+                "GoldenTenno",
+                sample_uid,
+                current_nick=(
+                    interaction.user.display_name
+                    if isinstance(interaction.user, discord.Member)
+                    else "OldNick"
+                ),
+            ),
         ),
     ]
 
@@ -2289,30 +2348,33 @@ async def preview_responses(interaction: discord.Interaction) -> None:
         "/channels/{channel_id}/messages",
         channel_id=PREVIEW_CHANNEL_ID,
     )
+    # Defer first so we don't hit the 3s interaction timeout while
+    # posting 8 messages sequentially. Sequential keeps the channel
+    # ordering deterministic (pass → fail → incomplete → nick prompt).
+    await interaction.response.defer(ephemeral=True, thinking=True)
     sent = 0
     errors: list[str] = []
-    tasks = [
-        client.http.request(
-            route,
-            json={
-                "flags": COMPONENTS_V2_FLAG,
-                "components": components,
-                "allowed_mentions": {"parse": []},
-            },
-        )
-        for components in samples
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for r in results:
-        if isinstance(r, Exception):
-            errors.append(str(r))
-        else:
+    for label, components in samples:
+        payload = {
+            "flags": COMPONENTS_V2_FLAG,
+            "components": components,
+            "allowed_mentions": {"parse": []},
+        }
+        try:
+            await client.http.request(route, json=payload)
             sent += 1
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+            logger.exception("preview-responses: failed sending %s", label)
+        await asyncio.sleep(0.3)
 
-    msg = f"\u2705 Posted {sent}/{len(samples)} samples to <#{PREVIEW_CHANNEL_ID}>."
+    msg = (
+        f"\u2705 Posted {sent}/{len(samples)} samples to "
+        f"<#{PREVIEW_CHANNEL_ID}>."
+    )
     if errors:
         msg += "\n" + "\n".join(f"\u274C {e}" for e in errors)
-    await interaction.response.send_message(msg, ephemeral=True)
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 # ---------- /status (paginated, ephemeral, V2) ------------------------------
