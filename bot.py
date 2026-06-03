@@ -1234,7 +1234,10 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
     # verification card / progress bar untouched.
     if nick_target:
         try:
-            prompt_components = _nickname_prompt_components(nick_target, member.id)
+            prompt_components = _nickname_prompt_components(
+                nick_target, member.id,
+                current_nick=member.display_name or "",
+            )
             await _send_v2(message, prompt_components)
         except Exception:
             logger.exception("nick prompt send failed")
@@ -1739,13 +1742,21 @@ def _nickname_prompt_top_level(suggestion: str, user_id: int) -> list[dict]:
     ]
 
 
-def _nickname_prompt_components(suggestion: str, user_id: int) -> list[dict]:
+def _nickname_prompt_components(
+    suggestion: str, user_id: int, *, current_nick: str = ""
+) -> list[dict]:
     """Standalone V2 message for the in-game-name Yes/No prompt.
 
     Wraps the prompt text + Yes/No row in a single Container (type 17) so
     when the handler issues UPDATE_MESSAGE (callback type 7) the
     confirmation card replaces this whole message cleanly and the
     verification reply / progress bar above are left untouched.
+
+    The buttons are labelled with the actual names instead of Yes/No:
+      - green button = in-game name (``suggestion``)
+      - red button   = current server nickname (``current_nick``)
+    Discord caps button labels at 80 chars; both inputs are already
+    bounded (nick ≤ 32, suggestion ≤ 32) so no truncation needed.
     """
     from urllib.parse import quote
 
@@ -1758,6 +1769,8 @@ def _nickname_prompt_components(suggestion: str, user_id: int) -> list[dict]:
         encoded = quote(truncated, safe="")
     yes_id = f"nick:y:{user_id}:{encoded}"
     no_id = f"nick:n:{user_id}:{encoded}"
+    yes_label = (suggestion or "In-game name")[:80]
+    no_label = (current_nick or "Keep current")[:80]
     return [{
         "type": 17,
         "accent_color": ACCENT_INCOMPLETE,
@@ -1773,11 +1786,11 @@ def _nickname_prompt_components(suggestion: str, user_id: int) -> list[dict]:
                 "type": 1,
                 "components": [
                     {
-                        "type": 2, "style": 3, "label": "Yes",
+                        "type": 2, "style": 3, "label": yes_label,
                         "custom_id": yes_id,
                     },
                     {
-                        "type": 2, "style": 4, "label": "No",
+                        "type": 2, "style": 4, "label": no_label,
                         "custom_id": no_id,
                     },
                 ],
