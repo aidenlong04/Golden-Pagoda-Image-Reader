@@ -1519,7 +1519,12 @@ def _pass_components(
         clan_part,
     ]
     if mastery_rank:
-        inner_lines.append(f"> * -# {mastery_rank}")
+        # mastery_rank is "MR <N>" or "Unranked"; surface just the value
+        # so the bullet reads "Mastery Rank: `12`" / "Mastery Rank: `Unranked`".
+        mr_value = mastery_rank
+        if mr_value.upper().startswith("MR "):
+            mr_value = mr_value[3:].strip()
+        inner_lines.append(f"> * -# Mastery Rank: `{mr_value}`")
     if missing_categories:
         joined = ", ".join(f"**`{c}`**" for c in missing_categories)
         inner_lines.append(f"> * -# Missing Data: {joined}")
