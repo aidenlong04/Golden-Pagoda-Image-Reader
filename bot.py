@@ -2857,12 +2857,12 @@ async def progress_cmd(
 async def _handle_nick_interaction(
     interaction: discord.Interaction, custom_id: str
 ) -> None:
-    """Handle the in-game-name Yes/No buttons posted after verification.
+    """Handle the in-game-name buttons posted after verification.
 
-    On either choice we UPDATE_MESSAGE the original verification reply so
-    the prompt is replaced with a confirmation block addressing the user
-    by their in-game name. Omitting ``attachments`` from the edit payload
-    preserves the existing progress-card attachment.
+    On either choice we acknowledge the click silently via callback type 6
+    (DEFERRED_UPDATE_MESSAGE) and delete the prompt message — no visible
+    reply or message edit. If the user picks the in-game name we still
+    apply it as their server nickname in the background.
     """
     from urllib.parse import unquote
 
@@ -2881,6 +2881,7 @@ async def _handle_nick_interaction(
         suggestion = unquote(parts[3])[:32].strip()
 
     if interaction.user.id != target_uid:
+        # Wrong user clicked: ephemeral notice, no visible message change.
         try:
             await _interaction_callback(
                 interaction, 4,
@@ -2896,17 +2897,8 @@ async def _handle_nick_interaction(
     if action not in ("y", "n"):
         return
 
-    # Default username for the confirmation header is the in-game name
-    # carried in the custom_id; fall back to the member's display name
-    # if we don't have one.
-    username = suggestion or interaction.user.display_name
-
-    if action == "y":
-        if (
-            suggestion
-            and interaction.guild
-            and isinstance(interaction.user, discord.Member)
-        ):
+    if action == "y" and suggestion:
+        if interaction.guild and isinstance(interaction.user, discord.Member):
             try:
                 await interaction.user.edit(
                     nick=suggestion,
@@ -2916,28 +2908,31 @@ async def _handle_nick_interaction(
                 logger.info("nick: forbidden setting %s", suggestion)
             except discord.HTTPException:
                 logger.exception("nick: edit failed")
-        selection_line = "-# In-game alias selected"
-        accent = ACCENT_PASS
-    else:
-        selection_line = "-# Base Discord alias selected"
-        accent = ACCENT_INCOMPLETE
 
-    text = f"### Understood Tenno - {username}\n{selection_line}"
-    components = [
-        {
-            "type": 17,
-            "accent_color": accent,
-            "components": [{"type": 10, "content": text}],
-        }
-    ]
+    # Silently acknowledge the click (type 6 = DEFERRED_UPDATE_MESSAGE)
+    # so Discord doesn't show "interaction failed" without any visible
+    # change to the prompt message.
     try:
-        # type 7 = UPDATE_MESSAGE; non-ephemeral so the original public
-        # message is edited in place.
-        await _interaction_callback(
-            interaction, 7, components, ephemeral=False,
+        from discord.http import Route
+
+        route = Route(
+            "POST",
+            "/interactions/{interaction_id}/{interaction_token}/callback",
+            interaction_id=interaction.id,
+            interaction_token=interaction.token,
         )
+        await client.http.request(route, json={"type": 6})
     except Exception:
-        logger.exception("nick: update message failed")
+        logger.exception("nick: deferred ack failed")
+
+    # Delete the prompt message so the channel doesn't get cluttered.
+    try:
+        if interaction.message is not None:
+            await interaction.message.delete()
+    except (discord.NotFound, discord.Forbidden):
+        pass
+    except Exception:
+        logger.exception("nick: prompt delete failed")
 
 
 @client.event
