@@ -1506,7 +1506,6 @@ def _quote(text: str) -> str:
 
 
 CLAN_EMOJI = os.getenv("CLAN_EMOJI", "").strip() or "\U0001F6E1\ufe0f"  # 🛡️
-ALLIANCE_EMOJI_RAW = os.getenv("ALLIANCE_EMOJI", "<:GoldenPagoda_Emblem:1416905638428020877>").strip()
 OPERATOR_EMOJI_RAW = os.getenv(
     "OPERATOR_EMOJI", "<:operator:1467922510908494098>"
 ).strip()
@@ -1530,7 +1529,6 @@ def _emoji_to_button_payload(raw: str) -> dict | None:
     return {"id": m.group(3), "name": m.group(2), "animated": m.group(1) == "a"}
 
 
-ALLIANCE_EMOJI_PAYLOAD = _emoji_to_button_payload(ALLIANCE_EMOJI_RAW)
 PICK_ROLES_EMOJI_PAYLOAD = _emoji_to_button_payload(PICK_ROLES_EMOJI_RAW)
 
 
@@ -1581,18 +1579,17 @@ def _pass_components(
         inner_lines.append("please assign the missing roles here")
     inner = "\n".join(inner_lines)
 
-    # Split link_buttons: Pick Roles becomes the section accessory; the
-    # rest (e.g. Clan Chat) go into a separate action row below the section.
+    # The Pick Roles button is the section accessory so the verification
+    # card stays a single visual block; any other link buttons we receive
+    # are ignored (the clan-chat button was retired).
     pick_roles_btn: dict | None = None
-    other_buttons: list[tuple[str, str]] = []
     for label, url in (link_buttons or []):
-        if label == "Pick Roles" and pick_roles_btn is None:
+        if label == "Pick Roles":
             btn: dict = {"type": 2, "style": 5, "label": label, "url": url}
             if PICK_ROLES_EMOJI_PAYLOAD is not None:
                 btn["emoji"] = PICK_ROLES_EMOJI_PAYLOAD
             pick_roles_btn = btn
-        else:
-            other_buttons.append((label, url))
+            break
 
     if pick_roles_btn is not None:
         section: dict = {
@@ -1604,14 +1601,6 @@ def _pass_components(
     else:
         container_children = [{"type": 10, "content": inner}]
 
-    if other_buttons:
-        row_buttons: list[dict] = []
-        for label, url in other_buttons[:5]:
-            btn = {"type": 2, "style": 5, "label": label, "url": url}
-            if label == "Clan Chat" and ALLIANCE_EMOJI_PAYLOAD is not None:
-                btn["emoji"] = ALLIANCE_EMOJI_PAYLOAD
-            row_buttons.append(btn)
-        container_children.append({"type": 1, "components": row_buttons})
     container = {
         "type": 17,
         "accent_color": ACCENT_PASS,
@@ -1640,54 +1629,16 @@ def _channel_url(guild_id: int, channel_id: int) -> str:
 def _resolve_pass_link_buttons(
     guild: discord.Guild | None, clan_name: str | None
 ) -> list[tuple[str, str]]:
-    """Return [(label, url), ...] for pass response buttons:
-    1. Clan general chat — found by matching the clan's category and a 'general' channel.
-    2. Info channel — PASS_INFO_CHANNEL_ID (label = its channel name).
+    """Return [(label, url), ...] for pass response buttons.
+
+    Currently a single "Pick Roles" link button targeting
+    ``PASS_INFO_CHANNEL_ID``. ``clan_name`` is accepted for signature
+    stability with callers but is no longer used (the clan-chat button
+    was retired).
     """
     buttons: list[tuple[str, str]] = []
     if guild is None:
         return buttons
-
-    if clan_name:
-        clean = _strip_clan_tag(clan_name).lower().strip()
-        category = next(
-            (c for c in guild.categories if clean and clean in c.name.lower()),
-            None,
-        )
-        if category is None:
-            logger.info(
-                "No clan category matched for clan=%r (clean=%r); available=%s",
-                clan_name,
-                clean,
-                [c.name for c in guild.categories],
-            )
-        else:
-            # Prefer channels named like a general/clan-chat hangout. Falls
-            # back to the first text channel in the category if no semantic
-            # match (so the button still works for non-standard setups).
-            keywords = ("general", "clan-chat", "clan chat", "chat", "lounge", "main", "hangout")
-            general = next(
-                (
-                    ch
-                    for kw in keywords
-                    for ch in category.text_channels
-                    if kw in ch.name.lower()
-                ),
-                None,
-            )
-            if general is None and category.text_channels:
-                general = category.text_channels[0]
-            if general is None:
-                logger.info(
-                    "Clan category %r matched but no chat channel found; available=%s",
-                    category.name,
-                    [ch.name for ch in category.text_channels],
-                )
-            else:
-                buttons.append(
-                    ("Clan Chat", _channel_url(guild.id, general.id))
-                )
-
     pick = guild.get_channel(PASS_INFO_CHANNEL_ID)
     if pick is not None:
         buttons.append(("Pick Roles", _channel_url(guild.id, pick.id)))

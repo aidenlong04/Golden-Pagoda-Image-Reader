@@ -42,7 +42,7 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
             clan="Golden Pagoda",
             clan_emoji="<:GoldenPagoda_Emblem:123>",
             mastery_rank="MR 12",
-            link_buttons=[("Clan Chat", "https://discord.com/channels/1/2")],
+            link_buttons=[("Pick Roles", "https://discord.com/channels/1/2")],
             progress_attachment="progress.png",
             nick_suggestion="Tenno",
             user_id=9999,
@@ -58,7 +58,6 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
             mastery_rank="MR 12",
             link_buttons=[
                 ("Pick Roles", "https://discord.com/channels/1/2"),
-                ("Clan Chat", "https://discord.com/channels/1/3"),
             ],
             missing_categories=["Platform"],
         )
