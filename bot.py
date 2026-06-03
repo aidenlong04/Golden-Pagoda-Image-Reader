@@ -2039,6 +2039,57 @@ async def _send_v2(
         task.add_done_callback(_BG_TASKS.discard)
 
 
+async def _edit_message_v2_with_file(
+    *,
+    channel_id: int,
+    message_id: int,
+    components: list[dict],
+    file_bytes: bytes,
+    file_name: str = "progress.png",
+    file_content_type: str = "image/png",
+) -> None:
+    """PATCH an existing V2 message and replace its single attachment.
+
+    UPDATE_MESSAGE (interaction callback type 7) is JSON-only and can't
+    swap attachments, so refreshing the progress card requires a direct
+    multipart PATCH to /channels/{cid}/messages/{mid}. The new attachment
+    keeps the same filename so any ``attachment://progress.png``
+    references inside components resolve to the fresh file.
+    """
+    import aiohttp
+
+    payload = {
+        "components": components,
+        "attachments": [{"id": 0, "filename": file_name}],
+        "allowed_mentions": {"parse": []},
+    }
+    form = aiohttp.FormData()
+    form.add_field(
+        "payload_json", json.dumps(payload),
+        content_type="application/json",
+    )
+    form.add_field(
+        "files[0]", file_bytes,
+        filename=file_name, content_type=file_content_type,
+    )
+    url = (
+        f"https://discord.com/api/v10/channels/"
+        f"{channel_id}/messages/{message_id}"
+    )
+    headers = {
+        "Authorization": f"Bot {DISCORD_TOKEN}",
+        "User-Agent": "GoldenPagoda (https://github.com/aidenlong04, 1.0)",
+    }
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.patch(url, data=form, headers=headers) as resp:
+            if resp.status >= 400:
+                text = await resp.text()
+                raise RuntimeError(
+                    f"PATCH message {message_id} failed: {resp.status} {text}"
+                )
+
+
 async def _delete_after(channel_id: int, message_id: int, delay: float) -> None:
     from discord.http import Route
 
@@ -2958,12 +3009,14 @@ async def _handle_nick_interaction(
     # between them). discord.py 2.x doesn't parse V2 sub-components, so
     # fetch the raw message JSON to get authoritative component data.
     raw: list[dict] = []
+    msg_attachments: list[dict] = []
     try:
         if interaction.message is not None:
             data = await client.http.get_message(
                 interaction.channel_id, interaction.message.id,
             )
             raw = data.get("components") or []
+            msg_attachments = data.get("attachments") or []
     except Exception:
         logger.exception("nick: fetch original message failed")
     trimmed = _strip_nick_prompt(raw)
@@ -2982,6 +3035,72 @@ async def _handle_nick_interaction(
         except Exception:
             logger.exception("nick: deferred ack failed")
         return
+
+    # If the original verification reply included the progress card
+    # attachment, re-render it from the member's CURRENT roles so the
+    # bar reflects any changes since the message was first posted
+    # (clan/platform/MR/syndicate roles picked up via self-service,
+    # plus any unverified-role removal). When refreshed, we must edit
+    # via PATCH+multipart so the new PNG replaces the old attachment;
+    # the type:9/type:12 component still references attachment://progress.png.
+    has_progress = any(
+        att.get("filename") == "progress.png" for att in msg_attachments
+    )
+    refreshed_png: bytes | None = None
+    if (
+        has_progress
+        and interaction.guild
+        and isinstance(interaction.user, discord.Member)
+    ):
+        try:
+            member = interaction.user
+            role_ids = {r.id for r in member.roles}
+            cats = _role_categories_for(role_ids)
+            have = sum(1 for _, ok in cats if ok)
+            total = len(cats)
+            avatar_url = (
+                member.display_avatar or member.default_avatar
+            ).replace(size=256, format="png").url
+            avatar_bytes = await _fetch_avatar_bytes(avatar_url)
+            refreshed_png = await asyncio.to_thread(
+                _render_progress_card_png,
+                avatar_bytes=avatar_bytes,
+                display_name=member.display_name,
+                count=have,
+                target=total,
+            )
+        except Exception:
+            logger.exception("nick: progress card refresh failed")
+            refreshed_png = None
+
+    if refreshed_png is not None:
+        # Deferred-update ACK, then PATCH the message with multipart so
+        # the new attachment supersedes the old one. UPDATE_MESSAGE
+        # (type 7) is JSON-only so we can't use it for attachment swaps.
+        try:
+            from discord.http import Route
+            route = Route(
+                "POST",
+                "/interactions/{interaction_id}/{interaction_token}/callback",
+                interaction_id=interaction.id,
+                interaction_token=interaction.token,
+            )
+            await client.http.request(route, json={"type": 6})
+        except Exception:
+            logger.exception("nick: deferred ack (refresh) failed")
+            return
+        try:
+            await _edit_message_v2_with_file(
+                channel_id=interaction.channel_id,
+                message_id=interaction.message.id,
+                components=trimmed,
+                file_bytes=refreshed_png,
+                file_name="progress.png",
+            )
+        except Exception:
+            logger.exception("nick: message PATCH with refreshed card failed")
+        return
+
     try:
         await _interaction_callback(
             interaction, 7, trimmed, ephemeral=False,
