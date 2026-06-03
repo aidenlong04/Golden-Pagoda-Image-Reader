@@ -1200,13 +1200,22 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
             logger.exception("nick prompt build failed")
             nick_extra = []
     if passed:
+        # On the pass embed, "Missing Data" reflects what the user still
+        # needs to act on. Mastery Rank should only appear when OCR
+        # couldn't read it from the screenshot — if we parsed it
+        # successfully, the user has already shown their MR and we'll
+        # render it as its own bullet above.
+        pass_missing = [
+            c for c in extra_missing
+            if c != "Mastery Rank" or not mastery_rank
+        ]
         components = _pass_components(
             profile_name, clan_name,
             clan_emoji=clan_emoji,
             mastery_rank=mastery_rank,
             link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
             progress_attachment="progress.png" if progress_png else None,
-            missing_categories=extra_missing,
+            missing_categories=pass_missing,
         )
         # Append nickname prompt to the bottom of the verification message
         # so it lives inside the same Discord message as the pass embed.
