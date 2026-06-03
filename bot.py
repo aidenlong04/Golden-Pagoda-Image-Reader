@@ -1207,6 +1207,7 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
             mastery_rank=mastery_rank,
             link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
             progress_attachment="progress.png" if progress_png else None,
+            missing_categories=extra_missing,
         )
         # Append nickname prompt to the bottom of the verification message
         # so it lives inside the same Discord message as the pass embed.
@@ -1490,6 +1491,7 @@ def _pass_components(
     progress_attachment: str | None = None,
     nick_suggestion: str | None = None,
     user_id: int | None = None,
+    missing_categories: list[str] | None = None,
 ) -> list[dict]:
     emoji = (clan_emoji or "").strip() or CLAN_EMOJI
     display_clan = _strip_clan_tag(clan) if clan else None
@@ -1507,6 +1509,11 @@ def _pass_components(
     inner_lines = [f"### \u2705  `{display_profile}`", clan_part]
     if mastery_rank:
         inner_lines.append(f"-# {mastery_rank}")
+    if missing_categories:
+        joined = ", ".join(f"**{c}**" for c in missing_categories)
+        inner_lines.append(
+            f"-# \u26a0\ufe0f Still missing: {joined} \u2014 please pick them."
+        )
     inner = "\n".join(inner_lines)
     container_children: list[dict] = [{"type": 10, "content": inner}]
     if link_buttons:
