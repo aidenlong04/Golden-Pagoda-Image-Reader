@@ -27,6 +27,12 @@ _lock = threading.Lock()
 _initialized = False
 _disabled = False
 _db_path: Path | None = None
+# Single long-lived connection. SQLite handles serialization fine when
+# all callers share one connection guarded by ``_lock`` (the bot only
+# writes from the main thread + the OCR worker thread). Reusing the
+# connection avoids the open()/close() syscalls and per-call setup cost
+# that dominated record_verification() on the CX22's slow disk.
+_conn: sqlite3.Connection | None = None
 
 
 def _resolve_path() -> Path | None:
@@ -45,15 +51,33 @@ def _resolve_path() -> Path | None:
 
 @contextmanager
 def _connect() -> Iterator[sqlite3.Connection]:
+    global _conn
     p = _resolve_path()
     if p is None:
         raise RuntimeError("analytics disabled")
-    conn = sqlite3.connect(str(p), timeout=2.0)
+    if _conn is None:
+        _conn = sqlite3.connect(
+            str(p), timeout=2.0, check_same_thread=False, isolation_level=None
+        )
+        _conn.row_factory = sqlite3.Row
+        # WAL gives concurrent readers + a single writer without per-tx
+        # fsync stalls; synchronous=NORMAL is safe in WAL mode.
+        try:
+            _conn.execute("PRAGMA journal_mode=WAL")
+            _conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error:
+            logger.warning("analytics: PRAGMA setup failed", exc_info=True)
     try:
-        conn.row_factory = sqlite3.Row
-        yield conn
-    finally:
-        conn.close()
+        yield _conn
+    except sqlite3.Error:
+        # Drop the cached connection on hard errors so the next call
+        # reopens cleanly instead of reusing a broken handle.
+        try:
+            _conn.close()
+        except Exception:
+            pass
+        _conn = None
+        raise
 
 
 def _init() -> None:

@@ -282,10 +282,9 @@ def _update_env_clan_slots(slots: list[ClanSlot]) -> bool:
     by_slot = {s.slot: s for s in slots}
     lines = ENV_FILE_PATH.read_text().splitlines()
     seen: set[tuple[int, str]] = set()
-    pattern = re.compile(r"^(\s*)CLAN_ROLE_(\d+)_(NAME|ID|EMOJI)\s*=.*$")
 
     for idx, line in enumerate(lines):
-        m = pattern.match(line)
+        m = _ENV_CLAN_SLOT_RE.match(line)
         if not m:
             continue
         indent, slot_num, field = m.group(1), int(m.group(2)), m.group(3)
@@ -323,10 +322,9 @@ def _update_env_platform_ids(ids: dict[str, int | None]) -> bool:
     key_to_platform = {v: k for k, v in PLATFORM_ROLE_ID_ENV_KEYS.items()}
     lines = ENV_FILE_PATH.read_text().splitlines()
     seen: set[str] = set()
-    pattern = re.compile(r"^(\s*)(PLATFORM_ROLE_[A-Z]+_ID)\s*=.*$")
 
     for idx, line in enumerate(lines):
-        m = pattern.match(line)
+        m = _ENV_PLATFORM_ID_RE.match(line)
         if not m:
             continue
         indent, key = m.group(1), m.group(2)
@@ -684,10 +682,14 @@ def _sync_clan_slots_from_guilds() -> list[str]:
 # ---------- Role lookup helpers --------------------------------------------
 
 _CLAN_TAG_SUFFIX_RE = re.compile(r"#\d+\s*$")
+_WS_RE = re.compile(r"\s+")
+_ENV_CLAN_SLOT_RE = re.compile(r"^(\s*)CLAN_ROLE_(\d+)_(NAME|ID|EMOJI)\s*=.*$")
+_ENV_PLATFORM_ID_RE = re.compile(r"^(\s*)(PLATFORM_ROLE_[A-Z]+_ID)\s*=.*$")
+_PLACEHOLDER_NAME_RE = re.compile(r"^place[\s\-_]*holder", re.IGNORECASE)
 
 
 def _normalize(name: str) -> str:
-    return re.sub(r"\s+", " ", name.strip().lower())
+    return _WS_RE.sub(" ", name.strip().lower())
 
 
 def _strip_clan_tag(clan_name: str) -> str:
@@ -1022,7 +1024,7 @@ async def _process_screenshot(message: discord.Message) -> None:
             _ERROR_TIMESTAMPS.append(time.time())
             # If we have >= ERROR_THRESHOLD errors in the last ERROR_WINDOW_SECONDS,
             # stop the health signal so the watchdog restarts the container.
-            now = time.time()
+            now = _ERROR_TIMESTAMPS[-1]
             recent = sum(1 for ts in _ERROR_TIMESTAMPS if now - ts < _ERROR_WINDOW_SECONDS)
             if recent >= _ERROR_THRESHOLD:
                 if not _HEALTH_STOPPED:
@@ -2486,11 +2488,10 @@ def _status_page_roles_split(
     directly under the Clan slots block, between the two text blobs.
     """
     clan_lines = ["**Clan slots**"]
-    _placeholder_re = re.compile(r"^place[\s\-_]*holder", re.IGNORECASE)
 
     def _sort_key(slot):
         name = (slot.clan_name or "").strip()
-        is_placeholder = 1 if _placeholder_re.match(name) else 0
+        is_placeholder = 1 if _PLACEHOLDER_NAME_RE.match(name) else 0
         has_emoji = 0 if (slot.emoji or "").strip() else 1
         # Order: named+emoji, named+no-emoji, placeholders (then slot index).
         return (is_placeholder, has_emoji, slot.slot)
@@ -2800,20 +2801,26 @@ def _gradient_bar(
 
     fill_w = max(height, int(round(width * progress)))
 
-    grad = Image.new("RGBA", (fill_w, height), (0, 0, 0, 0))
     if complete:
         start, end = _PROGRESS_FILL_GOLD, _PROGRESS_FILL_END
     else:
         start, end = _PROGRESS_FILL_START, _PROGRESS_FILL_END
-    pixels = grad.load()
-    if fill_w > 1 and pixels is not None:
-        for x in range(fill_w):
-            t = x / (fill_w - 1)
-            r = int(start[0] + (end[0] - start[0]) * t)
-            g = int(start[1] + (end[1] - start[1]) * t)
-            b = int(start[2] + (end[2] - start[2]) * t)
-            for y in range(height):
-                pixels[x, y] = (r, g, b, 255)
+
+    # Vectorized gradient (was a per-pixel Python loop; numpy turns the
+    # fill_w*height inner work into a few BLAS-backed broadcasts).
+    import numpy as np
+
+    if fill_w > 1:
+        t = np.linspace(0.0, 1.0, fill_w, dtype=np.float32)
+    else:
+        t = np.zeros(1, dtype=np.float32)
+    s = np.array(start[:3], dtype=np.float32)
+    e = np.array(end[:3], dtype=np.float32)
+    row = (s + (e - s) * t[:, None]).astype(np.uint8)  # (fill_w, 3)
+    grad_arr = np.empty((height, fill_w, 4), dtype=np.uint8)
+    grad_arr[..., :3] = row[None, :, :]
+    grad_arr[..., 3] = 255
+    grad = Image.fromarray(grad_arr, mode="RGBA")
 
     fill_mask = Image.new("L", (fill_w, height), 0)
     ImageDraw.Draw(fill_mask).rounded_rectangle(

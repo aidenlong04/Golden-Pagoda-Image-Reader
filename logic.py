@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
+
+_CLAN_TAG_SUFFIX_RE = re.compile(r"#\d+\s*$")
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -132,13 +134,13 @@ def find_clan_slot(slots: Iterable["ClanSlot"], clan_name: str) -> "ClanSlot | N
     """
     if not clan_name:
         return None
-    needle = re.sub(r"#\d+\s*$", "", clan_name).strip().lower()
+    needle = _CLAN_TAG_SUFFIX_RE.sub("", clan_name).strip().lower()
     if not needle:
         return None
     for slot in slots:
         if not slot.clan_name:
             continue
-        candidate = re.sub(r"#\d+\s*$", "", slot.clan_name).strip().lower()
+        candidate = _CLAN_TAG_SUFFIX_RE.sub("", slot.clan_name).strip().lower()
         if candidate == needle:
             return slot
     return None
