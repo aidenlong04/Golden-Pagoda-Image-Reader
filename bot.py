@@ -1781,43 +1781,38 @@ def _nickname_prompt_components(
         encoded = quote(truncated, safe="")
     yes_id = f"nick:y:{user_id}:{encoded}"
     no_id = f"nick:n:{user_id}:{encoded}"
-    ingame_text = suggestion or "In-game name"
-    server_text = current_nick or "Current nickname"
+    ingame_label = (suggestion or "In-game name")[:80]
+    server_label = (current_nick or "Current nickname")[:80]
 
-    def _section(content: str, custom_id: str, emoji_id: str) -> dict:
-        section: dict = {
-            "type": 9,
-            "components": [{"type": 10, "content": content}],
-            "accessory": {
-                "type": 2,
-                "style": 2,
-                "custom_id": custom_id,
-            },
+    def _button_row(label: str, custom_id: str, emoji_id: str) -> dict:
+        btn: dict = {
+            "type": 2,
+            "style": 2,
+            "label": label,
+            "custom_id": custom_id,
         }
         if emoji_id:
-            section["accessory"]["emoji"] = {
+            btn["emoji"] = {
                 "id": emoji_id, "name": "unknown", "animated": False,
             }
-        return section
+        return {"type": 1, "components": [btn]}
 
-    components: list[dict] = []
-    components.extend([
+    return [
         {
             "type": 17,
             "accent_color": 0xD4AF37,
             "components": [{
                 "type": 10,
                 "content": (
-                    " ### Hello Operator! \n"
-                    "-# > Please Select your call sign.\n"
+                    " ### Hello Operator!\n"
+                    "-# > Please Select your call sign."
                 ),
             }],
         },
-        _section(ingame_text, yes_id, NICK_PROMPT_INGAME_EMOJI_ID),
+        _button_row(server_label, no_id, NICK_PROMPT_SERVER_EMOJI_ID),
         {"type": 14, "spacing": 2},
-        _section(server_text, no_id, NICK_PROMPT_SERVER_EMOJI_ID),
-    ])
-    return components
+        _button_row(ingame_label, yes_id, NICK_PROMPT_INGAME_EMOJI_ID),
+    ]
 
 
 def _nickname_resolved_components(text: str, accent: int) -> list[dict]:
@@ -2959,6 +2954,11 @@ def _strip_nick_prompt(components: list[dict]) -> list[dict]:
             cid = acc.get("custom_id", "")
             if isinstance(cid, str) and cid.startswith("nick:"):
                 return True
+        if t == 1:
+            for btn in c.get("components") or []:
+                cid = btn.get("custom_id", "") if isinstance(btn, dict) else ""
+                if isinstance(cid, str) and cid.startswith("nick:"):
+                    return True
         return False
 
     # Walk from the end and prune contiguous prompt-related components
