@@ -1153,16 +1153,21 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
                 assigned_role_ids.add(role_obj.id)
 
     # Post-verify category check: list every required category the member
-    # is still missing (Platform / MR / Syndicate). Platform is no longer
-    # auto-assigned \u2014 the user picks it themselves in the help channel.
+    # is still missing (Platform / MR / Syndicate). These are surfaced for
+    # the user's awareness but do NOT block a pass: as long as the clan
+    # role was successfully assigned (env-recognised clan), we run the
+    # full pass procedure (reaction, unverified-role removal, pass embed)
+    # so the user is properly verified. Platform/MR/Syndicate are picked
+    # up later via the user's own self-service flow.
     effective_role_ids = {r.id for r in member.roles} | assigned_role_ids
     cats = _role_categories_for(effective_role_ids)
     have = sum(1 for _, ok in cats if ok)
     total = len(cats)
     extra_missing = [name for name, ok in cats if not ok]
-    if extra_missing:
+    if extra_missing and not passed:
+        # Only surface missing categories on the incomplete embed; on a
+        # pass the user already gets the progress bar showing them.
         issues.extend(f"Missing **{cat}** role." for cat in extra_missing)
-        passed = False
 
     # Render the progress card once; both pass and incomplete embeds attach it.
     progress_png: bytes | None = None
