@@ -1134,10 +1134,10 @@ async def _process_screenshot(message: discord.Message) -> None:
     # Fan out the user-visible work concurrently: reacting, removing the
     # opposite-state role, and posting the V2 reply all hit different
     # Discord endpoints and never depend on each other.
-    nick_target = _nickname_suggestion(member, profile_name) if passed else None
+    nick_target = _nickname_suggestion(member, profile_name)
     if passed:
         components = _pass_components(
-            profile_name, clan_name, role_lines,
+            profile_name, clan_name,
             clan_emoji=clan_emoji,
             mastery_rank=mastery_rank,
             link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
@@ -1159,6 +1159,8 @@ async def _process_screenshot(message: discord.Message) -> None:
             " ".join(issues),
             link_buttons=_help_link_buttons(message.guild),
             progress_attachment="progress.png" if progress_png else None,
+            nick_suggestion=nick_target,
+            user_id=member.id,
         )
         outbound = [
             _react(message, "incomplete"),
@@ -2551,19 +2553,15 @@ def _render_progress_card_png(
     bar = _gradient_bar(bar_w, bar_h, progress, complete=complete)
     canvas.alpha_composite(bar, (text_x, bar_y))
 
+    # Only show a footer when the user has hit their target; the previous
+    # "X more to reach the goal" copy duplicated the bar and was noisy.
     if complete:
-        footer = "\u2605  Target reached!"
-        footer_fill = _PROGRESS_AVATAR_RING
-    else:
-        remaining = max(0, target - count)
-        footer = f"{remaining} more to reach the goal"
-        footer_fill = _PROGRESS_MUTED
-    draw.text(
-        (text_x, bar_y + bar_h + 8),
-        footer,
-        font=footer_font,
-        fill=footer_fill,
-    )
+        draw.text(
+            (text_x, bar_y + bar_h + 8),
+            "\u2605  Target reached!",
+            font=footer_font,
+            fill=_PROGRESS_AVATAR_RING,
+        )
 
     buf = io.BytesIO()
     canvas.convert("RGB").save(buf, format="PNG", optimize=True)
