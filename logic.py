@@ -666,23 +666,37 @@ def detect_platform(
             " | ".join(per_candidate_log),
         )
 
-    # Relaxed-gate fallback: if the strict gate (best>=0.45, gap>=0.15)
-    # rejected everything, accept a downscaled/noisy match where the
-    # leader is still comfortably ahead (best>=0.30, gap>=0.10). The
-    # margin requirement is what actually disambiguates one platform
-    # from another — the absolute floor is just to reject obviously
-    # off-target ROIs.
+    # Relaxed-gate fallback: when the strict gate (best>=0.45, gap>=0.15)
+    # rejected every candidate, accept the best one ONLY if the leader is
+    # comfortably ahead of the runner-up. The strong gap requirement is
+    # what prevents "forced" incorrect reads on ambiguous icons \u2014 a low
+    # absolute score with a wide margin is a legitimate match against a
+    # downscaled/blurred reference; a low score with a narrow margin is
+    # noise and must return None so the caller can surface a failure.
     if best_platform is None and fallback_platform is not None:
         sorted_fb = sorted(fallback_scores.values(), reverse=True)
         runner_up = sorted_fb[1] if len(sorted_fb) > 1 else 0.0
         gap = fallback_score_value - runner_up
-        if fallback_score_value >= 0.30 and gap >= 0.10:
+        # High-confidence: strong absolute score, only needs a modest margin.
+        strong = fallback_score_value >= 0.55 and gap >= 0.10
+        # Clear-margin: weaker absolute score but the leader is comfortably
+        # ahead \u2014 still a legitimate match against a downscaled reference.
+        clear = fallback_score_value >= 0.30 and gap >= 0.18
+        if strong or clear:
             best_platform = fallback_platform
             best_scores = fallback_scores
             best_score_value = fallback_score_value
             logger.info(
                 "Platform accepted via relaxed gate: %s score=%.3f runner_up=%.3f gap=%.3f",
                 best_platform,
+                fallback_score_value,
+                runner_up,
+                gap,
+            )
+        else:
+            logger.info(
+                "Platform rejected (ambiguous): leader=%s score=%.3f runner_up=%.3f gap=%.3f",
+                fallback_platform,
                 fallback_score_value,
                 runner_up,
                 gap,

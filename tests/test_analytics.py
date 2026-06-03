@@ -84,37 +84,3 @@ def test_platform_scores_persisted(analytics_module):
     assert row is not None
     assert row[0] is not None, "platform_scores column should be populated"
     assert json.loads(row[0]) == scores
-
-
-def test_submission_count_is_per_user_and_idempotent(analytics_module):
-    a = analytics_module
-    chan = 1511585450731507803
-    # Three unique submissions from user 1, one from user 2.
-    for mid in (100, 101, 102):
-        a.record_submission(
-            user_id=1, guild_id=42, channel_id=chan, message_id=mid,
-        )
-    a.record_submission(
-        user_id=2, guild_id=42, channel_id=chan, message_id=200,
-    )
-    # Duplicate message_id must not increment.
-    a.record_submission(
-        user_id=1, guild_id=42, channel_id=chan, message_id=100,
-    )
-
-    assert a.submission_count(user_id=1, channel_id=chan) == 3
-    assert a.submission_count(user_id=2, channel_id=chan) == 1
-    # Unrelated channel isolates counts.
-    assert a.submission_count(user_id=1, channel_id=999) == 0
-    # Unknown user.
-    assert a.submission_count(user_id=999, channel_id=chan) == 0
-
-
-def test_submission_count_disabled_returns_zero(tmp_path, monkeypatch):
-    monkeypatch.setenv("ANALYTICS_DB_PATH", "/proc/forbidden/x.db")
-    import analytics
-    importlib.reload(analytics)
-    analytics.record_submission(
-        user_id=1, channel_id=1, message_id=1,
-    )  # no raise
-    assert analytics.submission_count(user_id=1, channel_id=1) == 0

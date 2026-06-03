@@ -206,10 +206,22 @@ CATCHUP_LOOKBACK_HOURS = _int_env("CATCHUP_LOOKBACK_HOURS", 24)
 CATCHUP_STATE_PATH = Path(os.getenv("CATCHUP_STATE_PATH", "/app/data/catchup_state.json"))
 CATCHUP_DELAY_SECONDS = float(os.getenv("CATCHUP_DELAY_SECONDS") or "1.0")
 
-# Submission progress tracking: count each user's messages in PROGRESS_CHANNEL_ID
-# and expose the count via /progress as a 0..PROGRESS_TARGET progress bar.
-PROGRESS_CHANNEL_ID = _int_env("PROGRESS_CHANNEL_ID", 1511585450731507803)
-PROGRESS_TARGET = max(1, _int_env("PROGRESS_TARGET", 20))
+# Role IDs that count as "has MR verified" / "has joined a syndicate" for
+# the /progress completion check. Both accept a comma-separated list — a
+# member counts as having the category if they hold ANY of the listed roles.
+# Empty list disables the category (it stays at 0/0 and doesn't drag the
+# completion percentage down).
+MR_ROLE_IDS: list[int] = [
+    int(x) for x in (os.getenv("MR_ROLE_IDS") or "").split(",")
+    if x.strip().isdigit()
+]
+SYNDICATE_ROLE_IDS: list[int] = [
+    int(x) for x in (os.getenv("SYNDICATE_ROLE_IDS") or "").split(",")
+    if x.strip().isdigit()
+]
+# Channel users are directed to when they're missing MR/Platform/Syndicate.
+# Surfaces as a link button on the incomplete card.
+HELP_CHANNEL_ID = _int_env("HELP_CHANNEL_ID", 1392582268769271950)
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is required")
@@ -1022,26 +1034,27 @@ async def _process_screenshot(message: discord.Message) -> None:
     # Resolve which Discord role coroutines to fire concurrently. Building
     # them up front lets us issue both add_roles HTTP calls in parallel via
     # asyncio.gather instead of paying two sequential Discord round-trips.
-    role_coros: list[tuple[str, "asyncio.Future"]] = []
+    role_coros: list[tuple[str, "discord.Role", "asyncio.Future"]] = []
 
     if platform is None:
-        # TEMP fallback: platform detection failed but clan was readable.
-        # Skip platform role assignment instead of blocking the user.
-        # Log scores + OCR snippet so engine misses are diagnosable from
-        # `docker logs` without round-tripping to the original screenshot.
+        # Platform icon could not be confidently identified. Surface a
+        # failure rather than silently skipping the platform role so the
+        # user knows what's missing instead of getting a partially-applied
+        # role set.
         snippet = " ".join(ocr_text.split())[:240]
         logger.info(
-            "Passing without platform role (clan=%r, profile=%r) scores=%s ocr=%r",
+            "Platform unreadable (clan=%r, profile=%r) scores=%s ocr=%r",
             clan_name, profile_name, platform_scores, snippet,
         )
-        role_lines.append("Platform: skipped (icon not detected)")
+        issues.append("Platform icon not detected.")
+        passed = False
     else:
         role = _find_platform_role(message.guild, platform)
         if role is None:
             issues.append(f"No role for platform **{platform}**.")
             passed = False
         else:
-            role_coros.append(("Platform", _add_role(member, role, "Screenshot platform verification")))
+            role_coros.append(("Platform", role, _add_role(member, role, "Screenshot platform verification")))
 
     clan_emoji: str | None = None
     if clan_name:
@@ -1053,14 +1066,17 @@ async def _process_screenshot(message: discord.Message) -> None:
             issues.append(f"No role for clan **{_strip_clan_tag(clan_name)}**.")
             passed = False
         else:
-            role_coros.append(("Clan", _add_role(member, role, "Screenshot clan verification")))
+            role_coros.append(("Clan", role, _add_role(member, role, "Screenshot clan verification")))
     else:
         issues.append("Clan shown as Unaffiliated — no matching server clan role.")
         passed = False
 
+    assigned_role_ids: set[int] = set()
     if role_coros:
-        results = await asyncio.gather(*(c for _, c in role_coros), return_exceptions=True)
-        for (label, _), result in zip(role_coros, results):
+        results = await asyncio.gather(
+            *(c for _, _, c in role_coros), return_exceptions=True
+        )
+        for (label, role_obj, _), result in zip(role_coros, results):
             if isinstance(result, BaseException):
                 logger.exception("%s role assignment failed", label, exc_info=result)
                 role_lines.append(f"{label}: error assigning role")
@@ -1068,6 +1084,20 @@ async def _process_screenshot(message: discord.Message) -> None:
             else:
                 _, status = result
                 role_lines.append(f"{label}: {status}")
+                # discord.py's add_roles updates member.roles via a gateway
+                # event that may not have arrived yet; track the assignment
+                # locally so the post-verify role check sees fresh state.
+                assigned_role_ids.add(role_obj.id)
+
+    # Post-verify category check: even if the screenshot was perfect, the
+    # member may still be missing MR / Syndicate roles configured server-
+    # side. Surface those so the incomplete card lists everything that
+    # needs attention in one round-trip.
+    effective_role_ids = {r.id for r in member.roles} | assigned_role_ids
+    extra_missing = _missing_categories(effective_role_ids)
+    if extra_missing:
+        issues.extend(f"Missing **{cat}** role." for cat in extra_missing)
+        passed = False
 
     # Fan out the user-visible work concurrently: reacting, removing the
     # opposite-state role, and posting the V2 reply all hit different
@@ -1093,7 +1123,10 @@ async def _process_screenshot(message: discord.Message) -> None:
             _add_incomplete_role(member),
             _send_v2(
                 message,
-                _incomplete_components(" ".join(issues)),
+                _incomplete_components(
+                    " ".join(issues),
+                    link_buttons=_help_link_buttons(message.guild),
+                ),
                 mention_user=True,
                 allow_role_mentions=True,
             ),
@@ -1499,7 +1532,12 @@ def _fail_components(headline: str, reason: str, *, image_url: str | None = None
     ]
 
 
-def _incomplete_components(reason: str, *, image_url: str | None = None) -> list[dict]:
+def _incomplete_components(
+    reason: str,
+    *,
+    image_url: str | None = None,
+    link_buttons: list[tuple[str, str]] | None = None,
+) -> list[dict]:
     outreach = " / ".join(f"<@&{rid}>" for rid in OUTREACH_ROLE_IDS) or "staff"
     header = {
         "type": 10,
@@ -1520,6 +1558,15 @@ def _incomplete_components(reason: str, *, image_url: str | None = None) -> list
                 "items": [{"media": {"url": image_url}}],
             },
         )
+    if link_buttons:
+        # Discord caps action rows at 5 buttons; we never exceed that here.
+        children.append({
+            "type": 1,
+            "components": [
+                {"type": 2, "style": 5, "label": label, "url": url}
+                for label, url in link_buttons[:5]
+            ],
+        })
     return [
         header,
         {
@@ -1528,6 +1575,57 @@ def _incomplete_components(reason: str, *, image_url: str | None = None) -> list
             "components": children,
         },
     ]
+
+
+# ---------- Role category tracking -----------------------------------------
+
+
+# Categories that contribute to a member's verification "completion %".
+# Each tuple is (display_name, callable -> list[int] of role IDs that
+# count for that category). The list is recomputed per call because
+# CLAN_SLOTS / PLATFORM_ROLE_IDS can change at runtime via /clan-emblems
+# resync.
+def _role_categories() -> list[tuple[str, list[int]]]:
+    return [
+        ("Platform", [rid for rid in PLATFORM_ROLE_IDS.values() if rid]),
+        ("Clan", [s.role_id for s in CLAN_SLOTS if s.role_id]),
+        ("Mastery Rank", list(MR_ROLE_IDS)),
+        ("Syndicate", list(SYNDICATE_ROLE_IDS)),
+    ]
+
+
+def _role_categories_for(role_ids: set[int]) -> list[tuple[str, bool]]:
+    """Return (name, has) for each *enabled* category given a member's roles.
+
+    A category is enabled when its role-id list is non-empty. Disabled
+    categories don't appear in /progress totals, so an unconfigured server
+    won't show 0% forever.
+    """
+    out: list[tuple[str, bool]] = []
+    for name, ids in _role_categories():
+        if not ids:
+            continue
+        out.append((name, any(rid in role_ids for rid in ids)))
+    return out
+
+
+def _missing_categories(role_ids: set[int]) -> list[str]:
+    return [name for name, has in _role_categories_for(role_ids) if not has]
+
+
+def _help_link_buttons(guild: "discord.Guild | None") -> list[tuple[str, str]]:
+    """Build a Link button row pointing to the help channel.
+
+    Discord channel jump-links are ``/channels/<guild>/<channel>`` URLs.
+    Returns an empty list when either the guild or channel is unset so
+    callers can safely splat into ``link_buttons=``.
+    """
+    if not (guild and HELP_CHANNEL_ID):
+        return []
+    return [(
+        "How to get your roles",
+        f"https://discord.com/channels/{guild.id}/{HELP_CHANNEL_ID}",
+    )]
 
 
 async def _send_v2(
@@ -1627,16 +1725,6 @@ async def on_message(message: discord.Message) -> None:
         or message.type not in (discord.MessageType.default, discord.MessageType.reply)
     ):
         return
-
-    if PROGRESS_CHANNEL_ID and message.channel.id == PROGRESS_CHANNEL_ID:
-        _spawn_bg_task(asyncio.to_thread(
-            analytics.record_submission,
-            user_id=message.author.id,
-            guild_id=message.guild.id if message.guild else None,
-            channel_id=message.channel.id,
-            message_id=message.id,
-        ))
-
     if message.channel.id != TARGET_CHANNEL_ID:
         return
 
@@ -2398,33 +2486,50 @@ async def _interaction_callback_with_file(
 
 def _progress_components(
     *,
-    count: int,
-    target: int,
-    channel_id: int,
+    have: int,
+    total: int,
+    missing: list[str],
+    link_buttons: list[tuple[str, str]] | None = None,
 ) -> list[dict]:
-    """V2 container that hosts the rendered progress card image."""
-    complete = count >= target
-    footer = (
-        "-# \u2728 Target reached!" if complete
-        else f"-# Tracking submissions in <#{channel_id}>"
-    )
-    container = {
+    """V2 container that hosts the rendered progress card image.
+
+    Lists missing categories under the card and surfaces a help-channel
+    link button when the member is short any role.
+    """
+    complete = have >= total and total > 0
+    if complete:
+        footer = "-# \u2605 Verification complete \u2014 all roles assigned."
+    elif missing:
+        bullets = ", ".join(f"**{m}**" for m in missing)
+        footer = f"-# Missing: {bullets}"
+    else:
+        footer = "-# No verification categories are configured for this server."
+
+    children: list[dict] = [
+        {
+            "type": 12,
+            "items": [{"media": {"url": "attachment://progress.png"}}],
+        },
+        {"type": 10, "content": footer},
+    ]
+    if link_buttons and not complete:
+        children.append({
+            "type": 1,
+            "components": [
+                {"type": 2, "style": 5, "label": label, "url": url}
+                for label, url in link_buttons[:5]
+            ],
+        })
+    return [{
         "type": 17,
         "accent_color": ACCENT_PASS if complete else 0x5DD0F3,
-        "components": [
-            {
-                "type": 12,  # Media Gallery
-                "items": [{"media": {"url": "attachment://progress.png"}}],
-            },
-            {"type": 10, "content": footer},
-        ],
-    }
-    return [container]
+        "components": children,
+    }]
 
 
 @tree.command(
     name="progress",
-    description="Show submission progress in the tracked channel.",
+    description="Show your verification role progress (0-100% complete).",
 )
 @app_commands.describe(
     user="View another member's progress (defaults to yourself).",
@@ -2436,30 +2541,37 @@ async def progress_cmd(
     ephemeral: bool = False,
 ) -> None:
     target = user or interaction.user
-    if isinstance(target, discord.Member):
-        display_name = target.display_name
-    else:
-        display_name = getattr(target, "global_name", None) or target.name
-    avatar_asset = getattr(target, "display_avatar", None) or target.default_avatar
+    if not isinstance(target, discord.Member):
+        # Slash commands always carry a Member when invoked in a guild, but
+        # defensively handle the User edge case (DMs, stale cache).
+        await interaction.response.send_message(
+            "\u274C /progress can only be used in a server.", ephemeral=True
+        )
+        return
+
+    display_name = target.display_name
+    avatar_asset = target.display_avatar or target.default_avatar
     avatar_url = avatar_asset.replace(size=256, format="png").url
 
-    count = await asyncio.to_thread(
-        analytics.submission_count,
-        user_id=target.id,
-        channel_id=PROGRESS_CHANNEL_ID,
-    )
+    role_ids = {r.id for r in target.roles}
+    cats = _role_categories_for(role_ids)
+    total = len(cats)
+    have = sum(1 for _, ok in cats if ok)
+    missing = [name for name, ok in cats if not ok]
+
     avatar_bytes = await _fetch_avatar_bytes(avatar_url)
     png = await asyncio.to_thread(
         _render_progress_card_png,
         avatar_bytes=avatar_bytes,
         display_name=display_name,
-        count=count,
-        target=PROGRESS_TARGET,
+        count=have,
+        target=total,
     )
     components = _progress_components(
-        count=count,
-        target=PROGRESS_TARGET,
-        channel_id=PROGRESS_CHANNEL_ID,
+        have=have,
+        total=total,
+        missing=missing,
+        link_buttons=_help_link_buttons(interaction.guild),
     )
     try:
         await _interaction_callback_with_file(
