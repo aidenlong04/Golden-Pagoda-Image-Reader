@@ -1420,8 +1420,9 @@ def _pass_components(
         display_profile = profile
     else:
         display_profile = _strip_clan_tag(profile)
-    header = {"type": 10, "content": f"### \u2705  `{display_profile}`"}
-    inner_lines = [clan_part]
+    # In-game name shown as the heading inside the container, with clan
+    # directly underneath so the verified identity reads top-to-bottom.
+    inner_lines = [f"### \u2705  `{display_profile}`", clan_part]
     if mastery_rank:
         inner_lines.append(f"-# > {mastery_rank}")
     inner = "\n".join(inner_lines)
@@ -1447,7 +1448,7 @@ def _pass_components(
             "type": 12,
             "items": [{"media": {"url": f"attachment://{progress_attachment}"}}],
         })
-    top_level.extend([header, container])
+    top_level.append(container)
     # Inline nickname prompt as additional top-level components so the
     # whole verification flow lives in one message.
     if nick_suggestion and user_id is not None:
