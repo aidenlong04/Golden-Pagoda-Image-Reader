@@ -1742,21 +1742,33 @@ def _nickname_prompt_top_level(suggestion: str, user_id: int) -> list[dict]:
     ]
 
 
+NICK_PROMPT_BANNER_URL = os.getenv(
+    "NICK_PROMPT_BANNER_URL",
+    "https://ik.imagekit.io/qcxbyrkgu/Untitled%20-%20June%2003,%202026%20at%2001.46.58.png",
+).strip()
+NICK_PROMPT_INGAME_EMOJI_ID = os.getenv(
+    "NICK_PROMPT_INGAME_EMOJI_ID", "1467922510908494098"
+).strip()
+NICK_PROMPT_SERVER_EMOJI_ID = os.getenv(
+    "NICK_PROMPT_SERVER_EMOJI_ID", "1511619596459708486"
+).strip()
+
+
 def _nickname_prompt_components(
     suggestion: str, user_id: int, *, current_nick: str = ""
 ) -> list[dict]:
-    """Standalone V2 message for the in-game-name Yes/No prompt.
+    """Standalone V2 message for the in-game-name selection prompt.
 
-    Wraps the prompt text + Yes/No row in a single Container (type 17) so
-    when the handler issues UPDATE_MESSAGE (callback type 7) the
-    confirmation card replaces this whole message cleanly and the
-    verification reply / progress bar above are left untouched.
+    Layout (per design spec):
+      - MediaGallery banner (type 12)
+      - Container header "Hello Operator! / Please Select your call sign."
+      - Section (type 9) with the in-game name + button accessory
+      - Separator (type 14)
+      - Section (type 9) with the current server nickname + button accessory
 
-    The buttons are labelled with the actual names instead of Yes/No:
-      - green button = in-game name (``suggestion``)
-      - red button   = current server nickname (``current_nick``)
-    Discord caps button labels at 80 chars; both inputs are already
-    bounded (nick ≤ 32, suggestion ≤ 32) so no truncation needed.
+    The two buttons reuse the existing ``nick:y:<uid>:<encoded>`` /
+    ``nick:n:<uid>:<encoded>`` custom_id scheme so ``_handle_nick_interaction``
+    can edit this whole prompt message in place via UPDATE_MESSAGE.
     """
     from urllib.parse import quote
 
@@ -1769,34 +1781,48 @@ def _nickname_prompt_components(
         encoded = quote(truncated, safe="")
     yes_id = f"nick:y:{user_id}:{encoded}"
     no_id = f"nick:n:{user_id}:{encoded}"
-    yes_label = (suggestion or "In-game name")[:80]
-    no_label = (current_nick or "Keep current")[:80]
-    return [{
-        "type": 17,
-        "accent_color": ACCENT_INCOMPLETE,
-        "components": [
-            {
+    ingame_text = suggestion or "In-game name"
+    server_text = current_nick or "Current nickname"
+
+    def _section(content: str, custom_id: str, emoji_id: str) -> dict:
+        section: dict = {
+            "type": 9,
+            "components": [{"type": 10, "content": content}],
+            "accessory": {
+                "type": 2,
+                "style": 2,
+                "custom_id": custom_id,
+            },
+        }
+        if emoji_id:
+            section["accessory"]["emoji"] = {
+                "id": emoji_id, "name": "unknown", "animated": False,
+            }
+        return section
+
+    components: list[dict] = []
+    if NICK_PROMPT_BANNER_URL:
+        components.append({
+            "type": 12,
+            "items": [{"media": {"url": NICK_PROMPT_BANNER_URL}}],
+        })
+    components.extend([
+        {
+            "type": 17,
+            "accent_color": ACCENT_INCOMPLETE,
+            "components": [{
                 "type": 10,
                 "content": (
-                    f"### Use your in-game name?\n"
-                    f"-# Set your server nickname to **{suggestion}**."
+                    " ### Hello Operator! \n"
+                    "-# > Please Select your call sign.\n"
                 ),
-            },
-            {
-                "type": 1,
-                "components": [
-                    {
-                        "type": 2, "style": 3, "label": yes_label,
-                        "custom_id": yes_id,
-                    },
-                    {
-                        "type": 2, "style": 4, "label": no_label,
-                        "custom_id": no_id,
-                    },
-                ],
-            },
-        ],
-    }]
+            }],
+        },
+        _section(ingame_text, yes_id, NICK_PROMPT_INGAME_EMOJI_ID),
+        {"type": 14, "spacing": 2},
+        _section(server_text, no_id, NICK_PROMPT_SERVER_EMOJI_ID),
+    ])
+    return components
 
 
 def _nickname_resolved_components(text: str, accent: int) -> list[dict]:
