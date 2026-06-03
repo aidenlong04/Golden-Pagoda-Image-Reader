@@ -404,6 +404,23 @@ _ERROR_THRESHOLD = 3
 _ERROR_WINDOW_SECONDS = 60
 _HEALTH_STOPPED = False
 
+# Bounded source_message_id -> (channel_id, bot_reply_id) map so we can
+# tombstone the bot's verification reply when the user deletes their
+# original screenshot post. OrderedDict + popitem(last=False) gives us
+# O(1) FIFO eviction; cap is small because the only consumers are
+# moderators clicking "Delete" within a single session, and the bot
+# already auto-deletes replies after REPLY_TTL_SECONDS anyway.
+from collections import OrderedDict as _OrderedDict  # noqa: E402
+_REPLY_MAP_CAP = 512
+_REPLY_MAP: "_OrderedDict[int, tuple[int, int]]" = _OrderedDict()
+
+
+def _remember_reply(source_id: int, channel_id: int, reply_id: int) -> None:
+    _REPLY_MAP[source_id] = (channel_id, reply_id)
+    _REPLY_MAP.move_to_end(source_id)
+    while len(_REPLY_MAP) > _REPLY_MAP_CAP:
+        _REPLY_MAP.popitem(last=False)
+
 
 # ---------- Catch-up state persistence --------------------------------------
 
@@ -2022,12 +2039,14 @@ async def _send_v2(
         except discord.HTTPException:
             logger.exception("plain-text fallback also failed")
 
-    if sent_id and REPLY_TTL_SECONDS > 0:
-        task = asyncio.create_task(
-            _delete_after(reply_to.channel.id, sent_id, REPLY_TTL_SECONDS)
-        )
-        _BG_TASKS.add(task)
-        task.add_done_callback(_BG_TASKS.discard)
+    if sent_id:
+        _remember_reply(reply_to.id, reply_to.channel.id, sent_id)
+        if REPLY_TTL_SECONDS > 0:
+            task = asyncio.create_task(
+                _delete_after(reply_to.channel.id, sent_id, REPLY_TTL_SECONDS)
+            )
+            _BG_TASKS.add(task)
+            task.add_done_callback(_BG_TASKS.discard)
 
 
 async def _edit_message_v2_with_file(
@@ -2083,22 +2102,47 @@ async def _edit_message_v2_with_file(
             )
 
 
-async def _delete_after(channel_id: int, message_id: int, delay: float) -> None:
+async def _delete_message(channel_id: int, message_id: int) -> None:
+    """Issue a single DELETE /channels/{cid}/messages/{mid}. NotFound is
+    swallowed (already gone); other HTTP errors are logged."""
     from discord.http import Route
 
     try:
-        await asyncio.sleep(delay)
-        route = Route(
+        await client.http.request(Route(
             "DELETE",
             "/channels/{channel_id}/messages/{message_id}",
             channel_id=channel_id,
             message_id=message_id,
-        )
-        await client.http.request(route)
+        ))
     except discord.NotFound:
         pass
     except discord.HTTPException:
-        logger.exception("Failed to auto-delete reply %s", message_id)
+        logger.exception("Failed to delete message %s", message_id)
+
+
+async def _delete_after(channel_id: int, message_id: int, delay: float) -> None:
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        return
+    await _delete_message(channel_id, message_id)
+
+
+@client.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
+    """When the original screenshot post is deleted, also delete our reply.
+
+    Uses the raw event so this still fires when the source message isn't
+    cached (e.g. older than the bot's start). Scoped to TARGET_CHANNEL_ID
+    so we never touch messages in unrelated channels.
+    """
+    if payload.channel_id != TARGET_CHANNEL_ID:
+        return
+    entry = _REPLY_MAP.pop(payload.message_id, None)
+    if entry is None:
+        return
+    channel_id, reply_id = entry
+    _spawn_bg_task(_delete_message(channel_id, reply_id))
 
 
 @client.event
