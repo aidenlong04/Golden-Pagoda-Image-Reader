@@ -77,6 +77,17 @@ def _init() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
                 CREATE INDEX IF NOT EXISTS idx_events_outcome ON events(outcome);
+                CREATE TABLE IF NOT EXISTS submissions (
+                    message_id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    guild_id INTEGER,
+                    channel_id INTEGER NOT NULL,
+                    ts INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_subs_user_chan
+                    ON submissions(user_id, channel_id);
+                CREATE INDEX IF NOT EXISTS idx_subs_chan_ts
+                    ON submissions(channel_id, ts);
                 """
             )
             conn.commit()
@@ -236,3 +247,63 @@ def summary() -> dict:
         except OSError:
             pass
     return out
+
+
+def record_submission(
+    *,
+    user_id: int,
+    channel_id: int,
+    message_id: int,
+    guild_id: int | None = None,
+    ts: int | None = None,
+) -> None:
+    """Record a single user submission in ``channel_id``.
+
+    Idempotent on ``message_id`` (INSERT OR IGNORE) so catch-up scans or
+    duplicate dispatches do not inflate counts. Fail-soft like the rest of
+    the module — never raises.
+    """
+    if _disabled:
+        return
+    with _lock:
+        _init()
+        if _disabled:
+            return
+        try:
+            with _connect() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO submissions"
+                    "(message_id, user_id, guild_id, channel_id, ts)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        int(message_id),
+                        int(user_id),
+                        int(guild_id) if guild_id is not None else None,
+                        int(channel_id),
+                        int(ts if ts is not None else time.time()),
+                    ),
+                )
+                conn.commit()
+        except Exception:
+            logger.exception("analytics: submission record failed")
+
+
+def submission_count(*, user_id: int, channel_id: int) -> int:
+    """Return the number of submissions ``user_id`` has made in ``channel_id``."""
+    if _disabled:
+        return 0
+    with _lock:
+        _init()
+        if _disabled:
+            return 0
+        try:
+            with _connect() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM submissions"
+                    " WHERE user_id = ? AND channel_id = ?",
+                    (int(user_id), int(channel_id)),
+                ).fetchone()
+                return int(row["c"] or 0)
+        except Exception:
+            logger.exception("analytics: submission_count failed")
+            return 0

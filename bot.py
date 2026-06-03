@@ -28,7 +28,7 @@ warnings.filterwarnings(
 import discord  # noqa: E402
 import requests  # noqa: E402
 from discord import app_commands  # noqa: E402
-from PIL import Image, ImageOps  # noqa: E402
+from PIL import Image, ImageDraw, ImageOps  # noqa: E402
 
 try:
     import pytesseract  # optional local fallback
@@ -205,6 +205,11 @@ VERIFY_REMOVE_ROLE_ID = _int_env("VERIFY_REMOVE_ROLE_ID", 1459326361968574555)
 CATCHUP_LOOKBACK_HOURS = _int_env("CATCHUP_LOOKBACK_HOURS", 24)
 CATCHUP_STATE_PATH = Path(os.getenv("CATCHUP_STATE_PATH", "/app/data/catchup_state.json"))
 CATCHUP_DELAY_SECONDS = float(os.getenv("CATCHUP_DELAY_SECONDS") or "1.0")
+
+# Submission progress tracking: count each user's messages in PROGRESS_CHANNEL_ID
+# and expose the count via /progress as a 0..PROGRESS_TARGET progress bar.
+PROGRESS_CHANNEL_ID = _int_env("PROGRESS_CHANNEL_ID", 1511585450731507803)
+PROGRESS_TARGET = max(1, _int_env("PROGRESS_TARGET", 20))
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is required")
@@ -1622,6 +1627,16 @@ async def on_message(message: discord.Message) -> None:
         or message.type not in (discord.MessageType.default, discord.MessageType.reply)
     ):
         return
+
+    if PROGRESS_CHANNEL_ID and message.channel.id == PROGRESS_CHANNEL_ID:
+        _spawn_bg_task(asyncio.to_thread(
+            analytics.record_submission,
+            user_id=message.author.id,
+            guild_id=message.guild.id if message.guild else None,
+            channel_id=message.channel.id,
+            message_id=message.id,
+        ))
+
     if message.channel.id != TARGET_CHANNEL_ID:
         return
 
@@ -2081,6 +2096,191 @@ async def _send_status_page(interaction: discord.Interaction, page: int) -> None
 @app_commands.default_permissions(manage_guild=True)
 async def status_cmd(interaction: discord.Interaction) -> None:
     await _send_status_page(interaction, 0)
+
+
+# ---------- /progress (submission tracker, V2 with attached PNG) ------------
+
+# Visual styling for the rendered progress bar PNG. Matches the dark
+# "Lost Programme" XP-bar aesthetic referenced in the spec.
+_PROGRESS_BAR_BG = (43, 45, 49)       # Discord dark surface
+_PROGRESS_BAR_FG = (93, 208, 243)     # bright cyan fill
+_PROGRESS_BAR_W = 720
+_PROGRESS_BAR_H = 56
+
+
+def _render_progress_bar_png(progress: float) -> bytes:
+    """Render a rounded-end progress bar PNG and return raw bytes.
+
+    Uses the ellipse + rectangle technique so the caps stay perfectly
+    circular at any width. ``progress`` is clamped to [0.0, 1.0]. The
+    image is transparent outside the bar so it composes cleanly inside a
+    V2 container.
+    """
+    progress = max(0.0, min(1.0, float(progress)))
+    w, h = _PROGRESS_BAR_W, _PROGRESS_BAR_H
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    radius = h // 2
+    # Track (full width, rounded).
+    d.rounded_rectangle((0, 0, w, h), radius=radius, fill=_PROGRESS_BAR_BG)
+    if progress > 0:
+        # Always render at least one full cap so 1% still reads as "filled".
+        fill_w = max(h, int(round(w * progress)))
+        d.rounded_rectangle((0, 0, fill_w, h), radius=radius, fill=_PROGRESS_BAR_FG)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+async def _interaction_callback_with_file(
+    interaction: discord.Interaction,
+    callback_type: int,
+    components: list[dict],
+    *,
+    file_bytes: bytes,
+    filename: str,
+    content_type: str = "image/png",
+    ephemeral: bool = False,
+) -> None:
+    """POST a Components V2 interaction callback with a single attached file.
+
+    discord.py 2.x has no native V2 support, so we bypass it entirely and
+    talk to the interaction-callback endpoint directly. Interaction
+    callbacks accept the interaction token in the URL (no Authorization
+    header needed) and have generous per-token rate limits — well within
+    a single-shot slash-command response.
+    """
+    import aiohttp
+
+    flags = COMPONENTS_V2_FLAG
+    if ephemeral:
+        flags |= EPHEMERAL_FLAG
+    payload = {
+        "type": callback_type,
+        "data": {
+            "flags": flags,
+            "components": components,
+            "allowed_mentions": {"parse": []},
+            "attachments": [{"id": 0, "filename": filename}],
+        },
+    }
+    form = aiohttp.FormData()
+    form.add_field(
+        "payload_json", json.dumps(payload), content_type="application/json"
+    )
+    form.add_field(
+        "files[0]", file_bytes, filename=filename, content_type=content_type
+    )
+    url = (
+        f"https://discord.com/api/v10/interactions/"
+        f"{interaction.id}/{interaction.token}/callback"
+    )
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, data=form) as resp:
+            if resp.status >= 400:
+                text = await resp.text()
+                raise RuntimeError(
+                    f"interaction callback failed: {resp.status} {text}"
+                )
+    with contextlib.suppress(AttributeError):
+        interaction.response._responded = True  # type: ignore[attr-defined]
+
+
+def _progress_components(
+    *,
+    display_name: str,
+    avatar_url: str,
+    count: int,
+    target: int,
+    channel_id: int,
+) -> list[dict]:
+    pct = min(1.0, count / target) if target > 0 else 0.0
+    pct_label = f"{int(round(pct * 100))}%"
+    complete = count >= target
+    header_text = (
+        f"### {display_name}\n"
+        f"-# Submissions in <#{channel_id}>"
+    )
+    summary_text = f"## {count} / {target}  \u00B7  {pct_label}"
+    footer_text = (
+        "-# \u2728 Target reached!" if complete
+        else f"-# {max(0, target - count)} to go"
+    )
+    container = {
+        "type": 17,
+        "accent_color": ACCENT_PASS if complete else 0x5DD0F3,
+        "components": [
+            {
+                "type": 9,  # Section
+                "components": [
+                    {"type": 10, "content": header_text},
+                ],
+                "accessory": {
+                    "type": 11,  # Thumbnail
+                    "media": {"url": avatar_url},
+                },
+            },
+            {"type": 10, "content": summary_text},
+            {
+                "type": 12,  # Media Gallery
+                "items": [{"media": {"url": "attachment://progress.png"}}],
+            },
+            {"type": 10, "content": footer_text},
+        ],
+    }
+    return [container]
+
+
+@tree.command(
+    name="progress",
+    description="Show submission progress in the tracked channel.",
+)
+@app_commands.describe(
+    user="View another member's progress (defaults to yourself).",
+    ephemeral="Only you can see the reply when true (default: false).",
+)
+async def progress_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    ephemeral: bool = False,
+) -> None:
+    target = user or interaction.user
+    if isinstance(target, discord.Member):
+        display_name = target.display_name
+    else:
+        display_name = getattr(target, "global_name", None) or target.name
+    avatar = getattr(target, "display_avatar", None) or target.default_avatar
+    avatar_url = avatar.replace(size=256, format="png").url
+
+    count = await asyncio.to_thread(
+        analytics.submission_count,
+        user_id=target.id,
+        channel_id=PROGRESS_CHANNEL_ID,
+    )
+    pct = min(1.0, count / PROGRESS_TARGET) if PROGRESS_TARGET > 0 else 0.0
+    png = await asyncio.to_thread(_render_progress_bar_png, pct)
+    components = _progress_components(
+        display_name=display_name,
+        avatar_url=avatar_url,
+        count=count,
+        target=PROGRESS_TARGET,
+        channel_id=PROGRESS_CHANNEL_ID,
+    )
+    try:
+        await _interaction_callback_with_file(
+            interaction, 4, components,
+            file_bytes=png, filename="progress.png",
+            ephemeral=ephemeral,
+        )
+    except Exception:
+        logger.exception("/progress failed")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "\u274C Failed to render progress.", ephemeral=True
+            )
 
 
 @client.event
