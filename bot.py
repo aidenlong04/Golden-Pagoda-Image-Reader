@@ -1478,6 +1478,9 @@ OPERATOR_EMOJI_RAW = os.getenv(
 PICK_ROLES_EMOJI_RAW = os.getenv(
     "PICK_ROLES_EMOJI", "<:roles:1502055976830894291>"
 ).strip()
+MASTERY_RANK_EMOJI_RAW = os.getenv(
+    "MASTERY_RANK_EMOJI", "<:mastery:1511640736318226553>"
+).strip()
 
 
 def _emoji_to_button_payload(raw: str) -> dict | None:
@@ -1533,7 +1536,10 @@ def _pass_components(
         mr_value = mastery_rank
         if mr_value.upper().startswith("MR "):
             mr_value = mr_value[3:].strip()
-        inner_lines.append(f"> * -# Mastery Rank: `{mr_value}`")
+        mr_prefix = f"{MASTERY_RANK_EMOJI_RAW} " if MASTERY_RANK_EMOJI_RAW else ""
+        inner_lines.append(
+            f"> * -# {mr_prefix}Mastery Rank: `{mr_value}`"
+        )
     if missing_categories:
         joined = ", ".join(f"**`{c}`**" for c in missing_categories)
         inner_lines.append(f"> * -# Missing Data: {joined}")
@@ -1802,7 +1808,7 @@ NICK_PROMPT_INGAME_EMOJI_ID = os.getenv(
     "NICK_PROMPT_INGAME_EMOJI_ID", "1467922510908494098"
 ).strip()
 NICK_PROMPT_SERVER_EMOJI_ID = os.getenv(
-    "NICK_PROMPT_SERVER_EMOJI_ID", "1511619596459708486"
+    "NICK_PROMPT_SERVER_EMOJI_ID", "1511640752424222760"
 ).strip()
 
 
