@@ -1118,50 +1118,43 @@ async def _process_screenshot(message: discord.Message) -> None:
     # Fan out the user-visible work concurrently: reacting, removing the
     # opposite-state role, and posting the V2 reply all hit different
     # Discord endpoints and never depend on each other.
+    nick_target = _nickname_suggestion(member, profile_name) if passed else None
     if passed:
+        components = _pass_components(
+            profile_name, clan_name, role_lines,
+            clan_emoji=clan_emoji,
+            mastery_rank=mastery_rank,
+            link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
+            progress_attachment="progress.png" if progress_png else None,
+            nick_suggestion=nick_target,
+            user_id=member.id,
+        )
         outbound = [
             _react(message, "pass"),
             _remove_unverified_role(member),
             _send_v2(
-                message,
-                _pass_components(
-                    profile_name, clan_name, role_lines,
-                    clan_emoji=clan_emoji,
-                    mastery_rank=mastery_rank,
-                    link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
-                ),
+                message, components,
+                file_bytes=progress_png,
+                file_name="progress.png",
             ),
         ]
     else:
+        components = _incomplete_components(
+            " ".join(issues),
+            link_buttons=_help_link_buttons(message.guild),
+            progress_attachment="progress.png" if progress_png else None,
+        )
         outbound = [
             _react(message, "incomplete"),
             _add_incomplete_role(member),
             _send_v2(
-                message,
-                _incomplete_components(
-                    " ".join(issues),
-                    link_buttons=_help_link_buttons(message.guild),
-                ),
+                message, components,
                 mention_user=True,
                 allow_role_mentions=True,
+                file_bytes=progress_png,
+                file_name="progress.png",
             ),
         ]
-    # Progress card is sent as a separate plain reply so it renders
-    # outside the verification card (a real attachment bubble, not an
-    # embedded media-gallery item).
-    if progress_png is not None:
-        outbound.append(_send_progress_attachment(message, progress_png))
-    # Offer to apply the OCR'd in-game name as the member's server
-    # nickname when it differs from what they already use.
-    nick_target = _nickname_suggestion(member, profile_name)
-    if nick_target is not None:
-        outbound.append(
-            _send_v2(
-                message,
-                _nickname_prompt_components(nick_target, member.id),
-                mention_user=False,
-            )
-        )
     for result in await asyncio.gather(*outbound, return_exceptions=True):
         if isinstance(result, BaseException):
             logger.exception("post-verification action failed", exc_info=result)
@@ -1412,6 +1405,9 @@ def _pass_components(
     clan_emoji: str | None = None,
     mastery_rank: str | None = None,
     link_buttons: list[tuple[str, str]] | None = None,
+    progress_attachment: str | None = None,
+    nick_suggestion: str | None = None,
+    user_id: int | None = None,
 ) -> list[dict]:
     emoji = (clan_emoji or "").strip() or CLAN_EMOJI
     display_clan = _strip_clan_tag(clan) if clan else None
@@ -1443,7 +1439,20 @@ def _pass_components(
         "accent_color": ACCENT_PASS,
         "components": container_children,
     }
-    return [header, container]
+    top_level: list[dict] = [header, container]
+    # Progress card as a top-level media gallery so it renders as its own
+    # attachment bubble OUTSIDE the verification container but still in
+    # the same Discord message.
+    if progress_attachment:
+        top_level.append({
+            "type": 12,
+            "items": [{"media": {"url": f"attachment://{progress_attachment}"}}],
+        })
+    # Inline nickname prompt as additional top-level components so the
+    # whole verification flow lives in one message.
+    if nick_suggestion and user_id is not None:
+        top_level.extend(_nickname_prompt_top_level(nick_suggestion, user_id))
+    return top_level
 
 
 def _channel_url(guild_id: int, channel_id: int) -> str:
@@ -1538,6 +1547,7 @@ def _incomplete_components(
     *,
     image_url: str | None = None,
     link_buttons: list[tuple[str, str]] | None = None,
+    progress_attachment: str | None = None,
 ) -> list[dict]:
     outreach = " / ".join(f"<@&{rid}>" for rid in OUTREACH_ROLE_IDS) or "staff"
     header = {
@@ -1568,14 +1578,18 @@ def _incomplete_components(
                 for label, url in link_buttons[:5]
             ],
         })
-    return [
-        header,
-        {
-            "type": 17,
-            "accent_color": ACCENT_INCOMPLETE,
-            "components": children,
-        },
-    ]
+    container = {
+        "type": 17,
+        "accent_color": ACCENT_INCOMPLETE,
+        "components": children,
+    }
+    top_level: list[dict] = [header, container]
+    if progress_attachment:
+        top_level.append({
+            "type": 12,
+            "items": [{"media": {"url": f"attachment://{progress_attachment}"}}],
+        })
+    return top_level
 
 
 # ---------- Nickname suggestion --------------------------------------------
@@ -1600,54 +1614,47 @@ def _nickname_suggestion(
     return suggestion
 
 
-def _nickname_prompt_components(suggestion: str, user_id: int) -> list[dict]:
-    """V2 components for the 'use in-game name?' prompt.
+def _nickname_prompt_top_level(suggestion: str, user_id: int) -> list[dict]:
+    """Return top-level V2 components for the in-game-name Yes/No prompt.
 
-    The custom IDs encode the target user so a different member can't
-    hijack the buttons, and the suggested nickname (URL-encoded) so the
-    handler doesn't need cross-message state.
+    Emitted as a separator + text + action row at the message's top level
+    (not inside a container) so the buttons sit below the verification
+    card / progress image in the same message.
     """
     from urllib.parse import quote
 
-    # Discord custom_id limit is 100 chars. Reserve space for prefix + uid.
-    # Format: "nick:y:<uid>:<encoded>" → prefix is ~15 chars for 18-digit uid.
     prefix_len = len(f"nick:y:{user_id}:")
     max_encoded_len = 100 - prefix_len
-    # Pre-truncate suggestion so the encoded form fits without slicing mid-escape.
     truncated = suggestion[:max_encoded_len]
     encoded = quote(truncated, safe="")
-    # If encoding expanded beyond the limit, iteratively shrink until it fits.
     while len(encoded) > max_encoded_len and truncated:
         truncated = truncated[:-1]
         encoded = quote(truncated, safe="")
     yes_id = f"nick:y:{user_id}:{encoded}"
     no_id = f"nick:n:{user_id}"
-    return [{
-        "type": 17,
-        "accent_color": ACCENT_PASS,
-        "components": [
-            {
-                "type": 10,
-                "content": (
-                    f"### Use your in-game name?\n"
-                    f"-# Set your server nickname to **{suggestion}**."
-                ),
-            },
-            {
-                "type": 1,
-                "components": [
-                    {
-                        "type": 2, "style": 3, "label": "Yes",
-                        "custom_id": yes_id,
-                    },
-                    {
-                        "type": 2, "style": 4, "label": "No",
-                        "custom_id": no_id,
-                    },
-                ],
-            },
-        ],
-    }]
+    return [
+        {"type": 14},  # Separator
+        {
+            "type": 10,
+            "content": (
+                f"### Use your in-game name?\n"
+                f"-# Set your server nickname to **{suggestion}**."
+            ),
+        },
+        {
+            "type": 1,
+            "components": [
+                {
+                    "type": 2, "style": 3, "label": "Yes",
+                    "custom_id": yes_id,
+                },
+                {
+                    "type": 2, "style": 4, "label": "No",
+                    "custom_id": no_id,
+                },
+            ],
+        },
+    ]
 
 
 def _nickname_resolved_components(text: str, accent: int) -> list[dict]:
@@ -1656,19 +1663,6 @@ def _nickname_resolved_components(text: str, accent: int) -> list[dict]:
         "accent_color": accent,
         "components": [{"type": 10, "content": text}],
     }]
-
-
-async def _send_progress_attachment(
-    reply_to: discord.Message, png: bytes
-) -> None:
-    """Post the progress card as a plain reply (outside any V2 container)."""
-    try:
-        await reply_to.reply(
-            file=discord.File(io.BytesIO(png), filename="progress.png"),
-            mention_author=False,
-        )
-    except Exception:
-        logger.exception("progress attachment reply failed")
 
 
 # ---------- Role category tracking -----------------------------------------
@@ -1728,8 +1722,16 @@ async def _send_v2(
     *,
     mention_user: bool = False,
     allow_role_mentions: bool = False,
+    file_bytes: bytes | None = None,
+    file_name: str = "attachment.png",
+    file_content_type: str = "image/png",
 ) -> None:
-    """Send a Components V2 message as a reply via raw HTTP (discord.py 2.x has no native v2)."""
+    """Send a Components V2 message as a reply via raw HTTP (discord.py 2.x has no native v2).
+
+    When ``file_bytes`` is provided, the message is posted as multipart so a
+    top-level media-gallery entry referencing ``attachment://<file_name>``
+    resolves to the attached file in the same Discord message.
+    """
     from discord.http import Route
 
     parse: list[str] = []
@@ -1753,6 +1755,8 @@ async def _send_v2(
     }
     if reply_to.guild is not None:
         payload["message_reference"]["guild_id"] = reply_to.guild.id
+    if file_bytes is not None:
+        payload["attachments"] = [{"id": 0, "filename": file_name}]
 
     route = Route(
         "POST",
@@ -1761,7 +1765,39 @@ async def _send_v2(
     )
     sent_id: int | None = None
     try:
-        data = await client.http.request(route, json=payload)
+        if file_bytes is not None:
+            # discord.py's HTTPClient.request can't cleanly post arbitrary
+            # multipart bodies for V2, so post directly with aiohttp using
+            # the bot token. Per-channel rate limits apply but a single
+            # reply is well within the bucket.
+            import aiohttp
+
+            form = aiohttp.FormData()
+            form.add_field(
+                "payload_json", json.dumps(payload),
+                content_type="application/json",
+            )
+            form.add_field(
+                "files[0]", file_bytes,
+                filename=file_name, content_type=file_content_type,
+            )
+            url = (
+                f"https://discord.com/api/v10/channels/"
+                f"{reply_to.channel.id}/messages"
+            )
+            headers = {
+                "Authorization": f"Bot {DISCORD_TOKEN}",
+                "User-Agent": "GoldenPagoda (https://github.com/aidenlong04, 1.0)",
+            }
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, data=form, headers=headers) as resp:
+                    if resp.status >= 400:
+                        text = await resp.text()
+                        raise discord.HTTPException(resp, text)  # type: ignore[arg-type]
+                    data = await resp.json()
+        else:
+            data = await client.http.request(route, json=payload)
         if isinstance(data, dict) and data.get("id"):
             try:
                 sent_id = int(data["id"])
@@ -2679,9 +2715,9 @@ async def _handle_nick_interaction(
             "-# Kept your current server nickname.", ACCENT_INCOMPLETE,
         )
         try:
-            await _interaction_callback(interaction, 7, components)
+            await _interaction_callback(interaction, 4, components)
         except Exception:
-            logger.exception("nick: no update failed")
+            logger.exception("nick: no ack failed")
         return
 
     if action != "y" or len(parts) < 4:
@@ -2717,9 +2753,9 @@ async def _handle_nick_interaction(
 
     components = _nickname_resolved_components(msg, accent)
     try:
-        await _interaction_callback(interaction, 7, components)
+        await _interaction_callback(interaction, 4, components)
     except Exception:
-        logger.exception("nick: yes update failed")
+        logger.exception("nick: yes ack failed")
 
 
 @client.event
