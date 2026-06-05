@@ -1536,6 +1536,9 @@ PICK_ROLES_EMOJI_RAW = os.getenv(
 MASTERY_RANK_EMOJI_RAW = os.getenv(
     "MASTERY_RANK_EMOJI", "<:mastery:1511640736318226553>"
 ).strip()
+WARNING_EMOJI_RAW = os.getenv(
+    "WARNING_EMOJI", "<:WarningStatus:1512253042270142634>"
+).strip()
 
 
 def _emoji_to_button_payload(raw: str) -> dict | None:
@@ -1596,7 +1599,8 @@ def _pass_components(
         )
     if missing_categories:
         joined = ", ".join(f"**`{c}`**" for c in missing_categories)
-        inner_lines.append(f"> * -# Missing Data: {joined}")
+        warn_prefix = f"{WARNING_EMOJI_RAW} " if WARNING_EMOJI_RAW else ""
+        inner_lines.append(f"> * -# {warn_prefix}Missing Data: {joined}")
         inner_lines.append("please assign the missing roles here")
     inner = "\n".join(inner_lines)
 
@@ -1698,11 +1702,12 @@ def _incomplete_components(
     nick_suggestion: str | None = None,
     user_id: int | None = None,
 ) -> list[dict]:
+    warn_icon = WARNING_EMOJI_RAW or "\u26a0\ufe0f"
     children: list[dict] = [
         {
             "type": 10,
             "content": (
-                "### \u26a0\ufe0f  Please select the missing roles\n"
+                f"### {warn_icon}  Please select the missing roles\n"
                 f"-# {reason}"
             ),
         },
