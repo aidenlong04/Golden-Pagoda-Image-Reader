@@ -253,6 +253,10 @@ SYNDICATE_ROLE_IDS: list[int] = _csv_ids("SYNDICATE_ROLE_IDS")
 # Surfaces as a link button on the incomplete card.
 HELP_CHANNEL_ID = _int_env("HELP_CHANNEL_ID", 1392582268769271950)
 
+# Custom emoji shown on the "Assign <category>" link buttons that appear on a
+# /profile card when the member is missing Platform / Mastery Rank / Syndicate.
+ASSIGN_ROLE_EMOJI_ID = _int_env("ASSIGN_ROLE_EMOJI_ID", 1416857287166918827)
+
 
 def _format_mastery_display(value: str | None) -> str:
     """Normalize a stored/OCR'd mastery rank to a card-ready value.
@@ -1780,7 +1784,7 @@ def _pass_components(
         joined = ", ".join(f"**`{c}`**" for c in missing_categories)
         warn_prefix = f"{WARNING_EMOJI_RAW} " if WARNING_EMOJI_RAW else ""
         inner_lines.append(f"> * -# {warn_prefix}Missing Data: {joined}")
-        inner_lines.append("please assign the missing roles here")
+        inner_lines.append("> -# please assign the missing roles here")
 
     caption, row_buttons = _callsign_buttons(
         nick_suggestion, user_id, current_nick
@@ -2136,6 +2140,18 @@ async def _member_profile_info_lines(
     return rows
 
 
+async def _member_in_game_name(member: discord.Member) -> str | None:
+    """Return the member's stored in-game handle (e.g. ``PlayerName#123``)
+    from the durable profile store, or ``None`` when no readable scan has
+    been recorded. Used as the /profile card headline (the server nickname
+    becomes a small subtitle beneath it)."""
+    stored = await asyncio.to_thread(
+        analytics.get_member_profile, member.guild.id, member.id
+    )
+    name = (stored or {}).get("in_game_name")
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
 def _help_link_buttons(guild: "discord.Guild | None") -> list[tuple[str, str]]:
     """Build a Link button row pointing to the help channel.
 
@@ -2149,6 +2165,110 @@ def _help_link_buttons(guild: "discord.Guild | None") -> list[tuple[str, str]]:
         "How to get your roles",
         f"https://discord.com/channels/{guild.id}/{HELP_CHANNEL_ID}",
     )]
+
+
+# Categories a member can self-assign via the help channel; surfaced as
+# "Assign <category>" link buttons on a /profile card when unearned.
+_ASSIGNABLE_CATEGORIES = ("Platform", "Mastery Rank", "Syndicate")
+
+
+def _missing_assignable_categories(info_lines: list[tuple] | None) -> list[str]:
+    """Return the subset of Platform / Mastery Rank / Syndicate the member
+    hasn't earned, read from the gathered /profile rows (em-dash value or
+    empty faction list). Categories not configured on the server are
+    skipped — there's nothing to assign."""
+    rows = {entry[0]: entry for entry in (info_lines or [])}
+    missing: list[str] = []
+    for label in _ASSIGNABLE_CATEGORIES:
+        entry = rows.get(label)
+        if entry is None:
+            continue
+        if label == "Syndicate":
+            earned = bool(entry[1]) if len(entry) >= 2 and isinstance(
+                entry[1], list
+            ) else False
+        else:
+            value = entry[1] if len(entry) >= 2 else "\u2014"
+            earned = bool(value) and value != "\u2014"
+        if not earned:
+            missing.append(label)
+    return missing
+
+
+def _assign_role_buttons(
+    guild: "discord.Guild | None", missing: list[str]
+) -> list["discord.ui.Button"]:
+    """Build an "Assign <category>" Link button per missing category, each
+    jumping to the help channel. Empty when the guild/channel is unset or
+    nothing's missing."""
+    if not (guild and HELP_CHANNEL_ID and missing):
+        return []
+    url = f"https://discord.com/channels/{guild.id}/{HELP_CHANNEL_ID}"
+    emoji = (
+        discord.PartialEmoji(name="assign", id=ASSIGN_ROLE_EMOJI_ID)
+        if ASSIGN_ROLE_EMOJI_ID
+        else None
+    )
+    return [
+        discord.ui.Button(
+            style=discord.ButtonStyle.link,
+            label=f"Assign {label}",
+            url=url,
+            emoji=emoji,
+        )
+        for label in missing
+    ]
+
+
+# Components V2 multipart bodies bypass discord.py's HTTPClient (it can't
+# cleanly post arbitrary V2 multipart) and go straight out via aiohttp with
+# the bot token. One base URL + User-Agent + sender keeps the POST (new
+# reply) and PATCH (attachment swap) paths in lock-step.
+_DISCORD_API_BASE = "https://discord.com/api/v10"
+_V2_USER_AGENT = "GoldenPagoda (https://github.com/aidenlong04, 1.0)"
+
+
+async def _v2_multipart_request(
+    method: str,
+    url: str,
+    *,
+    payload: dict,
+    file_bytes: bytes,
+    file_name: str,
+    file_content_type: str = "image/png",
+) -> dict | None:
+    """Send a multipart Components-V2 body (``payload_json`` + one file) to
+    ``url`` via the shared aiohttp session, authenticated with the bot token.
+
+    Returns the parsed JSON response when the server sends one, else None.
+    Raises ``discord.HTTPException`` on any 4xx/5xx so callers can fall back
+    (``_send_v2``) or log (``_edit_message_v2_with_file``).
+    """
+    form = aiohttp.FormData()
+    form.add_field(
+        "payload_json", json.dumps(payload),
+        content_type="application/json",
+    )
+    form.add_field(
+        "files[0]", file_bytes,
+        filename=file_name, content_type=file_content_type,
+    )
+    headers = {
+        "Authorization": f"Bot {DISCORD_TOKEN}",
+        "User-Agent": _V2_USER_AGENT,
+    }
+    timeout = aiohttp.ClientTimeout(total=15)
+    session = await _get_http_session()
+    async with session.request(
+        method, url, data=form, headers=headers, timeout=timeout
+    ) as resp:
+        if resp.status >= 400:
+            text = await resp.text()
+            raise discord.HTTPException(resp, text)  # type: ignore[arg-type]
+        try:
+            return await resp.json()
+        except (aiohttp.ContentTypeError, ValueError):
+            return None
 
 
 async def _send_v2(
@@ -2202,35 +2322,18 @@ async def _send_v2(
     try:
         if file_bytes is not None:
             # discord.py's HTTPClient.request can't cleanly post arbitrary
-            # multipart bodies for V2, so post directly with aiohttp using
-            # the bot token. Per-channel rate limits apply but a single
+            # multipart bodies for V2, so post directly via the shared
+            # multipart sender. Per-channel rate limits apply but a single
             # reply is well within the bucket.
-            form = aiohttp.FormData()
-            form.add_field(
-                "payload_json", json.dumps(payload),
-                content_type="application/json",
-            )
-            form.add_field(
-                "files[0]", file_bytes,
-                filename=file_name, content_type=file_content_type,
-            )
             url = (
-                f"https://discord.com/api/v10/channels/"
+                f"{_DISCORD_API_BASE}/channels/"
                 f"{reply_to.channel.id}/messages"
             )
-            headers = {
-                "Authorization": f"Bot {DISCORD_TOKEN}",
-                "User-Agent": "GoldenPagoda (https://github.com/aidenlong04, 1.0)",
-            }
-            timeout = aiohttp.ClientTimeout(total=15)
-            session = await _get_http_session()
-            async with session.post(
-                url, data=form, headers=headers, timeout=timeout
-            ) as resp:
-                if resp.status >= 400:
-                    text = await resp.text()
-                    raise discord.HTTPException(resp, text)  # type: ignore[arg-type]
-                data = await resp.json()
+            data = await _v2_multipart_request(
+                "POST", url, payload=payload,
+                file_bytes=file_bytes, file_name=file_name,
+                file_content_type=file_content_type,
+            )
         else:
             data = await client.http.request(route, json=payload)
         if isinstance(data, dict):
@@ -2287,33 +2390,15 @@ async def _edit_message_v2_with_file(
         "attachments": [{"id": 0, "filename": file_name}],
         "allowed_mentions": {"parse": []},
     }
-    form = aiohttp.FormData()
-    form.add_field(
-        "payload_json", json.dumps(payload),
-        content_type="application/json",
-    )
-    form.add_field(
-        "files[0]", file_bytes,
-        filename=file_name, content_type=file_content_type,
-    )
     url = (
-        f"https://discord.com/api/v10/channels/"
+        f"{_DISCORD_API_BASE}/channels/"
         f"{channel_id}/messages/{message_id}"
     )
-    headers = {
-        "Authorization": f"Bot {DISCORD_TOKEN}",
-        "User-Agent": "GoldenPagoda (https://github.com/aidenlong04, 1.0)",
-    }
-    timeout = aiohttp.ClientTimeout(total=15)
-    session = await _get_http_session()
-    async with session.patch(
-        url, data=form, headers=headers, timeout=timeout
-    ) as resp:
-        if resp.status >= 400:
-            text = await resp.text()
-            raise RuntimeError(
-                f"PATCH message {message_id} failed: {resp.status} {text}"
-            )
+    await _v2_multipart_request(
+        "PATCH", url, payload=payload,
+        file_bytes=file_bytes, file_name=file_name,
+        file_content_type=file_content_type,
+    )
 
 
 async def _delete_message(channel_id: int, message_id: int) -> None:
@@ -2965,7 +3050,6 @@ _PROGRESS_RADIUS = 24                   # rounded panel corners
 # Warframe-inspired slate panel: a faint vertical gradient from a lighter
 # top to a darker base gives the card depth instead of a flat fill.
 _PROGRESS_BG_TOP = (38, 41, 47)        # lighter slate (top edge)
-_PROGRESS_BG = (30, 31, 34)            # #1E1F22 base panel
 _PROGRESS_BG_BOTTOM = (21, 22, 25)     # darker slate (bottom edge)
 _PROGRESS_BG_EDGE = (18, 19, 22)       # dividers / inner shadow
 _PROGRESS_BORDER = (58, 62, 70)        # crisp outer hairline
@@ -3586,17 +3670,21 @@ def _render_profile_card_png(
     avatar_bytes: bytes | None,
     display_name: str,
     info_lines: list[tuple] | None = None,
+    in_game_name: str | None = None,
 ) -> bytes:
     """Render the "user profile" card and return PNG bytes.
 
     A sibling of :func:`_render_progress_card_png` with the progress bar
-    removed. The header stacks a gold "USER PROFILE" eyebrow, the member
-    name, and a row of icons beneath it (the platform icon with a soft
-    gold glow, trailed by the syndicate flags — a lone syndicate shows
-    its icon + faction-coloured name, two or more collapse to icon-only)
-    on the left of the circular avatar, with the Clan as a gold callout
-    on the right. Beneath the header the Mastery Rank sits in a gold
-    capsule badge. ``info_lines`` come from
+    removed. The header stacks a gold "USER PROFILE" eyebrow, the member's
+    in-game handle (``in_game_name``, e.g. ``PlayerName#123`` pulled from
+    the original profile scan) as the headline — with the Discord server
+    nickname (``display_name``) demoted to a small muted subtitle beneath
+    it when the two differ — and a row of icons beneath that (the platform
+    icon with a soft gold glow, trailed by the syndicate flags — a lone
+    syndicate shows its icon + faction-coloured name, two or more collapse
+    to icon-only) on the left of the circular avatar, with the Clan as a
+    gold callout on the right. Beneath the header the Mastery Rank sits in
+    a gold capsule badge. ``info_lines`` come from
     :func:`_member_profile_info_lines`. Rendered at ``_PROGRESS_SS``x for
     crisp HiDPI output.
     """
@@ -3637,8 +3725,23 @@ def _render_profile_card_png(
             ]
 
     pad = 22
-    # Header zone holds the avatar + eyebrow + name + platform icon.
-    header_h = 140
+    # Identity: headline with the scanned in-game handle when we have it,
+    # falling back to the server nickname. When both exist and differ, the
+    # server nickname rides beneath as a small muted subtitle.
+    in_game = (in_game_name or "").strip()
+    server_nick = (display_name or "").strip()
+    headline = in_game or server_nick or "Member"
+    subtitle = (
+        server_nick
+        if in_game and server_nick
+        and server_nick.casefold() != in_game.casefold()
+        else None
+    )
+
+    # Header zone holds the avatar + eyebrow + headline + (optional
+    # subtitle) + platform icon. It grows a touch when a subtitle is shown
+    # so the small nick line has breathing room above the icon row.
+    header_h = 152 if subtitle else 140
     mr_pill_h = 32
 
     # Lay out the stacked sections so the canvas height is known before we
@@ -3685,12 +3788,15 @@ def _render_profile_card_png(
     eyebrow_font = _load_font(sc(14), bold=True)
     name_font = _load_font(sc(28), bold=True)
 
-    # Two header rows (eyebrow / name) anchored above the avatar's midline,
-    # with the platform icon on a third row beneath the name.
+    # Header rows anchored around the avatar's midline: eyebrow, headline,
+    # an optional small subtitle (server nick), then the platform/syndicate
+    # icon row. The headline baseline stays fixed whether or not a subtitle
+    # is present so the right-hand Clan callout always lines up with it.
     cy = sc(header_h) // 2
-    eyebrow_cy = cy - sc(28)
-    name_cy = cy - sc(2)
-    plat_cy = cy + sc(34)
+    eyebrow_cy = cy - sc(32 if subtitle else 28)
+    name_cy = cy - sc(8 if subtitle else 2)
+    subtitle_cy = cy + sc(15)
+    plat_cy = cy + sc(42 if subtitle else 34)
 
     # Thin gold rule between the avatar and the identity text — a refined
     # divider spanning the eyebrow + name rows.
@@ -3748,7 +3854,7 @@ def _render_profile_card_png(
         fill=_PROGRESS_ACCENT, anchor="lm",
     )
 
-    name = display_name or "Member"
+    name = headline
     max_name_w = name_right_bound - text_x
     if draw.textlength(name, font=name_font) > max_name_w:
         while name and draw.textlength(
@@ -3760,6 +3866,22 @@ def _render_profile_card_png(
         (text_x, name_cy), name, font=name_font,
         fill=_PROGRESS_TEXT, anchor="lm",
     )
+
+    # Server nickname as a small muted subtitle beneath the in-game handle.
+    if subtitle:
+        sub_font = _load_font(sc(12), bold=True)
+        sub_txt = subtitle
+        max_sub_w = name_right_bound - text_x
+        if draw.textlength(sub_txt, font=sub_font) > max_sub_w:
+            while sub_txt and draw.textlength(
+                sub_txt + "\u2026", font=sub_font
+            ) > max_sub_w:
+                sub_txt = sub_txt[:-1]
+            sub_txt = sub_txt + "\u2026"
+        draw.text(
+            (text_x, subtitle_cy), sub_txt, font=sub_font,
+            fill=_PROGRESS_MUTED, anchor="lm",
+        )
 
     # Platform + syndicate flags share one row beneath the name. The
     # platform icon leads with a soft gold glow; a lone syndicate trails
@@ -4179,12 +4301,14 @@ class _MasteryEditorView(discord.ui.View):
     def __init__(
         self, *, member: discord.Member, owner_id: int,
         avatar_bytes: bytes | None, display_name: str,
+        in_game_name: str | None = None,
     ) -> None:
         super().__init__(timeout=300)
         self.member = member
         self.owner_id = owner_id
         self.avatar_bytes = avatar_bytes
         self.display_name = display_name
+        self.in_game_name = in_game_name
         first, second = _mastery_select_options()
         self.add_item(_MasterySelect(
             self, placeholder="Set Mastery Rank (1\u201325)", options=first,
@@ -4232,7 +4356,18 @@ class _MasteryEditorView(discord.ui.View):
             avatar_bytes=self.avatar_bytes,
             display_name=self.display_name,
             info_lines=info,
+            in_game_name=self.in_game_name,
         )
+        # Drop any now-earned "Assign <category>" buttons (e.g. the Mastery
+        # Rank just set) and re-add the ones still outstanding.
+        for item in list(self.children):
+            if isinstance(item, discord.ui.Button) and \
+                    item.style == discord.ButtonStyle.link:
+                self.remove_item(item)
+        for btn in _assign_role_buttons(
+            self.member.guild, _missing_assignable_categories(info)
+        ):
+            self.add_item(btn)
         await interaction.response.edit_message(
             attachments=[
                 discord.File(io.BytesIO(png), filename="profile.png")
@@ -4289,12 +4424,14 @@ async def profile_cmd(
     try:
         await interaction.response.defer(ephemeral=ephemeral)
         info = await _member_profile_info_lines(target)
+        in_game_name = await _member_in_game_name(target)
         avatar_bytes = await _fetch_avatar_bytes(avatar_url)
         png = await asyncio.to_thread(
             _render_profile_card_png,
             avatar_bytes=avatar_bytes,
             display_name=display_name,
             info_lines=info,
+            in_game_name=in_game_name,
         )
         send_kwargs: dict = dict(
             file=discord.File(io.BytesIO(png), filename="profile.png"),
@@ -4303,13 +4440,28 @@ async def profile_cmd(
         )
         # The mastery editor is opt-in and only ever attached to a member's
         # own profile (it edits their roles + stored rank).
+        view: discord.ui.View | None = None
         if edit_mastery and target.id == interaction.user.id:
-            send_kwargs["view"] = _MasteryEditorView(
+            view = _MasteryEditorView(
                 member=target,
                 owner_id=interaction.user.id,
                 avatar_bytes=avatar_bytes,
                 display_name=display_name,
+                in_game_name=in_game_name,
             )
+        # Nudge the member toward the help channel for any unearned
+        # Platform / Mastery Rank / Syndicate via "Assign <category>" link
+        # buttons, sharing the message's single view with the editor.
+        assign_buttons = _assign_role_buttons(
+            interaction.guild, _missing_assignable_categories(info)
+        )
+        if assign_buttons:
+            if view is None:
+                view = discord.ui.View(timeout=None)
+            for btn in assign_buttons:
+                view.add_item(btn)
+        if view is not None:
+            send_kwargs["view"] = view
         await interaction.followup.send(**send_kwargs)
     except Exception:
         logger.exception("/profile failed")
