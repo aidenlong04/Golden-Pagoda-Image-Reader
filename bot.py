@@ -145,7 +145,6 @@ OCR_RECOMPRESS_QUALITY = _int_env("OCR_RECOMPRESS_QUALITY", 70)
 
 # Reactions added to the original screenshot message based on verification outcome.
 PASS_REACTION_ID = _int_env("PASS_REACTION_ID", 1506744187096399882)
-PASS_REACTION_NAME = os.getenv("PASS_REACTION_NAME", "thumbsup")
 FAIL_REACTION = os.getenv("FAIL_REACTION", "\U0001F6A8")  # 🚨
 # Parsed form: a PartialEmoji if FAIL_REACTION is a custom emoji literal
 # (<:name:id> or <a:name:id>), otherwise the raw unicode string.
@@ -160,7 +159,6 @@ FAIL_REACTION_EMOJI = _parse_reaction_emoji(FAIL_REACTION)
 # Reaction cleared from the post when verification passes (e.g. a "pending"
 # marker added upstream). Set to 0 to disable.
 PENDING_REACTION_ID = _int_env("PENDING_REACTION_ID", 1459403163432910972)
-PENDING_REACTION_NAME = os.getenv("PENDING_REACTION_NAME", "pending")
 
 # Components V2 reply styling.
 COMPONENTS_V2_FLAG = 1 << 15  # 32768 — IS_COMPONENTS_V2
@@ -1443,8 +1441,10 @@ async def _react(message: discord.Message, status: str) -> None:
         emoji: discord.Emoji | discord.PartialEmoji | str | None = (
             client.get_emoji(PASS_REACTION_ID) if PASS_REACTION_ID else None
         )
+        # Fallback when the emoji isn't in cache yet (e.g. mid-startup).
+        # Discord matches reactions by ID; "r" is a placeholder name.
         if emoji is None and PASS_REACTION_ID:
-            emoji = discord.PartialEmoji(name=PASS_REACTION_NAME, id=PASS_REACTION_ID)
+            emoji = discord.PartialEmoji(name="r", id=PASS_REACTION_ID)
         if emoji is None:
             emoji = "\U0001F44D"  # 👍 fallback
     else:  # fail
@@ -1458,7 +1458,7 @@ async def _react(message: discord.Message, status: str) -> None:
     if PENDING_REACTION_ID:
         pending: discord.Emoji | discord.PartialEmoji | None = client.get_emoji(
             PENDING_REACTION_ID
-        ) or discord.PartialEmoji(name=PENDING_REACTION_NAME, id=PENDING_REACTION_ID)
+        ) or discord.PartialEmoji(name="r", id=PENDING_REACTION_ID)
         try:
             await message.clear_reaction(pending)
         except discord.NotFound:
@@ -2528,16 +2528,17 @@ def _status_page_channels(
     def fmt(cid: int) -> str:
         return f"<#{cid}> `{cid}`" if cid else "*(unset)*"
 
-    def fmt_reaction(name: str, rid: int | None) -> str:
+    def fmt_reaction(rid: int | None) -> str:
         if not rid:
             return "*(unset)*"
-        # Prefer the live emoji from the bot's cache — that gives us
-        # the correct name AND the animated flag, so animated custom
-        # emojis render via <a:name:id> instead of a broken <:name:id>.
+        # Pull the rendered form from the bot's cache so animated
+        # custom emojis get <a:name:id> (and the correct display
+        # name) automatically. Falls back to a bare id reference for
+        # the rare window before the cache populates.
         live = client.get_emoji(rid) if client else None
         if live is not None:
             return str(live)
-        return f"<:{name}:{rid}>"
+        return f"`{rid}`"
 
     last_seen = _load_catchup_state()
     last = f"`{last_seen}`" if last_seen else "*(none)*"
@@ -2548,8 +2549,8 @@ def _status_page_channels(
         f"-# Pass info: {fmt(PASS_INFO_CHANNEL_ID)}\n"
         f"-# Preview: {fmt(PREVIEW_CHANNEL_ID)}\n"
         f"\n**Reactions**\n"
-        f"-# Pass: {fmt_reaction(PASS_REACTION_NAME, PASS_REACTION_ID)}\n"
-        f"-# Pending: {fmt_reaction(PENDING_REACTION_NAME, PENDING_REACTION_ID)}\n"
+        f"-# Pass: {fmt_reaction(PASS_REACTION_ID)}\n"
+        f"-# Pending: {fmt_reaction(PENDING_REACTION_ID)}\n"
         f"-# Fail: {FAIL_REACTION or '*(unset)*'}\n"
         f"\n**Messaging**\n"
         f"-# Reply TTL: `{REPLY_TTL_SECONDS}s`\n"
