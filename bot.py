@@ -257,6 +257,10 @@ HELP_CHANNEL_ID = _int_env("HELP_CHANNEL_ID", 1392582268769271950)
 # /profile card when the member is missing Platform / Mastery Rank / Syndicate.
 ASSIGN_ROLE_EMOJI_ID = _int_env("ASSIGN_ROLE_EMOJI_ID", 1416857287166918827)
 
+# Role permitted to run /profile (server managers are always allowed too).
+# When unset (0), /profile stays open to everyone.
+PROFILE_ACCESS_ROLE_ID = _int_env("PROFILE_ACCESS_ROLE_ID", 1392585653971062815)
+
 
 def _format_mastery_display(value: str | None) -> str:
     """Normalize a stored/OCR'd mastery rank to a card-ready value.
@@ -4392,6 +4396,20 @@ class _MasteryEditorView(discord.ui.View):
                 )
 
 
+def _can_use_profile(member: discord.Member) -> bool:
+    """Return True when ``member`` may run /profile.
+
+    Access is gated to ``PROFILE_ACCESS_ROLE_ID`` (server managers are always
+    allowed). When that role isn't configured (0), the command stays open to
+    everyone.
+    """
+    if not PROFILE_ACCESS_ROLE_ID:
+        return True
+    if member.guild_permissions.manage_guild:
+        return True
+    return any(r.id == PROFILE_ACCESS_ROLE_ID for r in member.roles)
+
+
 @tree.command(
     name="profile",
     description="Show a member's Warframe verification profile card.",
@@ -4411,6 +4429,15 @@ async def profile_cmd(
     if not isinstance(target, discord.Member):
         await interaction.response.send_message(
             "\u274C /profile can only be used in a server.", ephemeral=True
+        )
+        return
+
+    if not (
+        isinstance(interaction.user, discord.Member)
+        and _can_use_profile(interaction.user)
+    ):
+        await interaction.response.send_message(
+            "\u274C You don't have access to /profile.", ephemeral=True
         )
         return
 
