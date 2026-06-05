@@ -322,28 +322,28 @@ class MasteryEditorHelperTests(unittest.TestCase):
             # The editor back-reference the callback relies on is present.
             self.assertIs(sel._editor, view)
 
-    def test_set_in_game_name_button_and_modal_construct(self):
-        """The /profile in-game-name prompt button + modal build cleanly and
-        keep their back-refs off discord.py's reserved ``Item._parent``."""
+    def test_screenshot_verify_button_and_modal_construct(self):
+        """The /profile screenshot-submission button + modal build cleanly,
+        keep their back-refs off discord.py's reserved ``Item._parent``, and
+        the modal carries a single file-upload component."""
+        import discord
         b = self.bot_module
-        btn = b._SetInGameNameButton(
+        btn = b._ScreenshotVerifyButton(
             member=Mock(), owner_id=123, avatar_bytes=None,
             display_name="Tenno",
         )
         # Reserved attribute untouched so dispatch doesn't recurse.
         self.assertIsNone(btn._parent)
-        self.assertEqual(btn.label, "Set In-Game Name")
+        self.assertEqual(btn.label, "Submit Profile Screenshot")
         self.assertEqual(btn.style, discord.ButtonStyle.primary)
 
-        modal = b._InGameNameModal(
-            member=Mock(), avatar_bytes=None, display_name="Tenno",
-            source_view=None, source_button=btn,
+        modal = b._ScreenshotVerifyModal(
+            member=Mock(), owner_id=123, avatar_bytes=None,
+            display_name="Tenno", source_view=None,
         )
-        inputs = [c for c in modal.children
-                  if isinstance(c, discord.ui.TextInput)]
-        self.assertEqual(len(inputs), 1)
-        # Discord nicknames / handles cap at 32 chars.
-        self.assertEqual(inputs[0].max_length, 32)
+        # The modal exposes a single FileUpload for the screenshot.
+        self.assertIsInstance(modal.screenshot, discord.ui.FileUpload)
+        self.assertEqual(modal.screenshot.max_values, 1)
 
     def test_mr_bucket_role_for_maps_rank_to_bucket(self):
         b = self.bot_module

@@ -4363,15 +4363,17 @@ class _MasteryEditorView(discord.ui.View):
             in_game_name=self.in_game_name,
         )
         # Drop any now-earned "Assign <category>" buttons (e.g. the Mastery
-        # Rank just set) and re-add the ones still outstanding.
-        for item in list(self.children):
-            if isinstance(item, discord.ui.Button) and \
-                    item.style == discord.ButtonStyle.link:
-                self.remove_item(item)
-        for btn in _assign_role_buttons(
-            self.member.guild, _missing_assignable_categories(info)
-        ):
-            self.add_item(btn)
+        # Rank just set), re-add the ones still outstanding, and keep the
+        # screenshot button in sync — all via the shared rebuilder.
+        _sync_profile_action_items(
+            self,
+            member=self.member,
+            owner_id=self.owner_id,
+            avatar_bytes=self.avatar_bytes,
+            display_name=self.display_name,
+            info=info,
+            in_game_name=self.in_game_name,
+        )
         await interaction.response.edit_message(
             attachments=[
                 discord.File(io.BytesIO(png), filename="profile.png")
@@ -4396,78 +4398,128 @@ class _MasteryEditorView(discord.ui.View):
                 )
 
 
-class _InGameNameModal(discord.ui.Modal):
-    """Modal that lets a member type the in-game name the verification/OCR
-    flow never pulled for them.
+class _ScreenshotVerifyModal(discord.ui.Modal):
+    """Modal that lets a member upload a Warframe profile screenshot. On
+    submit we OCR it and assign/store every field we can (in-game name,
+    clan role, mastery rank), then re-render the /profile card in place.
 
-    On submit we persist the handle to the durable member store, re-render
-    the /profile card (the headline becomes the handle), drop the prompt
-    button, and edit the message in place.
+    Used instead of asking the member to type their handle: one screenshot
+    fills everything the verification flow would have pulled.
     """
 
     def __init__(
-        self, *, member: discord.Member, avatar_bytes: bytes | None,
-        display_name: str, source_view: "discord.ui.View | None",
-        source_button: "discord.ui.Button | None",
+        self, *, member: discord.Member, owner_id: int,
+        avatar_bytes: bytes | None, display_name: str,
+        source_view: "discord.ui.View | None",
     ) -> None:
-        super().__init__(title="Set Your In-Game Name", timeout=300)
+        super().__init__(title="Submit Profile Screenshot", timeout=600)
         self._gp_member = member
+        self._gp_owner_id = owner_id
         self._gp_avatar_bytes = avatar_bytes
         self._gp_display_name = display_name
         self._gp_source_view = source_view
-        self._gp_source_button = source_button
-        self.name_input = discord.ui.TextInput(
-            label="Warframe in-game name",
-            placeholder="e.g. PlayerName",
-            min_length=1,
-            max_length=32,
-            required=True,
+        self.screenshot = discord.ui.FileUpload(
+            min_values=1, max_values=1, required=True,
         )
-        self.add_item(self.name_input)
+        self.add_item(discord.ui.Label(
+            text="Profile screenshot",
+            description=(
+                "Upload a screenshot of your Warframe profile "
+                "(title bar + CLAN visible)."
+            ),
+            component=self.screenshot,
+        ))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        name = str(self.name_input.value or "").strip()
-        if not name:
+        files = list(self.screenshot.values or [])
+        if not files:
             with contextlib.suppress(discord.HTTPException):
                 await interaction.response.defer()
             return
+        attachment = files[0]
+        # OCR + role HTTP can take seconds; ack as a deferred message update
+        # so we can edit the source card afterward (edit_original_response).
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.defer()
+        try:
+            image_bytes = await attachment.read()
+        except Exception:
+            logger.warning(
+                "profile screenshot: attachment read failed", exc_info=True
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.followup.send(
+                    "Couldn't read that upload \u2014 try again.",
+                    ephemeral=True,
+                )
+            return
+
         member = self._gp_member
-        await asyncio.to_thread(
-            analytics.upsert_member_profile,
-            guild_id=member.guild.id,
-            user_id=member.id,
-            in_game_name=name,
+        summary = await _verify_member_from_screenshot(
+            member,
+            image_bytes=image_bytes,
+            filename=attachment.filename or "profile.png",
+            content_type=attachment.content_type or "image/png",
         )
+
+        # Re-fetch so the re-render reflects freshly assigned roles (the
+        # cached member.roles lags the role-add gateway event).
+        with contextlib.suppress(discord.HTTPException):
+            member = await member.guild.fetch_member(member.id)
+
         info = await _member_profile_info_lines(member)
+        in_game_name = await _member_in_game_name(member)
         png = await asyncio.to_thread(
             _render_profile_card_png,
             avatar_bytes=self._gp_avatar_bytes,
             display_name=self._gp_display_name,
             info_lines=info,
-            in_game_name=name,
+            in_game_name=in_game_name,
         )
-        # The handle is recorded now, so drop the prompt button. Keep a
-        # mastery editor's cached headline in sync so a later rank edit
-        # doesn't revert to the (blank) name.
+
+        # Refresh the action buttons (drop the screenshot button once a
+        # handle exists, re-add link buttons for whatever's still missing)
+        # and keep a mastery editor's cached headline in sync.
         view = self._gp_source_view
         if view is not None:
-            if self._gp_source_button is not None:
-                with contextlib.suppress(ValueError):
-                    view.remove_item(self._gp_source_button)
+            _sync_profile_action_items(
+                view,
+                member=member,
+                owner_id=self._gp_owner_id,
+                avatar_bytes=self._gp_avatar_bytes,
+                display_name=self._gp_display_name,
+                info=info,
+                in_game_name=in_game_name,
+            )
             if hasattr(view, "in_game_name"):
-                view.in_game_name = name
-        await interaction.response.edit_message(
-            attachments=[
-                discord.File(io.BytesIO(png), filename="profile.png")
-            ],
-            view=view,
-        )
+                view.in_game_name = in_game_name
+
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.edit_original_response(
+                attachments=[
+                    discord.File(io.BytesIO(png), filename="profile.png")
+                ],
+                view=view,
+            )
+
+        if summary:
+            body = "Updated your profile from the screenshot:\n" + "\n".join(
+                f"\u2022 {line}" for line in summary
+            )
+        else:
+            body = (
+                "I couldn't read that screenshot. Upload a clearer PNG/JPG "
+                "with your title bar (PlayerName#NNN) and CLAN visible."
+            )
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.followup.send(body, ephemeral=True)
 
 
-class _SetInGameNameButton(discord.ui.Button):
+class _ScreenshotVerifyButton(discord.ui.Button):
     """Prompt button on a member's own /profile card, shown only when the
     verification/OCR flow never pulled an in-game name. Opens
-    ``_InGameNameModal``."""
+    ``_ScreenshotVerifyModal`` so the member can self-verify by uploading a
+    profile screenshot."""
 
     def __init__(
         self, *, member: discord.Member, owner_id: int,
@@ -4475,7 +4527,7 @@ class _SetInGameNameButton(discord.ui.Button):
     ) -> None:
         super().__init__(
             style=discord.ButtonStyle.primary,
-            label="Set In-Game Name",
+            label="Submit Profile Screenshot",
         )
         # Non-reserved names: discord.py's Item._run_checks recurses through
         # ``_parent``; clobbering it (or ``_view``) breaks dispatch.
@@ -4491,14 +4543,143 @@ class _SetInGameNameButton(discord.ui.Button):
                     "These controls aren't yours.", ephemeral=True
                 )
             return
-        modal = _InGameNameModal(
+        modal = _ScreenshotVerifyModal(
             member=self._gp_member,
+            owner_id=self._gp_owner_id,
             avatar_bytes=self._gp_avatar_bytes,
             display_name=self._gp_display_name,
             source_view=self.view,
-            source_button=self,
         )
         await interaction.response.send_modal(modal)
+
+
+async def _verify_member_from_screenshot(
+    member: discord.Member, *, image_bytes: bytes,
+    filename: str, content_type: str,
+) -> list[str]:
+    """OCR a Warframe profile screenshot and assign/store every field we can
+    for ``member``: in-game name + clan role + mastery rank.
+
+    Mirrors the channel verification flow's parsing and storage (same
+    ``upsert_member_profile`` snapshot shape) but scoped to a single member's
+    self-service. Returns human-readable summary lines describing what was
+    updated; an empty list means the screenshot couldn't be read.
+    """
+    try:
+        probe = Image.open(io.BytesIO(image_bytes))
+        try:
+            probe.verify()
+        finally:
+            probe.close()
+    except Exception:
+        logger.warning("profile screenshot: invalid image", exc_info=True)
+        return []
+
+    try:
+        ocr_text_raw, ocr_words, _engine = await asyncio.to_thread(
+            _ocr, image_bytes, filename, content_type,
+        )
+        ocr_text = (ocr_text_raw or "").strip()
+    except Exception:
+        logger.warning("profile screenshot: OCR failed", exc_info=True)
+        return []
+
+    try:
+        ocr_text, ocr_words = await asyncio.to_thread(
+            _supplement_title_bar_ocr, image_bytes, ocr_text, ocr_words,
+        )
+    except Exception:
+        logger.warning(
+            "profile screenshot: title-bar supplement raised", exc_info=True
+        )
+
+    profile_name = parse_profile_name(ocr_text)
+    clan_name = parse_clan_name(ocr_text)
+    mastery_rank = parse_mastery_rank(ocr_text)
+
+    summary: list[str] = []
+    store: dict = {}
+
+    if profile_name:
+        store["in_game_name"] = profile_name
+        summary.append(f"In-game name: **{_strip_clan_tag(profile_name)}**")
+
+    if clan_name:
+        role = _find_clan_role(member.guild, clan_name)
+        clan_label = _strip_clan_tag(clan_name)
+        if role is not None:
+            _changed, status = await _add_role(
+                member, role, "Profile screenshot self-verification"
+            )
+            store["clan"] = clan_label
+            summary.append(f"Clan: {status}")
+        else:
+            summary.append(
+                f"Clan **{clan_label}** isn't configured on this server."
+            )
+
+    if mastery_rank:
+        store["mastery_rank"] = mastery_rank
+        m = re.match(r"\s*(MR|LR)\s*(\d+)", mastery_rank, re.IGNORECASE)
+        if m:
+            kind = m.group(1).upper()
+            value = int(m.group(2))
+            status = await _apply_mastery_bucket(member, kind, value)
+            disp = _format_mastery_display(f"{kind} {value}")
+            if status == "assigned":
+                summary.append(f"Mastery Rank: **{disp}**")
+            else:
+                summary.append(
+                    f"Mastery Rank **{disp}** saved (no matching rank role)."
+                )
+        else:
+            summary.append(f"Mastery Rank: **{mastery_rank}**")
+
+    if store:
+        await asyncio.to_thread(
+            analytics.upsert_member_profile,
+            guild_id=member.guild.id,
+            user_id=member.id,
+            last_verified_ts=int(time.time()),
+            **store,
+        )
+
+    return summary
+
+
+def _sync_profile_action_items(
+    view: discord.ui.View, *, member: discord.Member, owner_id: int,
+    avatar_bytes: bytes | None, display_name: str,
+    info: list[tuple], in_game_name: str | None,
+) -> None:
+    """Rebuild a /profile view's action items (link + screenshot buttons)
+    from the member's current state, leaving any mastery selects in place.
+
+    Shared by the initial /profile build, the mastery editor refresh, and
+    the screenshot-verify refresh so all three stay consistent: drop the
+    existing "Assign <category>" link buttons + the screenshot button, then
+    re-add link buttons for whatever's still missing and the screenshot
+    button while the in-game name is still unknown.
+    """
+    for item in list(view.children):
+        if isinstance(item, _ScreenshotVerifyButton):
+            view.remove_item(item)
+        elif (
+            isinstance(item, discord.ui.Button)
+            and item.style == discord.ButtonStyle.link
+        ):
+            view.remove_item(item)
+    for btn in _assign_role_buttons(
+        member.guild, _missing_assignable_categories(info)
+    ):
+        view.add_item(btn)
+    if not in_game_name:
+        view.add_item(_ScreenshotVerifyButton(
+            member=member,
+            owner_id=owner_id,
+            avatar_bytes=avatar_bytes,
+            display_name=display_name,
+        ))
 
 
 def _can_use_profile(member: discord.Member) -> bool:
@@ -4587,36 +4768,23 @@ async def profile_cmd(
                 display_name=display_name,
                 in_game_name=in_game_name,
             )
-        # Nudge the member toward the help channel for any unearned
-        # Platform / Mastery Rank / Syndicate via "Assign <category>" link
-        # buttons, sharing the message's single view with the editor. Only
-        # shown on your OWN profile — there's nothing to self-assign on
-        # someone else's card.
-        assign_buttons = (
-            _assign_role_buttons(
-                interaction.guild, _missing_assignable_categories(info)
-            )
-            if target.id == interaction.user.id
-            else []
-        )
-        if assign_buttons:
+        # Own profile only: add the self-service action items — "Assign
+        # <category>" link buttons for unearned Platform / Mastery Rank /
+        # Syndicate, plus a "Submit Profile Screenshot" button to OCR-fill
+        # everything when no in-game name was ever pulled.
+        if target.id == interaction.user.id:
             if view is None:
-                view = discord.ui.View(timeout=None)
-            for btn in assign_buttons:
-                view.add_item(btn)
-        # If the verification/OCR flow never pulled this member's in-game
-        # name, give them a button to record it themselves (own profile
-        # only). The modal persists it and drops the button once set.
-        if target.id == interaction.user.id and not in_game_name:
-            if view is None:
-                view = discord.ui.View(timeout=300)
-            view.add_item(_SetInGameNameButton(
+                view = discord.ui.View(timeout=600)
+            _sync_profile_action_items(
+                view,
                 member=target,
                 owner_id=interaction.user.id,
                 avatar_bytes=avatar_bytes,
                 display_name=display_name,
-            ))
-        if view is not None:
+                info=info,
+                in_game_name=in_game_name,
+            )
+        if view is not None and view.children:
             send_kwargs["view"] = view
         await interaction.followup.send(**send_kwargs)
     except Exception:
