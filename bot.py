@@ -2529,9 +2529,15 @@ def _status_page_channels(
         return f"<#{cid}> `{cid}`" if cid else "*(unset)*"
 
     def fmt_reaction(name: str, rid: int | None) -> str:
-        if rid:
-            return f"<:{name}:{rid}>"
-        return "*(unset)*"
+        if not rid:
+            return "*(unset)*"
+        # Prefer the live emoji from the bot's cache — that gives us
+        # the correct name AND the animated flag, so animated custom
+        # emojis render via <a:name:id> instead of a broken <:name:id>.
+        live = client.get_emoji(rid) if client else None
+        if live is not None:
+            return str(live)
+        return f"<:{name}:{rid}>"
 
     last_seen = _load_catchup_state()
     last = f"`{last_seen}`" if last_seen else "*(none)*"
