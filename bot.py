@@ -2509,14 +2509,6 @@ def _status_page_roles_split(
         mention = f"<@&{rid}>" if rid else "*(unset)*"
         rest_lines.append(f"-# {plat} \u2192 {mention}")
 
-    rest_lines.append("")
-    rest_lines.append("**Special roles**")
-    inc = f"<@&{INCOMPLETE_ROLE_ID}>" if INCOMPLETE_ROLE_ID else "*(unset)*"
-    rem = f"<@&{VERIFY_REMOVE_ROLE_ID}>" if VERIFY_REMOVE_ROLE_ID else "*(unset)*"
-    out = ", ".join(f"<@&{rid}>" for rid in OUTREACH_ROLE_IDS) or "*(none)*"
-    rest_lines.append(f"-# Incomplete: {inc}")
-    rest_lines.append(f"-# Remove on pass: {rem}")
-    rest_lines.append(f"-# Outreach: {out}")
     return "\n".join(clan_lines), "\n".join(rest_lines)
 
 
