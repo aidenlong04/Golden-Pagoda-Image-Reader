@@ -3591,13 +3591,12 @@ def _render_profile_card_png(
 
     A sibling of :func:`_render_progress_card_png` with the progress bar
     removed. The header stacks a gold "USER PROFILE" eyebrow, the member
-    name, and the platform icon (icon-only, soft glow) on the left of the
-    circular avatar, with the Clan as a gold callout on the right. Beneath
-    the header the Mastery Rank sits in a gold capsule badge, and any
-    syndicates render as faction-coloured rows (icon + name for one or
-    two, icon-only when three or more). ``info_lines`` come from
-    :func:`_member_profile_info_lines`. Rendered at ``_PROGRESS_SS``x for
-    crisp HiDPI output.
+    name, and a row of icons beneath it (the platform icon with a soft
+    gold glow, trailed by each syndicate's faction flag) on the left of
+    the circular avatar, with the Clan as a gold callout on the right.
+    Beneath the header the Mastery Rank sits in a gold capsule badge.
+    ``info_lines`` come from :func:`_member_profile_info_lines`. Rendered
+    at ``_PROGRESS_SS``x for crisp HiDPI output.
     """
     s = _PROGRESS_SS
 
@@ -3641,22 +3640,13 @@ def _render_profile_card_png(
     mr_pill_h = 32
 
     # Lay out the stacked sections so the canvas height is known before we
-    # draw: header, then the optional Mastery capsule, then the optional
-    # syndicate band.
+    # draw: the header (which now also carries the platform + syndicate
+    # flag icons) then the optional Mastery capsule.
     content_bottom = header_h
     mr_pill_top = None
     if mastery_row is not None:
         mr_pill_top = header_h + 10
         content_bottom = mr_pill_top + mr_pill_h
-    syn_top = None
-    syn_two_row_h = 26
-    syn_icon_row_h = 30
-    if syndicate_factions:
-        syn_top = content_bottom + 12
-        if len(syndicate_factions) <= 2:
-            content_bottom = syn_top + len(syndicate_factions) * syn_two_row_h
-        else:
-            content_bottom = syn_top + syn_icon_row_h
     card_h = content_bottom + 16
 
     W, H = sc(_PROGRESS_CARD_W), sc(card_h)
@@ -3713,7 +3703,7 @@ def _render_profile_card_png(
     name_right_bound = right_x
     if clan_row is not None:
         clan_label_font = _load_font(sc(12), bold=True)
-        clan_value_font = _load_font(sc(18), bold=True)
+        clan_value_font = _load_font(sc(16), bold=True)
         c_icon_px = sc(22)
         c_gap = sc(9)
         clan_val = clan_row[1] or "\u2014"
@@ -3769,11 +3759,15 @@ def _render_profile_card_png(
         fill=_PROGRESS_TEXT, anchor="lm",
     )
 
-    # Platform: icon only, beneath the name, with a soft gold glow.
+    # Platform + syndicate flag icons share one row beneath the name
+    # (icon-only). The platform icon leads with a soft gold glow; each
+    # syndicate flag trails it, with a faction-coloured dot as the
+    # fallback when its custom emoji is unset.
+    row_cx = text_x
     if platform_row is not None and platform_row[2]:
         plat_icon_px = sc(26)
         glow_d = plat_icon_px * 2
-        gcx = text_x + plat_icon_px // 2
+        gcx = row_cx + plat_icon_px // 2
         glow = Image.new("RGBA", (glow_d, glow_d), (0, 0, 0, 0))
         ImageDraw.Draw(glow).ellipse(
             (glow_d * 0.2, glow_d * 0.2, glow_d * 0.8, glow_d * 0.8),
@@ -3784,9 +3778,29 @@ def _render_profile_card_png(
             glow, (gcx - glow_d // 2, plat_cy - glow_d // 2)
         )
         _paste_emoji_icon(
-            canvas, platform_row[2], text_x, plat_cy, plat_icon_px,
+            canvas, platform_row[2], row_cx, plat_cy, plat_icon_px,
             label="Platform",
         )
+        row_cx += plat_icon_px + sc(16)
+    if syndicate_factions:
+        syn_icon_px = sc(24)
+        syn_gap = sc(10)
+        for _sname, scolor, sbytes in syndicate_factions:
+            if row_cx + syn_icon_px > name_right_bound:
+                break
+            if not (sbytes and _paste_emoji_icon(
+                canvas, sbytes, row_cx, plat_cy, syn_icon_px,
+                label="Syndicate",
+            )):
+                r = syn_icon_px // 3
+                ImageDraw.Draw(canvas).ellipse(
+                    (
+                        row_cx + syn_icon_px // 2 - r, plat_cy - r,
+                        row_cx + syn_icon_px // 2 + r, plat_cy + r,
+                    ),
+                    fill=(scolor or _PROGRESS_MUTED) + (255,),
+                )
+            row_cx += syn_icon_px + syn_gap
 
     # Mastery Rank capsule badge beneath the header (gold-tinted fill +
     # hairline gold border), sized to its content.
@@ -3809,8 +3823,8 @@ def _render_profile_card_png(
         overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
         ImageDraw.Draw(overlay).rounded_rectangle(
             (pill_x0, pill_y0, pill_x0 + pill_w, pill_y0 + pill_h),
-            radius=pill_h // 2, fill=_PROGRESS_ACCENT + (26,),
-            outline=_PROGRESS_ACCENT + (130,), width=max(1, sc(1)),
+            radius=pill_h // 2, fill=_PROGRESS_ACCENT + (14,),
+            outline=_PROGRESS_ACCENT + (105,), width=max(1, sc(1)),
         )
         canvas.alpha_composite(overlay)
         mcy = pill_y0 + pill_h // 2
@@ -3827,62 +3841,6 @@ def _render_profile_card_png(
             (mx + lbl_w, mcy), value_txt, font=mr_value_font,
             fill=_PROGRESS_FILL_GOLD_END, anchor="lm",
         )
-
-    # Syndicate band: one/two factions render as icon + faction-coloured
-    # name (stacked); three or more collapse to an icon-only row.
-    if syndicate_factions and syn_top is not None:
-        syn_x = sc(pad) + sc(8)
-        syn_right = W - sc(pad) - sc(8)
-        if len(syndicate_factions) <= 2:
-            syn_font = _load_font(sc(14), bold=True)
-            syn_icon_px = sc(20)
-            syn_gap = sc(8)
-            for i, (sname, scolor, sbytes) in enumerate(syndicate_factions):
-                scy = sc(syn_top + i * syn_two_row_h + syn_two_row_h // 2)
-                cx = syn_x
-                if sbytes and _paste_emoji_icon(
-                    canvas, sbytes, cx, scy, syn_icon_px, label="Syndicate"
-                ):
-                    cx += syn_icon_px + syn_gap
-                else:
-                    bullet = "\u2022 "
-                    draw.text(
-                        (cx, scy), bullet, font=syn_font,
-                        fill=scolor or _PROGRESS_MUTED, anchor="lm",
-                    )
-                    cx += int(draw.textlength(bullet, font=syn_font))
-                nm = sname or ""
-                max_w = syn_right - cx
-                if draw.textlength(nm, font=syn_font) > max_w:
-                    while nm and draw.textlength(
-                        nm + "\u2026", font=syn_font
-                    ) > max_w:
-                        nm = nm[:-1]
-                    nm = nm + "\u2026"
-                draw.text(
-                    (cx, scy), nm, font=syn_font,
-                    fill=scolor or _PROGRESS_TEXT, anchor="lm",
-                )
-        else:
-            syn_icon_px = sc(26)
-            syn_gap = sc(12)
-            scy = sc(syn_top + syn_icon_row_h // 2)
-            cx = syn_x
-            for sname, scolor, sbytes in syndicate_factions:
-                if cx + syn_icon_px > syn_right:
-                    break
-                if not (sbytes and _paste_emoji_icon(
-                    canvas, sbytes, cx, scy, syn_icon_px, label="Syndicate"
-                )):
-                    r = syn_icon_px // 3
-                    ImageDraw.Draw(canvas).ellipse(
-                        (
-                            cx + syn_icon_px // 2 - r, scy - r,
-                            cx + syn_icon_px // 2 + r, scy + r,
-                        ),
-                        fill=(scolor or _PROGRESS_MUTED) + (255,),
-                    )
-                cx += syn_icon_px + syn_gap
 
     buf = io.BytesIO()
     canvas.save(buf, format="PNG", optimize=True)
