@@ -2928,10 +2928,6 @@ _PROGRESS_ACCENT = (212, 168, 87)      # gold accent (footer / pct)
 _PROGRESS_MISSING = (236, 170, 92)     # amber — 'missing data' callout
 _PROGRESS_AVATAR_SIZE = 112
 _PROGRESS_AVATAR_RING = (212, 168, 87)
-# Featured "stat tile" gradient — the profile card's headline Clan /
-# Mastery Rank fields sit in the band where the progress bar lives.
-_PROGRESS_STAT_TOP = (49, 52, 59)      # lighter slate (tile top edge)
-_PROGRESS_STAT_BOTTOM = (34, 36, 41)   # darker slate (tile bottom edge)
 # Supersample factor: the card is laid out in logical units then rendered
 # at this multiple so text, icons, and the bar stay crisp on Discord's
 # HiDPI clients (the previous 1x output looked soft when scaled).
@@ -3532,72 +3528,53 @@ def _render_progress_card_png(
     return buf.getvalue()
 
 
-def _draw_stat_tile(
-    canvas: Image.Image, *, x: int, y: int, w: int, h: int,
+def _draw_feature_row(
+    canvas: Image.Image, *, x: int, cy: int, right_edge: int,
     label: str, value: str, emoji_bytes: bytes | None, scale: int,
 ) -> None:
-    """Render one featured "stat tile" for the profile card's headline
-    Clan / Mastery Rank fields.
-
-    A rounded slate tile (subtle vertical gradient + hairline border) with
-    a gold accent strip down the left edge, the category emoji
-    (aspect-preserved, bullet-free) at the left, a small muted uppercase
-    label and the value in large bold beneath it. ``x``/``y``/``w``/``h``
-    are supersampled pixels; ``scale`` keeps radii and strokes
-    proportional.
+    """Render one headline profile field (Clan / Mastery Rank) as a
+    full-width "[icon] Label: Value" row, stacked vertically beneath the
+    header. Larger than the reference-grid cells below it but in the same
+    visual language — no tile/bar background. ``x``/``cy``/``right_edge``
+    are supersampled pixels; ``scale`` keeps fonts and icons proportional.
     """
     s = scale
 
     def sc(v: float) -> int:
         return int(round(v * s))
 
-    radius = sc(14)
-    tile = _vertical_gradient(w, h, _PROGRESS_STAT_TOP, _PROGRESS_STAT_BOTTOM)
-    mask = _rounded_mask(w, h, radius)
-    canvas.paste(tile, (x, y), mask)
-
-    # Gold accent strip down the left edge, clipped to the rounded corner
-    # so it follows the tile's top/bottom-left radius.
-    strip = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    ImageDraw.Draw(strip).rectangle(
-        (0, 0, sc(5), h - 1), fill=_PROGRESS_ACCENT + (255,)
-    )
-    clipped = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    clipped.paste(strip, (0, 0), mask)
-    canvas.alpha_composite(clipped, (x, y))
-
     draw = ImageDraw.Draw(canvas)
-    draw.rounded_rectangle(
-        (x, y, x + w - 1, y + h - 1), radius=radius,
-        outline=_PROGRESS_BORDER + (255,), width=max(1, sc(1)),
-    )
+    label_font = _load_font(sc(18), bold=True)
+    value_font = _load_font(sc(21), bold=True)
+    icon_px = sc(26)
+    icon_gap = sc(10)
 
-    icon_px = sc(30)
-    inner_x = x + sc(20)
-    cy = y + h // 2
-    if _paste_emoji_icon(
-        canvas, emoji_bytes, inner_x, cy, icon_px, label=label
-    ):
-        text_x = inner_x + icon_px + sc(13)
+    if _paste_emoji_icon(canvas, emoji_bytes, x, cy, icon_px, label=label):
+        text_x = x + icon_px + icon_gap
     else:
-        text_x = inner_x
+        bullet = "\u2022 "
+        draw.text(
+            (x, cy), bullet, font=label_font,
+            fill=_PROGRESS_MUTED, anchor="lm",
+        )
+        text_x = x + int(draw.textlength(bullet, font=label_font))
 
-    label_font = _load_font(sc(13), bold=True)
-    value_font = _load_font(sc(22), bold=True)
+    label_text = f"{label}: "
     draw.text(
-        (text_x, y + sc(22)), label.upper(), font=label_font,
+        (text_x, cy), label_text, font=label_font,
         fill=_PROGRESS_MUTED, anchor="lm",
     )
-    right_edge = x + w - sc(14)
+    value_x = text_x + draw.textlength(label_text, font=label_font)
+    max_value_w = right_edge - value_x
     v = value or ""
-    if draw.textlength(v, font=value_font) > right_edge - text_x:
+    if draw.textlength(v, font=value_font) > max_value_w:
         while v and draw.textlength(
             v + "\u2026", font=value_font
-        ) > right_edge - text_x:
+        ) > max_value_w:
             v = v[:-1]
         v = v + "\u2026"
     draw.text(
-        (text_x, y + sc(44)), v, font=value_font,
+        (value_x, cy), v, font=value_font,
         fill=_PROGRESS_TEXT, anchor="lm",
     )
 
@@ -3611,13 +3588,14 @@ def _render_profile_card_png(
     """Render the "user profile" card and return PNG bytes.
 
     A sibling of :func:`_render_progress_card_png` with the progress bar
-    removed: same rounded slate panel, circular avatar and two-column
-    reference grid (shared via :func:`_draw_info_grid`), but the header is
-    refined to a gold "USER PROFILE" eyebrow above the member name since
-    there is no bar/percentage to anchor the layout. ``info_lines`` are
-    ``(label, value)`` or ``(label, value, emoji_png_bytes)`` rows and
-    fill the grid row-major (Clan | Platform over Mastery Rank |
-    Syndicate). Rendered at ``_PROGRESS_SS``x for crisp HiDPI output.
+    removed: same rounded slate panel and circular avatar under a gold
+    "USER PROFILE" eyebrow above the member name. The headline Clan /
+    Mastery Rank fields are stacked vertically as prominent rows beneath
+    the header (no tile/bar background); any remaining fields (Platform,
+    Syndicate) flow into the shared two-column reference grid
+    (:func:`_draw_info_grid`) below a divider. ``info_lines`` are
+    ``(label, value)`` or ``(label, value, emoji_png_bytes)`` rows.
+    Rendered at ``_PROGRESS_SS``x for crisp HiDPI output.
     """
     s = _PROGRESS_SS
 
@@ -3636,21 +3614,24 @@ def _render_profile_card_png(
     # Header zone holds the avatar + eyebrow + name.
     header_h = 118
 
-    # Promote the headline Clan / Mastery Rank fields into featured "stat
-    # tiles" laid out in the full-width band where the progress bar sits on
-    # the sibling /progress card. Everything else (Platform, Syndicate)
-    # flows into the reference grid at the bottom.
+    # Promote the headline Clan / Mastery Rank fields into prominent rows
+    # stacked vertically beneath the header (no tile/bar background).
+    # Everything else (Platform, Syndicate) flows into the reference grid
+    # at the bottom.
     _FEATURED = ("Clan", "Mastery Rank")
     featured = [r for r in norm_rows if r[0] in _FEATURED]
     featured.sort(key=lambda r: _FEATURED.index(r[0]))
     remaining = [r for r in norm_rows if r[0] not in _FEATURED]
 
-    feat_h = 66
-    feat_bottom = header_h + ((6 + feat_h) if featured else 0)
+    feat_row_h = 40
+    feat_top = header_h + 6
+    feat_bottom = (
+        feat_top + len(featured) * feat_row_h if featured else header_h
+    )
 
     n_grid_rows = (len(remaining) + 1) // 2
     if remaining:
-        divider_logical = feat_bottom + (18 if featured else 12)
+        divider_logical = feat_bottom + (14 if featured else 12)
         info_block_h = 14 + n_grid_rows * row_h + 16
         card_h = divider_logical + info_block_h
     else:
@@ -3713,23 +3694,16 @@ def _render_profile_card_png(
         fill=_PROGRESS_TEXT, anchor="lm",
     )
 
-    # Featured Clan / Mastery Rank tiles in the band beneath the header
-    # (where the progress bar lives on the /progress card).
+    # Featured Clan / Mastery Rank fields stacked vertically beneath the
+    # header (where the progress bar lives on the /progress card), aligned
+    # with the reference grid's left edge below.
     if featured:
-        feat_left = sc(pad)
-        feat_right = W - sc(pad)
-        feat_top = sc(header_h + 6)
-        feat_h_px = sc(feat_h)
-        if len(featured) == 2:
-            gap = sc(16)
-            tile_w = (feat_right - feat_left - gap) // 2
-            second_x = feat_left + tile_w + gap
-            slots = [(feat_left, tile_w), (second_x, feat_right - second_x)]
-        else:
-            slots = [(feat_left, feat_right - feat_left)]
-        for (lbl, val, emj), (tx, tw) in zip(featured, slots, strict=True):
-            _draw_stat_tile(
-                canvas, x=tx, y=feat_top, w=tw, h=feat_h_px,
+        feat_left = sc(pad) + sc(8)
+        feat_right = W - sc(pad) - sc(8)
+        for i, (lbl, val, emj) in enumerate(featured):
+            cy = sc(feat_top + i * feat_row_h + feat_row_h // 2)
+            _draw_feature_row(
+                canvas, x=feat_left, cy=cy, right_edge=feat_right,
                 label=lbl, value=val, emoji_bytes=emj, scale=s,
             )
 
