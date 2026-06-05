@@ -2509,6 +2509,11 @@ def _status_page_channels(
     def fmt(cid: int) -> str:
         return f"<#{cid}> `{cid}`" if cid else "*(unset)*"
 
+    def fmt_reaction(name: str, rid: int | None) -> str:
+        if rid:
+            return f"<:{name}:{rid}>"
+        return "*(unset)*"
+
     last_seen = _load_catchup_state()
     last = f"`{last_seen}`" if last_seen else "*(none)*"
 
@@ -2518,9 +2523,9 @@ def _status_page_channels(
         f"-# Pass info: {fmt(PASS_INFO_CHANNEL_ID)}\n"
         f"-# Preview: {fmt(PREVIEW_CHANNEL_ID)}\n"
         f"\n**Reactions**\n"
-        f"-# Pass: `:{PASS_REACTION_NAME}:`\n"
-        f"-# Pending: `:{PENDING_REACTION_NAME}:`\n"
-        f"-# Fail: {FAIL_REACTION}\n"
+        f"-# Pass: {fmt_reaction(PASS_REACTION_NAME, PASS_REACTION_ID)}\n"
+        f"-# Pending: {fmt_reaction(PENDING_REACTION_NAME, PENDING_REACTION_ID)}\n"
+        f"-# Fail: {FAIL_REACTION or '*(unset)*'}\n"
         f"\n**Messaging**\n"
         f"-# Reply TTL: `{REPLY_TTL_SECONDS}s`\n"
         f"-# Catch-up: `{CATCHUP_LOOKBACK_HOURS}h` lookback \u2022 last id: {last}"
@@ -2610,12 +2615,12 @@ def _status_page_clans(interaction: discord.Interaction, _snap: dict) -> str:
 # builder slot is None.
 _StatusBuilder = Callable[[discord.Interaction, dict], str]
 _STATUS_PAGES: list[tuple[str, str, _StatusBuilder | None]] = [
-    ("bot",      "\U0001F916 Bot",         _status_page_bot),
-    ("roles",    "\U0001F6E1\ufe0f Roles", None),
-    ("channels", "\U0001F4FA Channels",    _status_page_channels),
-    ("ocr",      "\U0001F50D OCR",         _status_page_ocr),
-    ("stats",    "\U0001F4C8 Stats",       _status_page_stats),
-    ("clans",    "\U0001F3F0 Clans",       _status_page_clans),
+    ("bot",      "Bot",       _status_page_bot),
+    ("roles",    "Roles",     None),
+    ("channels", "Channels",  _status_page_channels),
+    ("ocr",      "OCR",       _status_page_ocr),
+    ("stats",    "Stats",     _status_page_stats),
+    ("clans",    "Clans",     _status_page_clans),
 ]
 
 # Pages that consume `analytics.summary()`. Computing the snapshot fires
