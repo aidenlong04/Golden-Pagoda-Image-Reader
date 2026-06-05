@@ -1271,6 +1271,9 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
 
     clan_emoji_bytes: bytes | None = None
     platform_emoji_bytes: bytes | None = None
+    profile_emoji_bytes: bytes | None = None
+    mastery_emoji_bytes: bytes | None = None
+    missing_emoji_bytes: bytes | None = None
     if passed:
         if clan_emoji:
             clan_emoji_bytes = await _fetch_emoji_bytes(clan_emoji)
@@ -1278,6 +1281,13 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
             platform_emoji_bytes = await _fetch_emoji_bytes(
                 PLATFORM_EMOJIS.get(member_platform)
             )
+        # Profile / mastery / missing rows reuse the same custom emojis the
+        # text embed renders (operator, mastery sigil, warning) so the card
+        # icons match the bot's established identity. Each falls back to the
+        # bullet glyph inside the renderer when its emoji can't be fetched.
+        profile_emoji_bytes = await _fetch_emoji_bytes(OPERATOR_EMOJI_RAW)
+        mastery_emoji_bytes = await _fetch_emoji_bytes(MASTERY_RANK_EMOJI_RAW)
+        missing_emoji_bytes = await _fetch_emoji_bytes(WARNING_EMOJI_RAW)
 
     info_lines: list[tuple] = []
     if passed:
@@ -1286,7 +1296,9 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
                 profile_name if profile_name.startswith("Tenno #")
                 else _strip_clan_tag(profile_name)
             )
-            info_lines.append(("Profile", display_profile, None))
+            info_lines.append(
+                ("Profile", display_profile, profile_emoji_bytes)
+            )
         if member_platform:
             info_lines.append(
                 ("Platform", member_platform, platform_emoji_bytes)
@@ -1299,10 +1311,12 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
             mr_value = mastery_rank
             if mr_value.upper().startswith("MR "):
                 mr_value = mr_value[3:].strip()
-            info_lines.append(("Mastery Rank", mr_value, None))
+            info_lines.append(
+                ("Mastery Rank", mr_value, mastery_emoji_bytes)
+            )
         if pass_missing:
             info_lines.append(
-                ("Missing Data", ", ".join(pass_missing), None)
+                ("Missing Data", ", ".join(pass_missing), missing_emoji_bytes)
             )
 
     # Render the progress card once; both pass and incomplete embeds attach it.
@@ -2836,14 +2850,23 @@ async def status_cmd(interaction: discord.Interaction) -> None:
 # and inline text overlay so a single PNG carries the whole message.
 _PROGRESS_CARD_W = 860
 _PROGRESS_CARD_H = 160
-_PROGRESS_BG = (30, 31, 34)            # #1E1F22 Discord dark
-_PROGRESS_BG_EDGE = (24, 25, 28)       # subtle inner shadow
-_PROGRESS_TRACK = (43, 45, 49)         # #2B2D31
-_PROGRESS_FILL_START = (93, 208, 243)  # cyan
+_PROGRESS_RADIUS = 24                   # rounded panel corners
+# Warframe-inspired slate panel: a faint vertical gradient from a lighter
+# top to a darker base gives the card depth instead of a flat fill.
+_PROGRESS_BG_TOP = (38, 41, 47)        # lighter slate (top edge)
+_PROGRESS_BG = (30, 31, 34)            # #1E1F22 base panel
+_PROGRESS_BG_BOTTOM = (21, 22, 25)     # darker slate (bottom edge)
+_PROGRESS_BG_EDGE = (18, 19, 22)       # dividers / inner shadow
+_PROGRESS_BORDER = (58, 62, 70)        # crisp outer hairline
+_PROGRESS_TRACK = (43, 45, 49)         # #2B2D31 bar track
+_PROGRESS_TRACK_EDGE = (24, 25, 28)    # track rim for definition
+_PROGRESS_FILL_START = (93, 208, 243)  # Warframe energy cyan
 _PROGRESS_FILL_END = (134, 230, 168)   # mint — gradient end
-_PROGRESS_FILL_GOLD = (212, 168, 87)   # gold for finished bars
+_PROGRESS_FILL_GOLD = (208, 162, 80)   # Orokin gold for finished bars
+_PROGRESS_FILL_GOLD_END = (240, 214, 140)  # warm gold highlight end
 _PROGRESS_TEXT = (236, 238, 240)
 _PROGRESS_MUTED = (163, 166, 170)
+_PROGRESS_ACCENT = (212, 168, 87)      # gold accent (footer / pct)
 _PROGRESS_AVATAR_SIZE = 112
 _PROGRESS_AVATAR_RING = (212, 168, 87)
 
@@ -2872,6 +2895,32 @@ def _load_font_cached(size: int, bold: bool) -> ImageFont.FreeTypeFont:
         except OSError:
             continue
     return ImageFont.load_default()  # type: ignore[return-value]
+
+
+def _vertical_gradient(
+    width: int, height: int,
+    top: tuple[int, int, int], bottom: tuple[int, int, int],
+) -> Image.Image:
+    """Return an RGBA image filled with a top→bottom colour gradient."""
+    t = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None]  # (h, 1)
+    top_a = np.array(top, dtype=np.float32)[None, :]              # (1, 3)
+    bot_a = np.array(bottom, dtype=np.float32)[None, :]           # (1, 3)
+    col = top_a + (bot_a - top_a) * t                            # (h, 3)
+    arr = np.empty((height, width, 4), dtype=np.uint8)
+    arr[..., :3] = col[:, None, :].astype(np.uint8)
+    arr[..., 3] = 255
+    return Image.fromarray(arr, mode="RGBA")
+
+
+def _rounded_mask(width: int, height: int, radius: int) -> Image.Image:
+    """Antialiased rounded-rectangle alpha mask (rendered at 4x)."""
+    scale = 4
+    mask = Image.new("L", (width * scale, height * scale), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, width * scale - 1, height * scale - 1),
+        radius=radius * scale, fill=255,
+    )
+    return mask.resize((width, height), Image.LANCZOS)
 
 
 def _circular_avatar(
@@ -2936,8 +2985,14 @@ def _gradient_bar(
     """Render the rounded progress bar with a horizontal colour gradient."""
     bar = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     radius = height // 2
-    ImageDraw.Draw(bar).rounded_rectangle(
+    bar_draw = ImageDraw.Draw(bar)
+    bar_draw.rounded_rectangle(
         (0, 0, width - 1, height - 1), radius=radius, fill=_PROGRESS_TRACK
+    )
+    # Track rim for definition against the panel.
+    bar_draw.rounded_rectangle(
+        (0, 0, width - 1, height - 1), radius=radius,
+        outline=_PROGRESS_TRACK_EDGE + (255,), width=1,
     )
     if progress <= 0:
         return bar
@@ -2945,7 +3000,7 @@ def _gradient_bar(
     fill_w = max(height, int(round(width * progress)))
 
     if complete:
-        start, end = _PROGRESS_FILL_GOLD, _PROGRESS_FILL_END
+        start, end = _PROGRESS_FILL_GOLD, _PROGRESS_FILL_GOLD_END
     else:
         start, end = _PROGRESS_FILL_START, _PROGRESS_FILL_END
 
@@ -2968,6 +3023,15 @@ def _gradient_bar(
         (0, 0, fill_w - 1, height - 1), radius=radius, fill=255
     )
     bar.paste(grad, (0, 0), fill_mask)
+
+    # Glossy sheen: a white overlay whose alpha fades top→bottom, clipped
+    # to the filled (rounded) region so the bar reads as a glassy capsule.
+    fm = np.asarray(fill_mask, dtype=np.float32) / 255.0          # (h, fill_w)
+    col_a = np.linspace(78.0, 0.0, height, dtype=np.float32)      # top→bottom
+    sheen = np.zeros((height, fill_w, 4), dtype=np.uint8)
+    sheen[..., :3] = 255
+    sheen[..., 3] = np.clip(col_a[:, None] * fm, 0, 255).astype(np.uint8)
+    bar.alpha_composite(Image.fromarray(sheen, mode="RGBA"))
     return bar
 
 
@@ -3010,11 +3074,19 @@ def _render_progress_card_png(
     card_h = _PROGRESS_CARD_H + info_block_h
 
     canvas = Image.new(
-        "RGBA", (_PROGRESS_CARD_W, card_h), _PROGRESS_BG + (255,)
+        "RGBA", (_PROGRESS_CARD_W, card_h), (0, 0, 0, 0)
     )
+    # Slate panel: vertical gradient clipped to rounded, transparent
+    # corners so the card blends into Discord's message background.
+    panel = _vertical_gradient(
+        _PROGRESS_CARD_W, card_h, _PROGRESS_BG_TOP, _PROGRESS_BG_BOTTOM
+    )
+    panel_mask = _rounded_mask(_PROGRESS_CARD_W, card_h, _PROGRESS_RADIUS)
+    canvas.paste(panel, (0, 0), panel_mask)
+    # Crisp hairline border tracing the rounded panel edge.
     ImageDraw.Draw(canvas).rounded_rectangle(
         (0, 0, _PROGRESS_CARD_W - 1, card_h - 1),
-        radius=22, outline=_PROGRESS_BG_EDGE + (255,), width=2,
+        radius=_PROGRESS_RADIUS, outline=_PROGRESS_BORDER + (255,), width=2,
     )
 
     pad = 22
@@ -3064,11 +3136,19 @@ def _render_progress_card_png(
     )
 
     pct_label = f"{int(round(progress * 100))}%"
+    pct_prefix = "PROGRESS  \u2022  "
     draw.text(
         (text_x, 64),
-        f"PROGRESS  \u2022  {pct_label}",
+        pct_prefix,
         font=label_font,
         fill=_PROGRESS_MUTED,
+    )
+    prefix_w = draw.textlength(pct_prefix, font=label_font)
+    draw.text(
+        (text_x + prefix_w, 64),
+        pct_label,
+        font=label_font,
+        fill=_PROGRESS_ACCENT if complete else _PROGRESS_TEXT,
     )
 
     bar_h = 22
@@ -3169,7 +3249,9 @@ def _render_progress_card_png(
             row_y += row_h
 
     buf = io.BytesIO()
-    canvas.convert("RGB").save(buf, format="PNG", optimize=True)
+    # Keep the alpha channel so the rounded corners stay transparent and
+    # blend into Discord's message background instead of showing as black.
+    canvas.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
 
