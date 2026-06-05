@@ -4451,9 +4451,15 @@ async def profile_cmd(
             )
         # Nudge the member toward the help channel for any unearned
         # Platform / Mastery Rank / Syndicate via "Assign <category>" link
-        # buttons, sharing the message's single view with the editor.
-        assign_buttons = _assign_role_buttons(
-            interaction.guild, _missing_assignable_categories(info)
+        # buttons, sharing the message's single view with the editor. Only
+        # shown on your OWN profile — there's nothing to self-assign on
+        # someone else's card.
+        assign_buttons = (
+            _assign_role_buttons(
+                interaction.guild, _missing_assignable_categories(info)
+            )
+            if target.id == interaction.user.id
+            else []
         )
         if assign_buttons:
             if view is None:
