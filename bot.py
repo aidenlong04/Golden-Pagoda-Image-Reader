@@ -4396,6 +4396,111 @@ class _MasteryEditorView(discord.ui.View):
                 )
 
 
+class _InGameNameModal(discord.ui.Modal):
+    """Modal that lets a member type the in-game name the verification/OCR
+    flow never pulled for them.
+
+    On submit we persist the handle to the durable member store, re-render
+    the /profile card (the headline becomes the handle), drop the prompt
+    button, and edit the message in place.
+    """
+
+    def __init__(
+        self, *, member: discord.Member, avatar_bytes: bytes | None,
+        display_name: str, source_view: "discord.ui.View | None",
+        source_button: "discord.ui.Button | None",
+    ) -> None:
+        super().__init__(title="Set Your In-Game Name", timeout=300)
+        self._gp_member = member
+        self._gp_avatar_bytes = avatar_bytes
+        self._gp_display_name = display_name
+        self._gp_source_view = source_view
+        self._gp_source_button = source_button
+        self.name_input = discord.ui.TextInput(
+            label="Warframe in-game name",
+            placeholder="e.g. PlayerName",
+            min_length=1,
+            max_length=32,
+            required=True,
+        )
+        self.add_item(self.name_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        name = str(self.name_input.value or "").strip()
+        if not name:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.defer()
+            return
+        member = self._gp_member
+        await asyncio.to_thread(
+            analytics.upsert_member_profile,
+            guild_id=member.guild.id,
+            user_id=member.id,
+            in_game_name=name,
+        )
+        info = await _member_profile_info_lines(member)
+        png = await asyncio.to_thread(
+            _render_profile_card_png,
+            avatar_bytes=self._gp_avatar_bytes,
+            display_name=self._gp_display_name,
+            info_lines=info,
+            in_game_name=name,
+        )
+        # The handle is recorded now, so drop the prompt button. Keep a
+        # mastery editor's cached headline in sync so a later rank edit
+        # doesn't revert to the (blank) name.
+        view = self._gp_source_view
+        if view is not None:
+            if self._gp_source_button is not None:
+                with contextlib.suppress(ValueError):
+                    view.remove_item(self._gp_source_button)
+            if hasattr(view, "in_game_name"):
+                view.in_game_name = name
+        await interaction.response.edit_message(
+            attachments=[
+                discord.File(io.BytesIO(png), filename="profile.png")
+            ],
+            view=view,
+        )
+
+
+class _SetInGameNameButton(discord.ui.Button):
+    """Prompt button on a member's own /profile card, shown only when the
+    verification/OCR flow never pulled an in-game name. Opens
+    ``_InGameNameModal``."""
+
+    def __init__(
+        self, *, member: discord.Member, owner_id: int,
+        avatar_bytes: bytes | None, display_name: str,
+    ) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.primary,
+            label="Set In-Game Name",
+        )
+        # Non-reserved names: discord.py's Item._run_checks recurses through
+        # ``_parent``; clobbering it (or ``_view``) breaks dispatch.
+        self._gp_member = member
+        self._gp_owner_id = owner_id
+        self._gp_avatar_bytes = avatar_bytes
+        self._gp_display_name = display_name
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self._gp_owner_id:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "These controls aren't yours.", ephemeral=True
+                )
+            return
+        modal = _InGameNameModal(
+            member=self._gp_member,
+            avatar_bytes=self._gp_avatar_bytes,
+            display_name=self._gp_display_name,
+            source_view=self.view,
+            source_button=self,
+        )
+        await interaction.response.send_modal(modal)
+
+
 def _can_use_profile(member: discord.Member) -> bool:
     """Return True when ``member`` may run /profile.
 
@@ -4499,6 +4604,18 @@ async def profile_cmd(
                 view = discord.ui.View(timeout=None)
             for btn in assign_buttons:
                 view.add_item(btn)
+        # If the verification/OCR flow never pulled this member's in-game
+        # name, give them a button to record it themselves (own profile
+        # only). The modal persists it and drops the button once set.
+        if target.id == interaction.user.id and not in_game_name:
+            if view is None:
+                view = discord.ui.View(timeout=300)
+            view.add_item(_SetInGameNameButton(
+                member=target,
+                owner_id=interaction.user.id,
+                avatar_bytes=avatar_bytes,
+                display_name=display_name,
+            ))
         if view is not None:
             send_kwargs["view"] = view
         await interaction.followup.send(**send_kwargs)
