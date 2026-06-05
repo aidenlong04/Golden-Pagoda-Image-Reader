@@ -3532,11 +3532,11 @@ def _draw_feature_row(
     canvas: Image.Image, *, x: int, cy: int, right_edge: int,
     label: str, value: str, emoji_bytes: bytes | None, scale: int,
 ) -> None:
-    """Render one headline profile field (Clan / Mastery Rank) as a
-    full-width "[icon] Label: Value" row, stacked vertically beneath the
-    header. Larger than the reference-grid cells below it but in the same
-    visual language — no tile/bar background. ``x``/``cy``/``right_edge``
-    are supersampled pixels; ``scale`` keeps fonts and icons proportional.
+    """Render the headline Mastery Rank field as a full-width "[icon]
+    Label: Value" row beneath the header, in the same text size and
+    visual language as the reference-grid cells below it (no tile/bar
+    background). ``x``/``cy``/``right_edge`` are supersampled pixels;
+    ``scale`` keeps fonts and icons proportional.
     """
     s = scale
 
@@ -3544,10 +3544,10 @@ def _draw_feature_row(
         return int(round(v * s))
 
     draw = ImageDraw.Draw(canvas)
-    label_font = _load_font(sc(18), bold=True)
-    value_font = _load_font(sc(21), bold=True)
-    icon_px = sc(26)
-    icon_gap = sc(10)
+    label_font = _load_font(sc(16), bold=True)
+    value_font = _load_font(sc(18), bold=True)
+    icon_px = sc(22)
+    icon_gap = sc(8)
 
     if _paste_emoji_icon(canvas, emoji_bytes, x, cy, icon_px, label=label):
         text_x = x + icon_px + icon_gap
@@ -3589,12 +3589,12 @@ def _render_profile_card_png(
 
     A sibling of :func:`_render_progress_card_png` with the progress bar
     removed: same rounded slate panel and circular avatar under a gold
-    "USER PROFILE" eyebrow above the member name. The headline Clan /
-    Mastery Rank fields are stacked vertically as prominent rows beneath
-    the header (no tile/bar background); any remaining fields (Platform,
-    Syndicate) flow into the shared two-column reference grid
-    (:func:`_draw_info_grid`) below a divider. ``info_lines`` are
-    ``(label, value)`` or ``(label, value, emoji_png_bytes)`` rows.
+    "USER PROFILE" eyebrow above the member name. The Clan is shown as a
+    gold callout on the right of the header (mirroring the name block);
+    the Mastery Rank sits as a full-width row beneath the header, and any
+    remaining fields (Platform, Syndicate) flow into the shared two-column
+    reference grid (:func:`_draw_info_grid`) below a divider. ``info_lines``
+    are ``(label, value)`` or ``(label, value, emoji_png_bytes)`` rows.
     Rendered at ``_PROGRESS_SS``x for crisp HiDPI output.
     """
     s = _PROGRESS_SS
@@ -3614,16 +3614,18 @@ def _render_profile_card_png(
     # Header zone holds the avatar + eyebrow + name.
     header_h = 118
 
-    # Promote the headline Clan / Mastery Rank fields into prominent rows
-    # stacked vertically beneath the header (no tile/bar background).
-    # Everything else (Platform, Syndicate) flows into the reference grid
-    # at the bottom.
-    _FEATURED = ("Clan", "Mastery Rank")
+    # The headline Clan field becomes a gold callout on the right of the
+    # header (mirroring the USER PROFILE / name block). Mastery Rank stays
+    # as a prominent row beneath the header; everything else (Platform,
+    # Syndicate) flows into the reference grid at the bottom.
+    clan_row = next((r for r in norm_rows if r[0] == "Clan"), None)
+    _FEATURED = ("Mastery Rank",)
     featured = [r for r in norm_rows if r[0] in _FEATURED]
-    featured.sort(key=lambda r: _FEATURED.index(r[0]))
-    remaining = [r for r in norm_rows if r[0] not in _FEATURED]
+    remaining = [
+        r for r in norm_rows if r[0] not in _FEATURED and r[0] != "Clan"
+    ]
 
-    feat_row_h = 40
+    feat_row_h = 36
     feat_top = header_h + 6
     feat_bottom = (
         feat_top + len(featured) * feat_row_h if featured else header_h
@@ -3675,6 +3677,49 @@ def _render_profile_card_png(
     # Centre the eyebrow + name as a group on the header's vertical
     # midline so the avatar and text read as one balanced row.
     cy = sc(header_h) // 2
+
+    # Clan callout on the right of the header, in the gold "complete"
+    # text colour — mirrors the USER PROFILE / name block on the left.
+    name_right_bound = right_x
+    if clan_row is not None:
+        clan_label_font = _load_font(sc(12), bold=True)
+        clan_value_font = _load_font(sc(22), bold=True)
+        c_icon_px = sc(24)
+        c_gap = sc(9)
+        clan_val = clan_row[1] or "\u2014"
+        clan_emoji = clan_row[2]
+        # Budget the callout to the right ~45% of the header so a long
+        # clan name can't crowd the member name; ellipsize to fit.
+        clan_budget = int((right_x - text_x) * 0.45)
+        icon_w = c_icon_px + c_gap if clan_emoji else 0
+        max_clan_w = clan_budget - icon_w
+        if draw.textlength(clan_val, font=clan_value_font) > max_clan_w:
+            while clan_val and draw.textlength(
+                clan_val + "\u2026", font=clan_value_font
+            ) > max_clan_w:
+                clan_val = clan_val[:-1]
+            clan_val = clan_val + "\u2026"
+        clan_text_w = draw.textlength(clan_val, font=clan_value_font)
+        block_left = int(right_x - icon_w - clan_text_w)
+        draw.text(
+            (right_x, cy - sc(13)), "CLAN", font=clan_label_font,
+            fill=_PROGRESS_MUTED, anchor="rm",
+        )
+        if clan_emoji and _paste_emoji_icon(
+            canvas, clan_emoji, block_left, cy + sc(10), c_icon_px,
+            label="Clan",
+        ):
+            draw.text(
+                (block_left + c_icon_px + c_gap, cy + sc(10)), clan_val,
+                font=clan_value_font, fill=_PROGRESS_ACCENT, anchor="lm",
+            )
+        else:
+            draw.text(
+                (right_x, cy + sc(10)), clan_val, font=clan_value_font,
+                fill=_PROGRESS_ACCENT, anchor="rm",
+            )
+        name_right_bound = block_left - sc(20)
+
     eyebrow = "USER PROFILE"
     draw.text(
         (text_x, cy - sc(13)), eyebrow, font=eyebrow_font,
@@ -3682,7 +3727,7 @@ def _render_profile_card_png(
     )
 
     name = display_name or "Member"
-    max_name_w = right_x - text_x
+    max_name_w = name_right_bound - text_x
     if draw.textlength(name, font=name_font) > max_name_w:
         while name and draw.textlength(
             name + "\u2026", font=name_font
@@ -3694,9 +3739,8 @@ def _render_profile_card_png(
         fill=_PROGRESS_TEXT, anchor="lm",
     )
 
-    # Featured Clan / Mastery Rank fields stacked vertically beneath the
-    # header (where the progress bar lives on the /progress card), aligned
-    # with the reference grid's left edge below.
+    # Mastery Rank row beneath the header (where the progress bar lives on
+    # the /progress card), aligned with the reference grid's left edge.
     if featured:
         feat_left = sc(pad) + sc(8)
         feat_right = W - sc(pad) - sc(8)
