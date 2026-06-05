@@ -77,8 +77,9 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
 
     def test_pass_components_with_progress_card_keeps_button(self):
         """With a progress card attached, the Pick Roles link button must
-        still be present (regression: it used to be dropped when there was
-        no nickname suggestion to host it)."""
+        still be present, wrapped inside the V2 container alongside the
+        card image (regression: the button used to be dropped when there
+        was no nickname suggestion to host it)."""
         result = self.bot_module._pass_components(
             profile="Tenno #465",
             clan="Golden Tenno",
@@ -87,18 +88,27 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
             ],
             progress_attachment="progress.png",
         )
-        # The media gallery (type 12) carries the card image.
+
+        def _walk(components):
+            for comp in components:
+                yield comp
+                if comp.get("type") in (1, 17):
+                    yield from _walk(comp.get("components") or [])
+
+        nodes = list(_walk(result))
+        # The card image lives in a media gallery (type 12) inside the
+        # gold V2 container (type 17).
         self.assertTrue(
-            any(c.get("type") == 12 for c in result),
+            any(c.get("type") == 17 for c in result),
+            "expected a top-level type:17 container",
+        )
+        self.assertTrue(
+            any(c.get("type") == 12 for c in nodes),
             "expected the progress card media gallery",
         )
-        # A top-level action row (type 1) must carry the link button.
+        # A link button (style 5) must be present inside the container.
         link_buttons = [
-            btn
-            for top in result
-            if top.get("type") == 1
-            for btn in (top.get("components") or [])
-            if btn.get("style") == 5 and btn.get("url")
+            c for c in nodes if c.get("style") == 5 and c.get("url")
         ]
         self.assertTrue(
             link_buttons, "Pick Roles link button missing from pass card"

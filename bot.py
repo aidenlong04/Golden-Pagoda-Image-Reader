@@ -1635,6 +1635,29 @@ def _emoji_to_button_payload(raw: str) -> dict | None:
 PICK_ROLES_EMOJI_PAYLOAD = _emoji_to_button_payload(PICK_ROLES_EMOJI_RAW)
 
 
+def _link_button(label: str, url: str) -> dict:
+    """Build a Components V2 Link button (style 5), attaching the
+    "Pick Roles" custom emoji when configured so every entry point
+    renders it consistently."""
+    btn: dict = {"type": 2, "style": 5, "label": label, "url": url}
+    if label == "Pick Roles" and PICK_ROLES_EMOJI_PAYLOAD is not None:
+        btn["emoji"] = PICK_ROLES_EMOJI_PAYLOAD
+    return btn
+
+
+def _link_button_row(
+    link_buttons: list[tuple[str, str]] | None,
+) -> dict | None:
+    """Build a single action row (type 1) of Link buttons, capped at
+    Discord's 5-per-row limit, or None when there are none to render."""
+    if not link_buttons:
+        return None
+    return {
+        "type": 1,
+        "components": [_link_button(lbl, url) for lbl, url in link_buttons[:5]],
+    }
+
+
 def _pass_components(
     profile: str,
     clan: str | None,
@@ -1685,42 +1708,32 @@ def _pass_components(
 
     # When a progress card is attached the bullet list (profile / clan /
     # mastery / missing) is rendered INTO the PNG, so the message is just
-    # the image plus a "Pick Roles" Link button. The button is rendered
-    # as a top-level action row here so it ALWAYS sends — previously it
-    # was threaded into the nickname prompt, which is skipped when OCR
-    # falls back to "Tenno #N" (no in-game name to suggest), silently
-    # dropping the button. The legacy V2 container below is only the
-    # fallback for when the avatar fetch or render fails.
+    # the image plus a "Pick Roles" Link button — both wrapped in a
+    # gold-accented V2 container so the button lives INSIDE the embed.
+    # Keeping the button on the card (rather than threading it into the
+    # nickname prompt) means it ALWAYS sends, even when OCR falls back to
+    # "Tenno #N" and there's no in-game name to host it.
     if progress_attachment:
-        top: list[dict] = [{
+        card_children: list[dict] = [{
             "type": 12,
             "items": [{"media": {"url": f"attachment://{progress_attachment}"}}],
         }]
-        gallery_buttons: list[dict] = []
-        for label, url in (link_buttons or []):
-            btn = {"type": 2, "style": 5, "label": label, "url": url}
-            if label == "Pick Roles" and PICK_ROLES_EMOJI_PAYLOAD is not None:
-                btn["emoji"] = PICK_ROLES_EMOJI_PAYLOAD
-            gallery_buttons.append(btn)
-        if gallery_buttons:
-            top.append({"type": 1, "components": gallery_buttons[:5]})
-        return top
+        button_row = _link_button_row(link_buttons)
+        if button_row:
+            card_children.append(button_row)
+        return [{
+            "type": 17,
+            "accent_color": ACCENT_PASS,
+            "components": card_children,
+        }]
 
     # Fallback path (no progress card): render the legacy V2 container
     # with the bullet list and Pick Roles action row so the user still
     # sees their verification result.
     container_children: list[dict] = [{"type": 10, "content": inner}]
-    action_row_buttons: list[dict] = []
-    for label, url in (link_buttons or []):
-        btn: dict = {"type": 2, "style": 5, "label": label, "url": url}
-        if label == "Pick Roles" and PICK_ROLES_EMOJI_PAYLOAD is not None:
-            btn["emoji"] = PICK_ROLES_EMOJI_PAYLOAD
-        action_row_buttons.append(btn)
-    if action_row_buttons:
-        container_children.append({
-            "type": 1,
-            "components": action_row_buttons[:5],
-        })
+    button_row = _link_button_row(link_buttons)
+    if button_row:
+        container_children.append(button_row)
 
     container = {
         "type": 17,
@@ -1810,15 +1823,9 @@ def _incomplete_components(
             "type": 12,
             "items": [{"media": {"url": image_url}}],
         })
-    if link_buttons:
-        # Discord caps action rows at 5 buttons; we never exceed that here.
-        children.append({
-            "type": 1,
-            "components": [
-                {"type": 2, "style": 5, "label": label, "url": url}
-                for label, url in link_buttons[:5]
-            ],
-        })
+    button_row = _link_button_row(link_buttons)
+    if button_row:
+        children.append(button_row)
     container = {
         "type": 17,
         "accent_color": ACCENT_INCOMPLETE,
@@ -1967,10 +1974,7 @@ def _nickname_prompt_components(
         _btn(ingame_label, yes_id, NICK_PROMPT_INGAME_EMOJI_ID),
     ]
     for lbl, url in (link_buttons or []):
-        link_btn: dict = {"type": 2, "style": 5, "label": lbl, "url": url}
-        if lbl == "Pick Roles" and PICK_ROLES_EMOJI_PAYLOAD is not None:
-            link_btn["emoji"] = PICK_ROLES_EMOJI_PAYLOAD
-        row_buttons.append(link_btn)
+        row_buttons.append(_link_button(lbl, url))
 
     return [
         {
@@ -3441,14 +3445,10 @@ def _progress_components(
         {"type": 10, "content": body},
         {"type": 10, "content": f"-# Progress: {have}/{total}"},
     ]
-    if link_buttons and not complete:
-        container_children.append({
-            "type": 1,
-            "components": [
-                {"type": 2, "style": 5, "label": label, "url": url}
-                for label, url in link_buttons[:5]
-            ],
-        })
+    if not complete:
+        button_row = _link_button_row(link_buttons)
+        if button_row:
+            container_children.append(button_row)
     return [header, {
         "type": 17, "accent_color": accent,
         "components": container_children,
