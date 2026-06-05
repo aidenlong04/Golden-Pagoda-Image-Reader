@@ -2864,7 +2864,6 @@ async def status_cmd(interaction: discord.Interaction) -> None:
 # member's avatar (circular, left) with a rounded gradient progress bar
 # and inline text overlay so a single PNG carries the whole message.
 _PROGRESS_CARD_W = 860
-_PROGRESS_CARD_H = 160
 _PROGRESS_RADIUS = 24                   # rounded panel corners
 # Warframe-inspired slate panel: a faint vertical gradient from a lighter
 # top to a darker base gives the card depth instead of a flat fill.
@@ -2882,6 +2881,7 @@ _PROGRESS_FILL_GOLD_END = (240, 214, 140)  # warm gold highlight end
 _PROGRESS_TEXT = (236, 238, 240)
 _PROGRESS_MUTED = (163, 166, 170)
 _PROGRESS_ACCENT = (212, 168, 87)      # gold accent (footer / pct)
+_PROGRESS_MISSING = (236, 170, 92)     # amber — 'missing data' callout
 _PROGRESS_AVATAR_SIZE = 112
 _PROGRESS_AVATAR_RING = (212, 168, 87)
 # Supersample factor: the card is laid out in logical units then rendered
@@ -3003,103 +3003,154 @@ def _circular_avatar(
             src.close()
 
 
-def _gradient_bar(
-    width: int, height: int, progress: float, *, complete: bool,
-    scale: int = 1,
+def _segmented_bar(
+    width: int, height: int, count: int, target: int, *,
+    complete: bool, scale: int = 1,
 ) -> Image.Image:
-    """Render the capsule progress bar.
+    """Render a segmented progress bar: one rounded segment per
+    verification category.
 
-    Design: a fully-rounded (oval-ended) track with an inset top shadow,
-    a horizontally-graded fill that carries a top→bottom shading blend
-    (glassy tube), a soft top gloss band, a traced brighter outline, and
-    a leading-edge energy glow at the fill tip. ``scale`` widens the
-    hairline/outline strokes so they stay proportional when the whole
-    card is supersampled.
+    The first ``count`` segments carry the glassy energy gradient (gold
+    when complete) cropped from a single full-width fill so the light
+    flows continuously across the bar; the remaining segments are
+    recessed track with a faint amber "pending" tint so unmet categories
+    read as outstanding. Small gaps separate the segments, and the last
+    filled segment gets a soft leading-edge glow while in progress.
+    ``scale`` keeps strokes proportional under supersampling.
     """
-    line_w = max(1, int(round(1.5 * scale)))
     bar = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    n = max(1, target)
+    count = max(0, min(count, n))
     radius = height // 2
-    track_mask = _rounded_mask(width, height, radius)
-    bar_draw = ImageDraw.Draw(bar)
-    bar_draw.rounded_rectangle(
-        (0, 0, width - 1, height - 1), radius=radius, fill=_PROGRESS_TRACK
-    )
-
-    # Inset top shadow: a black overlay fading top→bottom, clipped to the
-    # track, makes the empty channel read as a recessed groove.
-    tm = np.asarray(track_mask, dtype=np.float32) / 255.0
-    inset_a = np.linspace(70.0, 0.0, height, dtype=np.float32)
-    inset = np.zeros((height, width, 4), dtype=np.uint8)
-    inset[..., 3] = np.clip(inset_a[:, None] * tm, 0, 255).astype(np.uint8)
-    bar.alpha_composite(Image.fromarray(inset, mode="RGBA"))
-
-    # Track rim for definition against the panel.
-    bar_draw.rounded_rectangle(
-        (0, 0, width - 1, height - 1), radius=radius,
-        outline=_PROGRESS_TRACK_EDGE + (255,), width=line_w,
-    )
-    if progress <= 0:
-        return bar
-
-    fill_w = max(height, int(round(width * progress)))
-    full = fill_w >= width
+    line_w = max(1, int(round(1.5 * scale)))
+    gap = max(2, int(round(4 * scale)))
 
     if complete:
         start, end = _PROGRESS_FILL_GOLD, _PROGRESS_FILL_GOLD_END
     else:
         start, end = _PROGRESS_FILL_START, _PROGRESS_FILL_END
 
-    # Horizontal gradient (vectorized) with a vertical shading blend so the
-    # fill looks like a lit glass tube: brighter at the top, darker below.
-    if fill_w > 1:
-        t = np.linspace(0.0, 1.0, fill_w, dtype=np.float32)
-    else:
-        t = np.zeros(1, dtype=np.float32)
-    s = np.array(start[:3], dtype=np.float32)
-    e = np.array(end[:3], dtype=np.float32)
-    row = s + (e - s) * t[:, None]                       # (fill_w, 3)
-    base = np.repeat(row[None, :, :], height, axis=0)    # (h, fill_w, 3)
+    # Full-width glassy fill (horizontal gradient + vertical shading blend
+    # + top gloss); filled segments crop their slice so the energy flows
+    # continuously rather than restarting per segment.
+    t = np.linspace(0.0, 1.0, max(1, width), dtype=np.float32)
+    cs = np.array(start[:3], dtype=np.float32)
+    ce = np.array(end[:3], dtype=np.float32)
+    grad_row = cs + (ce - cs) * t[:, None]
+    grad_base = np.repeat(grad_row[None, :, :], height, axis=0)
     shade = np.linspace(1.16, 0.80, height, dtype=np.float32)[:, None, None]
-    shaded = np.clip(base * shade, 0, 255).astype(np.uint8)
-    grad_arr = np.empty((height, fill_w, 4), dtype=np.uint8)
-    grad_arr[..., :3] = shaded
-    grad_arr[..., 3] = 255
-    grad = Image.fromarray(grad_arr, mode="RGBA")
-
-    fill_mask = _rounded_mask(fill_w, height, radius)
-    bar.paste(grad, (0, 0), fill_mask)
-    fm = np.asarray(fill_mask, dtype=np.float32) / 255.0
-
-    # Top gloss band: white overlay fading out by ~55% height, clipped to
-    # the fill so only the upper curve catches the light.
+    fill_arr = np.empty((height, width, 4), dtype=np.uint8)
+    fill_arr[..., :3] = np.clip(grad_base * shade, 0, 255).astype(np.uint8)
+    fill_arr[..., 3] = 255
+    fill_img = Image.fromarray(fill_arr, mode="RGBA")
     gloss_a = np.linspace(118.0, 0.0, height, dtype=np.float32)
     gloss_a[int(height * 0.55):] = 0.0
-    gloss = np.zeros((height, fill_w, 4), dtype=np.uint8)
+    gloss = np.zeros((height, width, 4), dtype=np.uint8)
     gloss[..., :3] = 255
-    gloss[..., 3] = np.clip(gloss_a[:, None] * fm, 0, 255).astype(np.uint8)
-    bar.alpha_composite(Image.fromarray(gloss, mode="RGBA"))
-
-    # Leading-edge energy glow: a soft bright vertical highlight at the
-    # fill tip (only while the bar isn't full), clipped to the fill.
-    if not full:
-        cap = Image.new("RGBA", (fill_w, height), (0, 0, 0, 0))
-        cap_x = fill_w - max(2, int(round(3 * scale)))
-        ImageDraw.Draw(cap).line(
-            (cap_x, line_w, cap_x, height - line_w - 1),
-            fill=(255, 255, 255, 170), width=max(1, int(round(2 * scale))),
-        )
-        cap = cap.filter(ImageFilter.GaussianBlur(max(1, int(round(1.4 * scale)))))
-        ca = (np.asarray(cap.getchannel("A"), dtype=np.float32) * fm)
-        cap.putalpha(Image.fromarray(ca.astype(np.uint8), mode="L"))
-        bar.alpha_composite(cap)
-
-    # Trace the fill with a brighter tint of its end colour (line traced).
+    gloss[..., 3] = np.clip(gloss_a[:, None], 0, 255).astype(np.uint8)
+    fill_img.alpha_composite(Image.fromarray(gloss, mode="RGBA"))
     trace = tuple(min(255, int(c * 1.18)) for c in end[:3])
-    ImageDraw.Draw(bar).rounded_rectangle(
-        (0, 0, fill_w - 1, height - 1), radius=radius,
-        outline=trace + (220,), width=line_w,
-    )
+
+    # Empty 'pending' segments: track nudged toward amber (neutral when
+    # complete) so outstanding categories catch the eye.
+    if complete:
+        empty_fill = _PROGRESS_TRACK
+    else:
+        empty_fill = tuple(
+            int(round(tc * 0.82 + mc * 0.18))
+            for tc, mc in zip(_PROGRESS_TRACK, _PROGRESS_MISSING)
+        )
+
+    seg_w = (width - gap * (n - 1)) / n
+    last_filled = count - 1
+    for i in range(n):
+        x0 = int(round(i * (seg_w + gap)))
+        x1 = width if i == n - 1 else int(round(x0 + seg_w))
+        sw = x1 - x0
+        if sw <= 0:
+            continue
+        seg_mask = _rounded_mask(sw, height, radius)
+        if i < count:
+            bar.paste(
+                fill_img.crop((x0, 0, x0 + sw, height)), (x0, 0), seg_mask
+            )
+            # Traced brighter outline around the filled segment.
+            ImageDraw.Draw(bar).rounded_rectangle(
+                (x0, 0, x1 - 1, height - 1), radius=radius,
+                outline=trace + (220,), width=line_w,
+            )
+            # Leading-edge glow on the last filled segment while in progress.
+            if not complete and i == last_filled and count < n:
+                glow = Image.new("RGBA", (sw, height), (0, 0, 0, 0))
+                gx = sw - max(2, int(round(3 * scale)))
+                ImageDraw.Draw(glow).line(
+                    (gx, line_w, gx, height - line_w - 1),
+                    fill=(255, 255, 255, 150),
+                    width=max(1, int(round(2 * scale))),
+                )
+                glow = glow.filter(
+                    ImageFilter.GaussianBlur(max(1, int(round(1.4 * scale))))
+                )
+                ga = np.asarray(glow.getchannel("A"), dtype=np.float32) * (
+                    np.asarray(seg_mask, dtype=np.float32) / 255.0
+                )
+                glow.putalpha(Image.fromarray(ga.astype(np.uint8), mode="L"))
+                bar.alpha_composite(glow, (x0, 0))
+        else:
+            seg_layer = Image.new("RGBA", (sw, height), (0, 0, 0, 0))
+            sd = ImageDraw.Draw(seg_layer)
+            sd.rounded_rectangle(
+                (0, 0, sw - 1, height - 1), radius=radius, fill=empty_fill
+            )
+            # Inset top shadow so the empty segment reads as a recessed groove.
+            tm = np.asarray(seg_mask, dtype=np.float32) / 255.0
+            inset_a = np.linspace(70.0, 0.0, height, dtype=np.float32)
+            inset = np.zeros((height, sw, 4), dtype=np.uint8)
+            inset[..., 3] = np.clip(
+                inset_a[:, None] * tm, 0, 255
+            ).astype(np.uint8)
+            seg_layer.alpha_composite(Image.fromarray(inset, mode="RGBA"))
+            sd.rounded_rectangle(
+                (0, 0, sw - 1, height - 1), radius=radius,
+                outline=_PROGRESS_TRACK_EDGE + (255,), width=line_w,
+            )
+            bar.alpha_composite(seg_layer, (x0, 0))
+
     return bar
+
+
+def _paste_emoji_icon(
+    canvas: Image.Image, emoji_bytes: bytes | None,
+    x: int, cy: int, icon_px: int, *, label: str = "",
+) -> bool:
+    """Composite an emoji PNG onto ``canvas`` with its left edge at ``x``
+    and vertically centred on ``cy``.
+
+    The art is aspect-preserved (``ImageOps.contain``) and centred inside
+    a square ``icon_px`` box so non-square emoji never stretch. Returns
+    True when drawn, False on empty input or a decode error so callers can
+    fall back to a bullet glyph.
+    """
+    if not emoji_bytes:
+        return False
+    try:
+        src = Image.open(io.BytesIO(emoji_bytes))
+        src.load()
+        src = src.convert("RGBA")
+        src = ImageOps.contain(src, (icon_px, icon_px), Image.LANCZOS)
+        box = Image.new("RGBA", (icon_px, icon_px), (0, 0, 0, 0))
+        box.alpha_composite(
+            src, ((icon_px - src.width) // 2, (icon_px - src.height) // 2)
+        )
+        canvas.alpha_composite(box, (x, cy - icon_px // 2))
+        box.close()
+        src.close()
+        return True
+    except Exception:
+        logger.warning(
+            "progress: emoji decode failed for %r", label, exc_info=True
+        )
+        return False
 
 
 def _render_progress_card_png(
@@ -3125,15 +3176,16 @@ def _render_progress_card_png(
     ``_PROGRESS_SS``x so text and icons stay sharp on HiDPI clients.
     """
     progress = max(0.0, min(1.0, count / target)) if target > 0 else 0.0
-    complete = count >= target
+    complete = target > 0 and count >= target
     s = _PROGRESS_SS
 
     def sc(v: float) -> int:
         return int(round(v * s))
 
     # Normalize entries to (label, value, emoji_bytes|None). The
-    # "Missing Data" line is pulled out so it can render last, slightly
-    # larger, set apart from the regular profile/clan/mastery rows.
+    # "Missing Data" line is pulled out so it can render as an amber
+    # callout pill directly beneath the bar (its contextual home) rather
+    # than as a row in the reference grid below.
     norm_rows: list[tuple[str, str, bytes | None]] = []
     missing_row: tuple[str, str, bytes | None] | None = None
     for entry in info_lines or []:
@@ -3145,24 +3197,24 @@ def _render_progress_card_png(
         else:
             norm_rows.append((label, value, emoji))
 
-    has_info = bool(norm_rows or missing_row)
-
     # Logical layout sizes (1x); everything below is scaled via sc().
     pad = 22
     row_h = 30
-    missing_h = 40
-    miss_gap = 12
-    base_h = _PROGRESS_CARD_H
+    # Fixed header zone (avatar + name + percent + bar). The avatar is
+    # centred in this zone so it never drifts as the footer/grid grow. A
+    # status line (the gold "complete" note or the amber missing-data
+    # pill) sits just beneath the bar, so reserve extra footer height
+    # only when one is shown.
+    header_h = 130
+    has_status = complete or bool(missing_row)
+    base_h = header_h + (42 if has_status else 14)
     info_block_h = 0
     # Regular rows render in two columns so the reference data spreads
     # across the full width instead of bunching on the left; the block
     # height therefore scales with the number of GRID rows (ceil(n / 2)).
     n_grid_rows = (len(norm_rows) + 1) // 2
-    if has_info:
-        info_block_h = 14 + n_grid_rows * row_h
-        if missing_row:
-            info_block_h += miss_gap + missing_h
-        info_block_h += 14
+    if norm_rows:
+        info_block_h = 14 + n_grid_rows * row_h + 14
     card_h = base_h + info_block_h
 
     W, H = sc(_PROGRESS_CARD_W), sc(card_h)
@@ -3181,7 +3233,7 @@ def _render_progress_card_png(
 
     avatar_px = sc(_PROGRESS_AVATAR_SIZE)
     avatar = _circular_avatar(avatar_bytes, avatar_px)
-    avatar_y = sc((base_h - _PROGRESS_AVATAR_SIZE) // 2)
+    avatar_y = sc((header_h - _PROGRESS_AVATAR_SIZE) // 2)
 
     # Soft drop shadow under the avatar.
     shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
@@ -3237,7 +3289,9 @@ def _render_progress_card_png(
     bar_h = sc(24)
     bar_w = right_x - text_x
     bar_y = sc(98)
-    bar = _gradient_bar(bar_w, bar_h, progress, complete=complete, scale=s)
+    bar = _segmented_bar(
+        bar_w, bar_h, count, target, complete=complete, scale=s
+    )
     # Soft drop shadow under the bar for depth.
     bshadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     ImageDraw.Draw(bshadow).rounded_rectangle(
@@ -3248,26 +3302,57 @@ def _render_progress_card_png(
     canvas.alpha_composite(bshadow)
     canvas.alpha_composite(bar, (text_x, bar_y))
 
-    # Only show a footer when the user has hit their target; the previous
-    # "X more to reach the goal" copy duplicated the bar and was noisy.
+    # Status line directly beneath the bar — the contextual home for the
+    # "what's left" message. Complete shows the gold success note; an
+    # incomplete pass with leftover categories shows an amber "Missing"
+    # pill (relocated here from a previously orphaned bottom grid row so
+    # it reads as the call to action tied to the progress bar).
+    status_y = bar_y + bar_h + sc(9)
     if complete:
         draw.text(
-            (text_x, bar_y + bar_h + sc(8)),
-            "Operator, all roles have been registered!",
-            font=footer_font,
-            fill=_PROGRESS_ACCENT,
+            (text_x, status_y),
+            "\u2605  Operator, all roles have been registered!",
+            font=footer_font, fill=_PROGRESS_ACCENT,
+        )
+    elif missing_row:
+        amber = _PROGRESS_MISSING
+        badge_font = _load_font(sc(15), bold=True)
+        badge_text = f"Missing: {missing_row[1]}"
+        b_icon_px = sc(17)
+        b_gap = sc(7)
+        b_pad_x = sc(11)
+        b_pad_y = sc(5)
+        b_asc, b_desc = badge_font.getmetrics()
+        b_has_icon = bool(missing_row[2])
+        b_content_h = max(b_icon_px if b_has_icon else 0, b_asc + b_desc)
+        b_text_w = int(draw.textlength(badge_text, font=badge_font))
+        b_content_w = (b_icon_px + b_gap if b_has_icon else 0) + b_text_w
+        badge_w = b_content_w + b_pad_x * 2
+        badge_h = b_content_h + b_pad_y * 2
+        badge = Image.new("RGBA", (badge_w, badge_h), (0, 0, 0, 0))
+        ImageDraw.Draw(badge).rounded_rectangle(
+            (0, 0, badge_w - 1, badge_h - 1), radius=badge_h // 2,
+            fill=amber + (38,), outline=amber + (175,), width=max(1, sc(1)),
+        )
+        canvas.alpha_composite(badge, (text_x, status_y))
+        cx = text_x + b_pad_x
+        cy = status_y + badge_h // 2
+        if _paste_emoji_icon(
+            canvas, missing_row[2], cx, cy, b_icon_px, label="Missing Data"
+        ):
+            cx += b_icon_px + b_gap
+        draw.text(
+            (cx, cy), badge_text, font=badge_font, fill=amber, anchor="lm",
         )
 
-    # Render the labeled info rows beneath the bar. Regular rows
-    # (profile / platform / clan / mastery) render at one size; the
-    # "Missing Data" row is rendered last, larger, and spaced apart so it
-    # reads as the call to action. Each row is "[icon]  Label: Value"
-    # with the icon aspect-preserved (no stretch) and vertically centred.
-    if has_info:
+    # Render the labeled reference rows beneath the divider in a
+    # two-column grid (profile / platform / clan / mastery). Each cell is
+    # "[icon]  Label: Value" with the icon aspect-preserved (no stretch)
+    # and vertically centred. The missing-data callout lives above, under
+    # the bar, so the grid is purely the data that was read.
+    if norm_rows:
         info_label_font = _load_font(sc(16), bold=True)
         info_value_font = _load_font(sc(18), bold=True)
-        miss_label_font = _load_font(sc(18), bold=True)
-        miss_value_font = _load_font(sc(21), bold=True)
         divider_y = sc(base_h)
         draw.line(
             [(sc(pad + 8), divider_y), (W - sc(pad + 8), divider_y)],
@@ -3285,36 +3370,9 @@ def _render_progress_card_png(
         ) -> None:
             # Draw "[icon]  Label: Value" anchored at x0, vertically
             # centred on cy and clipped/ellipsized to right_edge.
-            icon_img: Image.Image | None = None
-            if emoji_bytes:
-                try:
-                    src = Image.open(io.BytesIO(emoji_bytes))
-                    src.load()
-                    src = src.convert("RGBA")
-                    # Preserve aspect ratio (contain), then centre inside
-                    # the square box so non-square art never stretches.
-                    src = ImageOps.contain(
-                        src, (icon_px, icon_px), Image.LANCZOS
-                    )
-                    icon_img = Image.new(
-                        "RGBA", (icon_px, icon_px), (0, 0, 0, 0)
-                    )
-                    icon_img.alpha_composite(
-                        src,
-                        ((icon_px - src.width) // 2,
-                         (icon_px - src.height) // 2),
-                    )
-                    src.close()
-                except Exception:
-                    logger.warning(
-                        "progress: emoji decode failed for row %r",
-                        label, exc_info=True,
-                    )
-                    icon_img = None
-
-            if icon_img is not None:
-                canvas.alpha_composite(icon_img, (x0, cy - icon_px // 2))
-                icon_img.close()
+            if _paste_emoji_icon(
+                canvas, emoji_bytes, x0, cy, icon_px, label=label
+            ):
                 text_x0 = x0 + icon_px + icon_gap
             else:
                 bullet = "\u2022 "
@@ -3367,17 +3425,6 @@ def _render_progress_card_png(
                     info_value_font, icon_px, inner_right,
                 )
             row_y += sc(row_h)
-
-        # Missing Data spans the full width, last and larger — the card's
-        # call to action set apart from the grid above.
-        if missing_row:
-            row_y += sc(miss_gap)
-            cy = row_y + sc(missing_h) // 2
-            _draw_cell(
-                left_x, cy, missing_row[0], missing_row[1], missing_row[2],
-                miss_label_font, miss_value_font, sc(27), inner_right,
-            )
-            row_y += sc(missing_h)
 
     buf = io.BytesIO()
     # Keep the alpha channel so the rounded corners stay transparent and
