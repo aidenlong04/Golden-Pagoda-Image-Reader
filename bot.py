@@ -16,6 +16,7 @@ from collections.abc import Callable
 from datetime import timedelta
 
 from pathlib import Path
+from typing import NamedTuple
 
 # Suppress discord.py's audioop DeprecationWarning on Python 3.12. The bot
 # never uses voice, but discord.player imports audioop unconditionally and
@@ -1073,6 +1074,73 @@ def _first_image_attachment(message: discord.Message) -> discord.Attachment | No
     return None
 
 
+class _OcrProfileFields(NamedTuple):
+    """Parsed fields from OCR-ing a Warframe profile screenshot.
+
+    ``ok`` is False only when the OCR call itself raised; an OCR that ran but
+    read nothing returns ``ok=True`` with None fields. ``engine`` and
+    ``latency_ms`` are always populated so the caller can record analytics
+    even on failure.
+    """
+
+    ok: bool
+    profile_name: str | None
+    clan_name: str | None
+    mastery_rank: str | None
+    ocr_text: str
+    engine: str
+    latency_ms: int
+
+
+async def _ocr_profile_fields(
+    image_bytes: bytes, filename: str, content_type: str,
+) -> _OcrProfileFields:
+    """OCR an already-decoded profile screenshot and parse the in-game name,
+    clan name, and mastery rank from it.
+
+    A pure pipeline (no Discord I/O) shared by the channel verification flow
+    (``_process_screenshot_impl``) and the /profile self-service modal
+    (``_verify_member_from_screenshot``). The blocking OCR + title-bar
+    supplement run in worker threads so the event loop keeps servicing
+    heartbeats. The caller owns image validation (probe-decode) and every
+    response / role / analytics side effect.
+    """
+    engine = "ocr.space" if OCR_API_KEY else ("tesseract" if pytesseract else "none")
+    started = time.monotonic()
+    try:
+        # OCR involves blocking HTTP (up to 60s) and subprocess work.
+        ocr_text_raw, ocr_words, engine = await asyncio.to_thread(
+            _ocr, image_bytes, filename, content_type,
+        )
+        ocr_text = (ocr_text_raw or "").strip()
+    except Exception:
+        logger.exception("OCR failed for uploaded image")
+        return _OcrProfileFields(
+            False, None, None, None, "", engine,
+            int((time.monotonic() - started) * 1000),
+        )
+    latency_ms = int((time.monotonic() - started) * 1000)
+
+    # OCR.space often drops the small title-bar text; rerun Tesseract on the
+    # top strip to recover the PlayerName#NNN token when it's missing.
+    try:
+        ocr_text, ocr_words = await asyncio.to_thread(
+            _supplement_title_bar_ocr, image_bytes, ocr_text, ocr_words,
+        )
+    except Exception:
+        logger.exception("Title-bar OCR supplement raised")
+
+    return _OcrProfileFields(
+        True,
+        parse_profile_name(ocr_text),
+        parse_clan_name(ocr_text),
+        parse_mastery_rank(ocr_text),
+        ocr_text,
+        engine,
+        latency_ms,
+    )
+
+
 async def _process_screenshot(message: discord.Message) -> None:
     """Core screenshot verification logic. Extracted from on_message to support
     both live processing and catch-up scanning."""
@@ -1131,45 +1199,31 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
         await _fail(message, "Invalid image", "Image could not be opened. Re-upload a valid PNG/JPG.")
         return
 
-    ocr_engine = "ocr.space" if OCR_API_KEY else ("tesseract" if pytesseract else "none")
-    ocr_started = time.monotonic()
-    try:
-        # OCR involves blocking HTTP (up to 60s) and subprocess work — run it
-        # in a worker thread so the event loop keeps servicing heartbeats and
-        # other messages while a single screenshot is being verified.
-        ocr_text_raw, ocr_words, ocr_engine = await asyncio.to_thread(
-            _ocr,
-            image_bytes,
-            attachment.filename,
-            attachment.content_type or "image/png",
-        )
-        ocr_text = ocr_text_raw.strip()
-    except Exception:
-        logger.exception("OCR failed for uploaded image")
+    # OCR + title-bar supplement + field parsing is shared with the /profile
+    # self-service modal via _ocr_profile_fields.
+    fields = await _ocr_profile_fields(
+        image_bytes,
+        attachment.filename,
+        attachment.content_type or "image/png",
+    )
+    ocr_engine = fields.engine
+    ocr_latency_ms = fields.latency_ms
+    if not fields.ok:
         _spawn_bg_task(asyncio.to_thread(
             analytics.record_verification,
             outcome="ocr_error",
             ocr_engine=ocr_engine,
-            ocr_latency_ms=int((time.monotonic() - ocr_started) * 1000),
+            ocr_latency_ms=ocr_latency_ms,
             user_id=message.author.id,
             guild_id=message.guild.id,
         ))
         await _fail(message, "Not readable", "No text could be read. Upload a clearer screenshot.")
         return
-    ocr_latency_ms = int((time.monotonic() - ocr_started) * 1000)
 
-    # OCR.space often drops the small title-bar text; rerun Tesseract on the
-    # top strip to recover the PlayerName#NNN token when it's missing.
-    try:
-        ocr_text, ocr_words = await asyncio.to_thread(
-            _supplement_title_bar_ocr, image_bytes, ocr_text, ocr_words
-        )
-    except Exception:
-        logger.exception("Title-bar OCR supplement raised")
-
-    profile_name = parse_profile_name(ocr_text)
-    clan_name = parse_clan_name(ocr_text)
-    mastery_rank = parse_mastery_rank(ocr_text)
+    ocr_text = fields.ocr_text
+    profile_name = fields.profile_name
+    clan_name = fields.clan_name
+    mastery_rank = fields.mastery_rank
 
     # Fallback name when OCR can't read the profile handle: use the
     # guild's current member count as a pseudo-discriminator so the
@@ -4560,10 +4614,12 @@ async def _verify_member_from_screenshot(
     """OCR a Warframe profile screenshot and assign/store every field we can
     for ``member``: in-game name + clan role + mastery rank.
 
-    Mirrors the channel verification flow's parsing and storage (same
-    ``upsert_member_profile`` snapshot shape) but scoped to a single member's
-    self-service. Returns human-readable summary lines describing what was
-    updated; an empty list means the screenshot couldn't be read.
+    Shares the OCR + parse pipeline (``_ocr_profile_fields``) and storage
+    snapshot shape (``upsert_member_profile``) with the channel verification
+    flow, but scoped to a single member's self-service: no reactions, no
+    public reply, no verify/incomplete role gating. Returns human-readable
+    summary lines describing what was updated; an empty list means the
+    screenshot couldn't be read.
     """
     try:
         probe = Image.open(io.BytesIO(image_bytes))
@@ -4575,27 +4631,12 @@ async def _verify_member_from_screenshot(
         logger.warning("profile screenshot: invalid image", exc_info=True)
         return []
 
-    try:
-        ocr_text_raw, ocr_words, _engine = await asyncio.to_thread(
-            _ocr, image_bytes, filename, content_type,
-        )
-        ocr_text = (ocr_text_raw or "").strip()
-    except Exception:
-        logger.warning("profile screenshot: OCR failed", exc_info=True)
+    fields = await _ocr_profile_fields(image_bytes, filename, content_type)
+    if not fields.ok:
         return []
-
-    try:
-        ocr_text, ocr_words = await asyncio.to_thread(
-            _supplement_title_bar_ocr, image_bytes, ocr_text, ocr_words,
-        )
-    except Exception:
-        logger.warning(
-            "profile screenshot: title-bar supplement raised", exc_info=True
-        )
-
-    profile_name = parse_profile_name(ocr_text)
-    clan_name = parse_clan_name(ocr_text)
-    mastery_rank = parse_mastery_rank(ocr_text)
+    profile_name = fields.profile_name
+    clan_name = fields.clan_name
+    mastery_rank = fields.mastery_rank
 
     summary: list[str] = []
     store: dict = {}
