@@ -158,6 +158,9 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
             image_url=None,
         )
         self.assertIsInstance(result, list)
+        # The headline must actually surface to the user (it was previously
+        # accepted but silently dropped from the rendered message).
+        self.assertIn("Not readable", str(result))
 
 
     def test_send_v2_signature(self):

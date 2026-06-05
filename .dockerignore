@@ -10,7 +10,6 @@ __pycache__
 .env.*
 !.env.example
 tests
-scripts/ocr_test.py
 scripts/preview_responses.py
 README.md
 *.md

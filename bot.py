@@ -113,7 +113,6 @@ def _float_env(name: str, default: float = 0.0) -> float:
 
 
 TARGET_CHANNEL_ID = _int_env("TARGET_CHANNEL_ID")
-GUILD_ID = _int_env("GUILD_ID", 1361846841905381629)
 
 # Platform name → list of acceptable Discord role-name aliases (case-insensitive).
 PLATFORM_ROLE_ALIASES: dict[str, tuple[str, ...]] = {
@@ -1139,13 +1138,14 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
         ocr_text = ocr_text_raw.strip()
     except Exception:
         logger.exception("OCR failed for uploaded image")
-        analytics.record_verification(
+        _spawn_bg_task(asyncio.to_thread(
+            analytics.record_verification,
             outcome="ocr_error",
             ocr_engine=ocr_engine,
             ocr_latency_ms=int((time.monotonic() - ocr_started) * 1000),
             user_id=message.author.id,
             guild_id=message.guild.id,
-        )
+        ))
         await _fail(message, "Not readable", "No text could be read. Upload a clearer screenshot.")
         return
     ocr_latency_ms = int((time.monotonic() - ocr_started) * 1000)
@@ -1184,14 +1184,15 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
             mastery_rank,
             snippet,
         )
-        analytics.record_verification(
+        _spawn_bg_task(asyncio.to_thread(
+            analytics.record_verification,
             outcome="unreadable",
             clan=clan_name,
             ocr_engine=ocr_engine,
             ocr_latency_ms=ocr_latency_ms,
             user_id=message.author.id,
             guild_id=message.guild.id,
-        )
+        ))
         await _fail(
             message,
             "Profile not found",
@@ -1730,11 +1731,10 @@ def _pass_components(
         clan_part,
     ]
     if mastery_rank:
-        # mastery_rank is "MR <N>" or "Unranked"; surface just the value
-        # so the bullet reads "Mastery Rank: `12`" / "Mastery Rank: `Unranked`".
-        mr_value = mastery_rank
-        if mr_value.upper().startswith("MR "):
-            mr_value = mr_value[3:].strip()
+        # The "Mastery Rank" label already names the field, so drop the
+        # redundant "MR "/"LR " prefix via the shared formatter (which also
+        # expands Legendary ranks, e.g. "LR 3" -> "Legendary 3").
+        mr_value = _format_mastery_display(mastery_rank)
         mr_prefix = f"{MASTERY_RANK_EMOJI_RAW} " if MASTERY_RANK_EMOJI_RAW else ""
         inner_lines.append(f"> * -# {mr_prefix}Mastery Rank: `{mr_value}`")
     if missing_categories:
@@ -1762,7 +1762,7 @@ def _fail_components(headline: str, reason: str, *, image_url: str | None = None
         "content": "> Verification Failed",
     }
     children: list[dict] = [
-        {"type": 10, "content": f"-# {reason}"},
+        {"type": 10, "content": f"### {headline}\n-# {reason}"},
     ]
     if image_url:
         children.append(
@@ -2628,9 +2628,7 @@ def _status_page_bot(_interaction: discord.Interaction, _snap: dict) -> str:
     )
 
 
-def _status_page_roles_split(
-    interaction: discord.Interaction,
-) -> tuple[str, str]:
+def _status_page_roles_split() -> tuple[str, str]:
     """Return (clan_slots_section, platform_roles_section).
 
     Used by `_status_components` to wedge the "Emblems" button
@@ -2819,7 +2817,7 @@ def _status_components(interaction: discord.Interaction, page: int) -> list[dict
     if key == "roles":
         # Wedge the Emblems button between Clan slots and Platform roles
         # so it lives directly under the clan listing.
-        clan_text, rest_text = _status_page_roles_split(interaction)
+        clan_text, rest_text = _status_page_roles_split()
         container_components = [
             {"type": 10, "content": clan_text},
             {"type": 1, "components": [

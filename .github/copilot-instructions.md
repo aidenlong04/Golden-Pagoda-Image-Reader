@@ -16,7 +16,7 @@ Discord bot ("**Oda Helper**") that OCRs Warframe profile screenshots, verifies 
 - **Server**: `5.78.211.130`, SSH user `nomekui` (NOPASSWD sudo, in `docker` group). Root login + password auth disabled.
 - **SSH keys** (in codespace): `~/.ssh/hetzner` (interactive), `~/.ssh/gha_deploy` (workflow).
 - **GitHub secrets**: `HETZNER_HOST`, `HETZNER_USER`, `HETZNER_SSH_KEY` (base64-encoded private key — workflow `base64 -d`s it).
-- **systemd unit**: `scripts/golden-pagoda.service` → `/etc/systemd/system/golden-pagoda.service`. Hardened: `--init`, `--memory=512m`, `--cpus=1`, `--pids-limit=256`, json-file log rotation (10m × 3 files), `SuccessExitStatus=0 137 143`.
+- **systemd unit**: `scripts/golden-pagoda.service` → `/etc/systemd/system/golden-pagoda.service`. Hardened: `--init`, `--memory=512m`, `--cpus=1.5`, `--pids-limit=256`, json-file log rotation (10m × 3 files), `SuccessExitStatus=0 137 143`.
 - **Watchdog**: `scripts/golden-pagoda-watchdog.{sh,service}` is a long-running `simple` systemd service that blocks on `docker events --filter container=golden-pagoda --filter event=health_status --filter event=die` and restarts `golden-pagoda.service` on `health_status: unhealthy` or container death. Cooldown (60s) + sliding-window cap (5 restarts / 10 min) prevent thrash. Idle CPU/RAM ~zero.
 - **Server `.env`**: `/opt/golden-pagoda/.env` (NOT in git — gitignored). The repo's local `.env` is excluded from the deploy rsync, so server is the source of truth. To update a key:
     - `scripts/ops.sh env-get KEY [KEY...]` — print current value(s) on server.
@@ -35,7 +35,7 @@ Discord bot ("**Oda Helper**") that OCRs Warframe profile screenshots, verifies 
 - `PLATFORM_EMOJI_<PC|XBOX|PLAYSTATION|SWITCH|MOBILE>` — custom Discord emojis (`<:name:id>` format).
 - `SYNDICATE_EMOJI` — custom Discord emoji (`<:name:id>`) for the Syndicate row on the `/profile` card; empty default (falls back to a bullet). Set via `scripts/ops.sh env-set SYNDICATE_EMOJI "<:name:id>"`.
 - `INCOMPLETE_ROLE_ID`, `VERIFY_REMOVE_ROLE_ID` — verification flow roles.
-- `PASS_REACTION_ID/_NAME`, `FAIL_REACTION`, `PENDING_REACTION_ID/_NAME` — reactions on the original screenshot.
+- `PASS_REACTION_ID`, `FAIL_REACTION`, `PENDING_REACTION_ID` — reactions on the original screenshot.
 - `REPLY_TTL_SECONDS` — auto-delete bot replies after N seconds.
 - `CATCHUP_LOOKBACK_HOURS` (default `24`) — how many hours of message history to scan on startup for missed screenshots.
 - `CATCHUP_STATE_PATH` (default `/app/data/catchup_state.json`) — where to persist the last-scanned message ID.
@@ -74,6 +74,6 @@ Discord bot ("**Oda Helper**") that OCRs Warframe profile screenshots, verifies 
 ## Things NOT in scope
 
 - Don't suggest Fly.io, Heroku, or other hosts — we're on Hetzner.
-- Don't add new env vars without updating both `.env.example` (if present) and the server's `/opt/golden-pagoda/.env`.
+- Don't add new env vars without updating both `.env.example` and the server's `/opt/golden-pagoda/.env`.
 - Don't commit secrets, SSH keys, or `.env`.
 - Don't remove `data/` or `icons/` from the rsync excludes — both hold runtime state owned by uid 10001 that the deploy user cannot unlink.
