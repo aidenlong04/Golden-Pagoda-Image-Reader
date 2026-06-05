@@ -281,6 +281,29 @@ class MasteryEditorHelperTests(unittest.TestCase):
         # No duplicate values across the two menus.
         self.assertEqual(len(values), len(set(values)))
 
+    def test_select_does_not_clobber_reserved_parent(self):
+        """Regression: the mastery selects must keep their editor back-ref
+        OFF discord.py's reserved ``Item._parent`` (used by
+        ``Item._run_checks`` during interaction dispatch). Clobbering it
+        with the View crashes every dropdown pick with
+        ``AttributeError: '_MasteryEditorView' object has no attribute
+        '_run_checks'``.
+        """
+        b = self.bot_module
+        view = b._MasteryEditorView(
+            member=Mock(), owner_id=123, avatar_bytes=None,
+            display_name="Tenno",
+        )
+        selects = [c for c in view.children
+                   if isinstance(c, b._MasterySelect)]
+        self.assertEqual(len(selects), 2)
+        for sel in selects:
+            # Reserved attribute must stay at the discord.py default so
+            # Item._run_checks doesn't recurse into the View.
+            self.assertIsNone(sel._parent)
+            # The editor back-reference the callback relies on is present.
+            self.assertIs(sel._editor, view)
+
     def test_mr_bucket_role_for_maps_rank_to_bucket(self):
         b = self.bot_module
 

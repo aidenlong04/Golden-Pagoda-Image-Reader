@@ -3907,16 +3907,21 @@ def _mastery_select_options() -> tuple[list, list]:
 
 
 class _MasterySelect(discord.ui.Select):
-    def __init__(self, parent: "_MasteryEditorView", *, placeholder: str,
+    def __init__(self, editor: "_MasteryEditorView", *, placeholder: str,
                  options: list) -> None:
         super().__init__(
             placeholder=placeholder, min_values=1, max_values=1,
             options=options,
         )
-        self._parent = parent
+        # NB: store the back-reference under a private name that does NOT
+        # collide with discord.py's reserved ``Item._parent`` (used by
+        # ``Item._run_checks`` for V2 layout nesting). Clobbering ``_parent``
+        # with the View breaks interaction dispatch (AttributeError: View has
+        # no ``_run_checks``).
+        self._editor = editor
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await self._parent.handle_pick(interaction, self.values[0])
+        await self._editor.handle_pick(interaction, self.values[0])
 
 
 class _MasteryEditorView(discord.ui.View):
