@@ -219,15 +219,33 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
         self.assertIsInstance(result, list)
 
     def test_render_profile_card_png_returns_png(self):
-        """_render_profile_card_png returns PNG bytes for full, partial
-        (em-dash placeholders) and empty grids without raising."""
-        rows = [
-            ("Clan", "Golden Tenno", None),
-            ("Platform", "PC", None),
-            ("Mastery Rank", "Mastery Rank 28", None),
-            ("Syndicate", "\u2014", None),
+        """_render_profile_card_png returns PNG bytes across the syndicate
+        layouts (none / one / two / three+ factions) and the legacy
+        em-dash + clan-only + empty inputs without raising."""
+        red = (176, 38, 42)
+        blue = (58, 150, 221)
+        green = (124, 185, 73)
+        base = [
+            ("Clan", "Golden Tenno", None, (212, 168, 87)),
+            ("Platform", "PlayStation", None),
+            ("Mastery Rank", "28", None),
         ]
-        for info in (rows, [("Clan", "\u2014", None)], []):
+        cases = [
+            base + [("Syndicate", [])],
+            base + [("Syndicate", [("Red Veil", red, None)])],
+            base + [("Syndicate", [
+                ("Red Veil", red, None), ("Cephalon Suda", blue, None),
+            ])],
+            base + [("Syndicate", [
+                ("Red Veil", red, None), ("Cephalon Suda", blue, None),
+                ("New Loka", green, None),
+            ])],
+            # Legacy / degenerate shapes must still render.
+            [("Clan", "\u2014", None), ("Syndicate", "\u2014", None)],
+            [("Clan", "\u2014", None)],
+            [],
+        ]
+        for info in cases:
             png = self.bot_module._render_profile_card_png(
                 avatar_bytes=None,
                 display_name="Tenno",

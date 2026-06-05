@@ -1651,6 +1651,45 @@ WARNING_EMOJI_RAW = os.getenv(
     "WARNING_EMOJI", "<:WarningStatus:1512253042270142634>"
 ).strip()
 
+# Per-faction syndicate styling for the /profile card: each canonical
+# Warframe syndicate maps to (env-key suffix, accent colour). A member's
+# syndicate role name is matched case-insensitively; the accent tints the
+# faction name on the card and an optional custom emoji is read from
+# SYNDICATE_EMOJI_<KEY> (<:name:id>). Colours are the in-game faction
+# accents and can be tweaked freely.
+_SYNDICATE_FACTIONS: dict[str, tuple[str, tuple[int, int, int]]] = {
+    "steel meridian": ("STEEL_MERIDIAN", (198, 70, 56)),
+    "arbiters of hexis": ("ARBITERS_OF_HEXIS", (200, 205, 210)),
+    "cephalon suda": ("CEPHALON_SUDA", (58, 150, 221)),
+    "the perrin sequence": ("THE_PERRIN_SEQUENCE", (38, 198, 176)),
+    "red veil": ("RED_VEIL", (176, 38, 42)),
+    "new loka": ("NEW_LOKA", (124, 185, 73)),
+}
+SYNDICATE_FACTION_EMOJIS: dict[str, str] = {
+    name: (os.getenv(f"SYNDICATE_EMOJI_{key}") or "").strip()
+    for name, (key, _color) in _SYNDICATE_FACTIONS.items()
+}
+
+
+def _syndicate_style(
+    role_name: str,
+) -> tuple[tuple[int, int, int] | None, str | None]:
+    """Map a syndicate role name to its ``(accent_colour, emoji_literal)``.
+
+    Matches ``role_name`` case-insensitively against the canonical Warframe
+    factions. Returns the faction accent + its ``SYNDICATE_EMOJI_<KEY>``
+    literal; falls back to ``(None, shared SYNDICATE_EMOJI)`` for an
+    unrecognised name so callers can apply the role's own colour + the
+    shared icon.
+    """
+    key = (role_name or "").strip().lower()
+    meta = _SYNDICATE_FACTIONS.get(key)
+    if meta is None:
+        return None, (SYNDICATE_EMOJI_RAW or None)
+    _env_key, color = meta
+    emoji = SYNDICATE_FACTION_EMOJIS.get(key) or SYNDICATE_EMOJI_RAW or None
+    return color, emoji
+
 
 def _link_button(label: str, url: str) -> dict:
     """Build a Components V2 Link button (style 5)."""
@@ -2004,14 +2043,14 @@ async def _member_profile_info_lines(
     member: discord.Member,
 ) -> list[tuple]:
     """Gather a member's role-derived verification data for the /profile
-    card: ``(label, value, emoji_bytes)`` rows for every category that is
-    *configured* on the server (Clan, Platform, Mastery Rank, Syndicate).
+    card, one entry per category configured on the server.
 
     Values come straight from the member's roles (no OCR), so the card
-    reflects exactly what they hold. A category the member hasn't earned
-    yet renders an em-dash placeholder so the grid stays balanced. The row
-    order (Clan, Platform, Mastery Rank, Syndicate) lays out row-major as
-    ``Clan | Platform`` over ``Mastery Rank | Syndicate``.
+    reflects exactly what they hold. Clan/Platform/Mastery Rank are
+    ``(label, value, emoji_bytes[, color])`` rows (an em-dash value when
+    not earned); Syndicate is special-cased to ``("Syndicate", [(name,
+    accent_rgb|None, emoji_bytes), ...])`` so the card can colour each
+    faction and show its icon. Consumed by :func:`_render_profile_card_png`.
     """
     role_ids = {r.id for r in member.roles}
     rows: list[tuple] = []
@@ -2076,16 +2115,23 @@ async def _member_profile_info_lines(
             await _fetch_emoji_bytes(MASTERY_RANK_EMOJI_RAW),
         ))
 
-    # Syndicate — members may pledge to several, so join every match.
+    # Syndicate — members may pledge to several. Emit a per-faction list of
+    # (name, accent_rgb, emoji_bytes): the canonical Warframe palette +
+    # per-faction SYNDICATE_EMOJI_<KEY>, falling back to the role's own
+    # colour + the shared SYNDICATE_EMOJI for an unrecognised name.
     if SYNDICATE_ROLE_IDS:
-        syn_names = [
-            r.name for r in member.roles if r.id in set(SYNDICATE_ROLE_IDS)
-        ]
-        rows.append((
-            "Syndicate",
-            ", ".join(syn_names) if syn_names else "\u2014",
-            await _fetch_emoji_bytes(SYNDICATE_EMOJI_RAW),
-        ))
+        syn_ids = set(SYNDICATE_ROLE_IDS)
+        factions: list[tuple] = []
+        for r in member.roles:
+            if r.id not in syn_ids:
+                continue
+            color, emoji_literal = _syndicate_style(r.name)
+            if color is None and r.color.value:
+                color = r.color.to_rgb()
+            factions.append((
+                r.name, color, await _fetch_emoji_bytes(emoji_literal),
+            ))
+        rows.append(("Syndicate", factions))
 
     return rows
 
@@ -3535,57 +3581,6 @@ def _render_progress_card_png(
     return buf.getvalue()
 
 
-def _draw_feature_row(
-    canvas: Image.Image, *, x: int, cy: int, right_edge: int,
-    label: str, value: str, emoji_bytes: bytes | None, scale: int,
-) -> None:
-    """Render the headline Mastery Rank field as a full-width "[icon]
-    Label: Value" row beneath the header in gold, at a slightly smaller
-    size than the reference-grid cells below it (no tile/bar background).
-    ``x``/``cy``/``right_edge`` are supersampled pixels; ``scale`` keeps
-    fonts and icons proportional.
-    """
-    s = scale
-
-    def sc(v: float) -> int:
-        return int(round(v * s))
-
-    draw = ImageDraw.Draw(canvas)
-    label_font = _load_font(sc(13), bold=True)
-    value_font = _load_font(sc(15), bold=True)
-    icon_px = sc(18)
-    icon_gap = sc(8)
-
-    if _paste_emoji_icon(canvas, emoji_bytes, x, cy, icon_px, label=label):
-        text_x = x + icon_px + icon_gap
-    else:
-        bullet = "\u2022 "
-        draw.text(
-            (x, cy), bullet, font=label_font,
-            fill=_PROGRESS_MUTED, anchor="lm",
-        )
-        text_x = x + int(draw.textlength(bullet, font=label_font))
-
-    label_text = f"{label}: "
-    draw.text(
-        (text_x, cy), label_text, font=label_font,
-        fill=_PROGRESS_ACCENT, anchor="lm",
-    )
-    value_x = text_x + draw.textlength(label_text, font=label_font)
-    max_value_w = right_edge - value_x
-    v = value or ""
-    if draw.textlength(v, font=value_font) > max_value_w:
-        while v and draw.textlength(
-            v + "\u2026", font=value_font
-        ) > max_value_w:
-            v = v[:-1]
-        v = v + "\u2026"
-    draw.text(
-        (value_x, cy), v, font=value_font,
-        fill=_PROGRESS_ACCENT, anchor="lm",
-    )
-
-
 def _render_profile_card_png(
     *,
     avatar_bytes: bytes | None,
@@ -3595,60 +3590,74 @@ def _render_profile_card_png(
     """Render the "user profile" card and return PNG bytes.
 
     A sibling of :func:`_render_progress_card_png` with the progress bar
-    removed: same rounded slate panel and circular avatar under a gold
-    "USER PROFILE" eyebrow above the member name. The Clan is shown as a
-    gold callout on the right of the header (mirroring the name block);
-    the Mastery Rank sits as a full-width row beneath the header, and any
-    remaining fields (Platform, Syndicate) flow into the shared two-column
-    reference grid (:func:`_draw_info_grid`) below a divider. ``info_lines``
-    are ``(label, value)`` or ``(label, value, emoji_png_bytes)`` rows.
-    Rendered at ``_PROGRESS_SS``x for crisp HiDPI output.
+    removed. The header stacks a gold "USER PROFILE" eyebrow, the member
+    name, and the platform icon (icon-only, soft glow) on the left of the
+    circular avatar, with the Clan as a gold callout on the right. Beneath
+    the header the Mastery Rank sits in a gold capsule badge, and any
+    syndicates render as faction-coloured rows (icon + name for one or
+    two, icon-only when three or more). ``info_lines`` come from
+    :func:`_member_profile_info_lines`. Rendered at ``_PROGRESS_SS``x for
+    crisp HiDPI output.
     """
     s = _PROGRESS_SS
 
     def sc(v: float) -> int:
         return int(round(v * s))
 
-    # Normalize entries to (label, value, emoji_bytes|None). The profile
-    # card has no "Missing" callout, so every row flows into the grid.
-    norm_rows: list[tuple[str, str, bytes | None]] = []
+    # Pull the categories the profile card cares about out of info_lines.
+    # Clan/Platform/Mastery are single rows; Syndicate is a per-faction
+    # list of (name, accent_rgb|None, emoji_bytes). Tolerant of legacy
+    # 3-tuple rows and a plain-string Syndicate value (older callers/tests).
+    clan_row: tuple[str, str, bytes | None] | None = None
     clan_color: tuple[int, int, int] | None = None
+    platform_row: tuple[str, str, bytes | None] | None = None
+    mastery_row: tuple[str, str, bytes | None] | None = None
+    syndicate_factions: list[tuple[str, tuple[int, int, int] | None, bytes | None]] = []
     for entry in info_lines or []:
-        emoji = entry[2] if len(entry) >= 3 else None
-        if entry[0] == "Clan" and len(entry) >= 4:
-            clan_color = entry[3]
-        norm_rows.append((entry[0], entry[1], emoji))
+        label = entry[0]
+        if label == "Clan":
+            clan_row = (label, entry[1], entry[2] if len(entry) >= 3 else None)
+            clan_color = entry[3] if len(entry) >= 4 else None
+        elif label == "Platform":
+            platform_row = (
+                label, entry[1], entry[2] if len(entry) >= 3 else None
+            )
+        elif label == "Mastery Rank":
+            mastery_row = (
+                label, entry[1], entry[2] if len(entry) >= 3 else None
+            )
+        elif label == "Syndicate" and len(entry) >= 2 and isinstance(
+            entry[1], list
+        ):
+            syndicate_factions = [
+                (str(f[0]), f[1] if len(f) >= 2 else None,
+                 f[2] if len(f) >= 3 else None)
+                for f in entry[1]
+            ]
 
     pad = 22
-    row_h = 30
-    # Header zone holds the avatar + eyebrow + name.
-    header_h = 118
+    # Header zone holds the avatar + eyebrow + name + platform icon.
+    header_h = 140
+    mr_pill_h = 32
 
-    # The headline Clan field becomes a gold callout on the right of the
-    # header (mirroring the USER PROFILE / name block). Mastery Rank stays
-    # as a prominent row beneath the header; everything else (Platform,
-    # Syndicate) flows into the reference grid at the bottom.
-    clan_row = next((r for r in norm_rows if r[0] == "Clan"), None)
-    _FEATURED = ("Mastery Rank",)
-    featured = [r for r in norm_rows if r[0] in _FEATURED]
-    remaining = [
-        r for r in norm_rows if r[0] not in _FEATURED and r[0] != "Clan"
-    ]
-
-    feat_row_h = 36
-    feat_top = header_h + 6
-    feat_bottom = (
-        feat_top + len(featured) * feat_row_h if featured else header_h
-    )
-
-    n_grid_rows = (len(remaining) + 1) // 2
-    if remaining:
-        divider_logical = feat_bottom + (14 if featured else 12)
-        info_block_h = 14 + n_grid_rows * row_h + 16
-        card_h = divider_logical + info_block_h
-    else:
-        divider_logical = None
-        card_h = feat_bottom + 16
+    # Lay out the stacked sections so the canvas height is known before we
+    # draw: header, then the optional Mastery capsule, then the optional
+    # syndicate band.
+    content_bottom = header_h
+    mr_pill_top = None
+    if mastery_row is not None:
+        mr_pill_top = header_h + 10
+        content_bottom = mr_pill_top + mr_pill_h
+    syn_top = None
+    syn_two_row_h = 26
+    syn_icon_row_h = 30
+    if syndicate_factions:
+        syn_top = content_bottom + 12
+        if len(syndicate_factions) <= 2:
+            content_bottom = syn_top + len(syndicate_factions) * syn_two_row_h
+        else:
+            content_bottom = syn_top + syn_icon_row_h
+    card_h = content_bottom + 16
 
     W, H = sc(_PROGRESS_CARD_W), sc(card_h)
     canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -3684,17 +3693,28 @@ def _render_profile_card_png(
     eyebrow_font = _load_font(sc(14), bold=True)
     name_font = _load_font(sc(28), bold=True)
 
-    # Centre the eyebrow + name as a group on the header's vertical
-    # midline so the avatar and text read as one balanced row.
+    # Two header rows (eyebrow / name) anchored above the avatar's midline,
+    # with the platform icon on a third row beneath the name.
     cy = sc(header_h) // 2
+    eyebrow_cy = cy - sc(28)
+    name_cy = cy - sc(2)
+    plat_cy = cy + sc(34)
 
-    # Clan callout on the right of the header, in the gold "complete"
-    # text colour — mirrors the USER PROFILE / name block on the left.
+    # Thin gold rule between the avatar and the identity text — a refined
+    # divider spanning the eyebrow + name rows.
+    rule_x = sc(pad) + avatar_px + sc(11)
+    draw.rounded_rectangle(
+        (rule_x, eyebrow_cy - sc(9), rule_x + sc(3), name_cy + sc(13)),
+        radius=sc(2), fill=_PROGRESS_ACCENT + (235,),
+    )
+
+    # Clan callout on the right of the header: "CLAN" eyebrow over the
+    # clan emoji + name, aligned to the same two rows as the name block.
     name_right_bound = right_x
     if clan_row is not None:
         clan_label_font = _load_font(sc(12), bold=True)
-        clan_value_font = _load_font(sc(22), bold=True)
-        c_icon_px = sc(24)
+        clan_value_font = _load_font(sc(18), bold=True)
+        c_icon_px = sc(22)
         c_gap = sc(9)
         clan_val = clan_row[1] or "\u2014"
         clan_emoji = clan_row[2]
@@ -3713,27 +3733,26 @@ def _render_profile_card_png(
         block_left = int(right_x - icon_w - clan_text_w)
         clan_name_fill = clan_color or _PROGRESS_ACCENT
         draw.text(
-            (right_x, cy - sc(13)), "CLAN", font=clan_label_font,
+            (right_x, eyebrow_cy), "CLAN", font=clan_label_font,
             fill=_PROGRESS_ACCENT, anchor="rm",
         )
         if clan_emoji and _paste_emoji_icon(
-            canvas, clan_emoji, block_left, cy + sc(10), c_icon_px,
+            canvas, clan_emoji, block_left, name_cy, c_icon_px,
             label="Clan",
         ):
             draw.text(
-                (block_left + c_icon_px + c_gap, cy + sc(10)), clan_val,
+                (block_left + c_icon_px + c_gap, name_cy), clan_val,
                 font=clan_value_font, fill=clan_name_fill, anchor="lm",
             )
         else:
             draw.text(
-                (right_x, cy + sc(10)), clan_val, font=clan_value_font,
+                (right_x, name_cy), clan_val, font=clan_value_font,
                 fill=clan_name_fill, anchor="rm",
             )
         name_right_bound = block_left - sc(20)
 
-    eyebrow = "USER PROFILE"
     draw.text(
-        (text_x, cy - sc(13)), eyebrow, font=eyebrow_font,
+        (text_x, eyebrow_cy), "USER PROFILE", font=eyebrow_font,
         fill=_PROGRESS_ACCENT, anchor="lm",
     )
 
@@ -3746,28 +3765,124 @@ def _render_profile_card_png(
             name = name[:-1]
         name = name + "\u2026"
     draw.text(
-        (text_x, cy + sc(10)), name, font=name_font,
+        (text_x, name_cy), name, font=name_font,
         fill=_PROGRESS_TEXT, anchor="lm",
     )
 
-    # Mastery Rank row beneath the header (where the progress bar lives on
-    # the /progress card), aligned with the reference grid's left edge.
-    if featured:
-        feat_left = sc(pad) + sc(8)
-        feat_right = W - sc(pad) - sc(8)
-        for i, (lbl, val, emj) in enumerate(featured):
-            cy = sc(feat_top + i * feat_row_h + feat_row_h // 2)
-            _draw_feature_row(
-                canvas, x=feat_left, cy=cy, right_edge=feat_right,
-                label=lbl, value=val, emoji_bytes=emj, scale=s,
-            )
-
-    # Remaining fields (Platform, Syndicate) in the shared reference grid.
-    if remaining and divider_logical is not None:
-        _draw_info_grid(
-            canvas, norm_rows=remaining, width=W,
-            divider_y=sc(divider_logical), pad=pad, row_h=row_h, scale=s,
+    # Platform: icon only, beneath the name, with a soft gold glow.
+    if platform_row is not None and platform_row[2]:
+        plat_icon_px = sc(26)
+        glow_d = plat_icon_px * 2
+        gcx = text_x + plat_icon_px // 2
+        glow = Image.new("RGBA", (glow_d, glow_d), (0, 0, 0, 0))
+        ImageDraw.Draw(glow).ellipse(
+            (glow_d * 0.2, glow_d * 0.2, glow_d * 0.8, glow_d * 0.8),
+            fill=_PROGRESS_ACCENT + (95,),
         )
+        glow = glow.filter(ImageFilter.GaussianBlur(sc(7)))
+        canvas.alpha_composite(
+            glow, (gcx - glow_d // 2, plat_cy - glow_d // 2)
+        )
+        _paste_emoji_icon(
+            canvas, platform_row[2], text_x, plat_cy, plat_icon_px,
+            label="Platform",
+        )
+
+    # Mastery Rank capsule badge beneath the header (gold-tinted fill +
+    # hairline gold border), sized to its content.
+    if mastery_row is not None and mr_pill_top is not None:
+        mr_label_font = _load_font(sc(13), bold=True)
+        mr_value_font = _load_font(sc(14), bold=True)
+        mr_icon_px = sc(18)
+        mr_icon_gap = sc(8)
+        badge_pad_x = sc(14)
+        label_txt = "Mastery Rank: "
+        value_txt = mastery_row[1] or "\u2014"
+        has_icon = bool(mastery_row[2])
+        lbl_w = draw.textlength(label_txt, font=mr_label_font)
+        val_w = draw.textlength(value_txt, font=mr_value_font)
+        icon_w = (mr_icon_px + mr_icon_gap) if has_icon else 0
+        pill_w = int(icon_w + lbl_w + val_w + badge_pad_x * 2)
+        pill_h = sc(mr_pill_h)
+        pill_x0 = sc(pad) + sc(8)
+        pill_y0 = sc(mr_pill_top)
+        overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        ImageDraw.Draw(overlay).rounded_rectangle(
+            (pill_x0, pill_y0, pill_x0 + pill_w, pill_y0 + pill_h),
+            radius=pill_h // 2, fill=_PROGRESS_ACCENT + (26,),
+            outline=_PROGRESS_ACCENT + (130,), width=max(1, sc(1)),
+        )
+        canvas.alpha_composite(overlay)
+        mcy = pill_y0 + pill_h // 2
+        mx = pill_x0 + badge_pad_x
+        if has_icon and _paste_emoji_icon(
+            canvas, mastery_row[2], mx, mcy, mr_icon_px, label="Mastery Rank"
+        ):
+            mx += mr_icon_px + mr_icon_gap
+        draw.text(
+            (mx, mcy), label_txt, font=mr_label_font,
+            fill=_PROGRESS_ACCENT, anchor="lm",
+        )
+        draw.text(
+            (mx + lbl_w, mcy), value_txt, font=mr_value_font,
+            fill=_PROGRESS_FILL_GOLD_END, anchor="lm",
+        )
+
+    # Syndicate band: one/two factions render as icon + faction-coloured
+    # name (stacked); three or more collapse to an icon-only row.
+    if syndicate_factions and syn_top is not None:
+        syn_x = sc(pad) + sc(8)
+        syn_right = W - sc(pad) - sc(8)
+        if len(syndicate_factions) <= 2:
+            syn_font = _load_font(sc(14), bold=True)
+            syn_icon_px = sc(20)
+            syn_gap = sc(8)
+            for i, (sname, scolor, sbytes) in enumerate(syndicate_factions):
+                scy = sc(syn_top + i * syn_two_row_h + syn_two_row_h // 2)
+                cx = syn_x
+                if sbytes and _paste_emoji_icon(
+                    canvas, sbytes, cx, scy, syn_icon_px, label="Syndicate"
+                ):
+                    cx += syn_icon_px + syn_gap
+                else:
+                    bullet = "\u2022 "
+                    draw.text(
+                        (cx, scy), bullet, font=syn_font,
+                        fill=scolor or _PROGRESS_MUTED, anchor="lm",
+                    )
+                    cx += int(draw.textlength(bullet, font=syn_font))
+                nm = sname or ""
+                max_w = syn_right - cx
+                if draw.textlength(nm, font=syn_font) > max_w:
+                    while nm and draw.textlength(
+                        nm + "\u2026", font=syn_font
+                    ) > max_w:
+                        nm = nm[:-1]
+                    nm = nm + "\u2026"
+                draw.text(
+                    (cx, scy), nm, font=syn_font,
+                    fill=scolor or _PROGRESS_TEXT, anchor="lm",
+                )
+        else:
+            syn_icon_px = sc(26)
+            syn_gap = sc(12)
+            scy = sc(syn_top + syn_icon_row_h // 2)
+            cx = syn_x
+            for sname, scolor, sbytes in syndicate_factions:
+                if cx + syn_icon_px > syn_right:
+                    break
+                if not (sbytes and _paste_emoji_icon(
+                    canvas, sbytes, cx, scy, syn_icon_px, label="Syndicate"
+                )):
+                    r = syn_icon_px // 3
+                    ImageDraw.Draw(canvas).ellipse(
+                        (
+                            cx + syn_icon_px // 2 - r, scy - r,
+                            cx + syn_icon_px // 2 + r, scy + r,
+                        ),
+                        fill=(scolor or _PROGRESS_MUTED) + (255,),
+                    )
+                cx += syn_icon_px + syn_gap
 
     buf = io.BytesIO()
     canvas.save(buf, format="PNG", optimize=True)
