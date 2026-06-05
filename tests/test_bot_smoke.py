@@ -168,14 +168,11 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
 
     def test_incomplete_components_signature(self):
         """_incomplete_components accepts all kwargs used in production."""
-        # Call site: bot.py line ~1158
         result = self.bot_module._incomplete_components(
             reason="Missing Platform role.",
             image_url=None,
             link_buttons=[("Help", "https://discord.com/channels/1/2")],
             progress_attachment="progress.png",
-            nick_suggestion="Tenno",
-            user_id=9999,
         )
         self.assertIsInstance(result, list)
 
@@ -189,14 +186,6 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
         )
         self.assertIsInstance(result, list)
 
-    def test_nickname_prompt_top_level_signature(self):
-        """_nickname_prompt_top_level accepts all kwargs used in production."""
-        # Call site: bot.py line ~1472 and ~1609
-        result = self.bot_module._nickname_prompt_top_level(
-            suggestion="Tenno#1234",
-            user_id=9999,
-        )
-        self.assertIsInstance(result, list)
 
     def test_send_v2_signature(self):
         """_send_v2 helper can be called with all production kwargs."""
