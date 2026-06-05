@@ -1204,6 +1204,40 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
         # pass the user already gets the progress bar showing them.
         issues.extend(f"Missing **{cat}** role." for cat in extra_missing)
 
+    # Compute pass_missing up front so it can be baked into the progress
+    # card's info rows (when the verification passes).
+    pass_missing: list[str] = []
+    if passed:
+        # On the pass embed, "Missing Data" reflects what the user still
+        # needs to act on. Mastery Rank should only appear when OCR
+        # couldn't read it from the screenshot — if we parsed it
+        # successfully, the user has already shown their MR and we'll
+        # render it as its own row above.
+        pass_missing = [
+            c for c in extra_missing
+            if c != "Mastery Rank" or not mastery_rank
+        ]
+
+    # Build the labeled rows rendered beneath the progress bar on a
+    # passing card: profile name, clan, mastery rank, missing data.
+    info_lines: list[tuple[str, str]] = []
+    if passed:
+        if profile_name:
+            display_profile = (
+                profile_name if profile_name.startswith("Tenno #")
+                else _strip_clan_tag(profile_name)
+            )
+            info_lines.append(("Profile", display_profile))
+        if clan_name:
+            info_lines.append(("Clan", _strip_clan_tag(clan_name)))
+        if mastery_rank:
+            mr_value = mastery_rank
+            if mr_value.upper().startswith("MR "):
+                mr_value = mr_value[3:].strip()
+            info_lines.append(("Mastery Rank", mr_value))
+        if pass_missing:
+            info_lines.append(("Missing Data", ", ".join(pass_missing)))
+
     # Render the progress card once; both pass and incomplete embeds attach it.
     progress_png: bytes | None = None
     try:
@@ -1217,6 +1251,7 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
             display_name=member.display_name,
             count=have,
             target=total,
+            info_lines=info_lines if info_lines else None,
         )
     except Exception:
         logger.warning("verify: progress card render failed", exc_info=True)
@@ -1228,23 +1263,22 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
     nick_extra: list[dict] = []
     if nick_target:
         try:
+            # On a pass, route the "Pick Roles" Link button through the
+            # nickname prompt's action row so it sits next to the call
+            # sign buttons (the progress card embed no longer carries it).
+            np_links = (
+                _resolve_pass_link_buttons(message.guild, clan_name)
+                if passed else None
+            )
             nick_extra = _nickname_prompt_components(
                 nick_target, member.id,
                 current_nick=member.display_name or "",
+                link_buttons=np_links,
             )
         except Exception:
             logger.exception("nick prompt build failed")
             nick_extra = []
     if passed:
-        # On the pass embed, "Missing Data" reflects what the user still
-        # needs to act on. Mastery Rank should only appear when OCR
-        # couldn't read it from the screenshot — if we parsed it
-        # successfully, the user has already shown their MR and we'll
-        # render it as its own bullet above.
-        pass_missing = [
-            c for c in extra_missing
-            if c != "Mastery Rank" or not mastery_rank
-        ]
         components = _pass_components(
             profile_name, clan_name,
             clan_emoji=clan_emoji,
@@ -1566,9 +1600,21 @@ def _pass_components(
         inner_lines.append("please assign the missing roles here")
     inner = "\n".join(inner_lines)
 
-    # Pick Roles lives in an action row at the bottom of the card (the
-    # slot Clan Chat used to occupy). Any other link buttons received
-    # are appended to the same row, capped at Discord's 5-per-row max.
+    # When a progress card is attached the bullet list (profile / clan /
+    # mastery / missing) is rendered INTO the PNG and the "Pick Roles"
+    # button has been moved to the nickname prompt's action row, so this
+    # message is just the image. The verification container is only kept
+    # as a fallback for the rare case where the avatar fetch or render
+    # fails and we cannot attach a progress card.
+    if progress_attachment:
+        return [{
+            "type": 12,
+            "items": [{"media": {"url": f"attachment://{progress_attachment}"}}],
+        }]
+
+    # Fallback path (no progress card): render the legacy V2 container
+    # with the bullet list and Pick Roles action row so the user still
+    # sees their verification result.
     container_children: list[dict] = [{"type": 10, "content": inner}]
     action_row_buttons: list[dict] = []
     for label, url in (link_buttons or []):
@@ -1587,15 +1633,7 @@ def _pass_components(
         "accent_color": ACCENT_PASS,
         "components": container_children,
     }
-    top_level: list[dict] = []
-    # Progress card pinned to the TOP of the message (above the verification
-    # card) so the bar / count is the first thing the user sees.
-    if progress_attachment:
-        top_level.append({
-            "type": 12,
-            "items": [{"media": {"url": f"attachment://{progress_attachment}"}}],
-        })
-    top_level.append(container)
+    top_level: list[dict] = [container]
     # Inline nickname prompt as additional top-level components so the
     # whole verification flow lives in one message.
     if nick_suggestion and user_id is not None:
@@ -1791,20 +1829,23 @@ NICK_PROMPT_SERVER_EMOJI_ID = os.getenv(
 
 
 def _nickname_prompt_components(
-    suggestion: str, user_id: int, *, current_nick: str = ""
+    suggestion: str, user_id: int, *, current_nick: str = "",
+    link_buttons: list[tuple[str, str]] | None = None,
 ) -> list[dict]:
     """Standalone V2 message for the in-game-name selection prompt.
 
     Layout (per design spec):
-      - MediaGallery banner (type 12)
-      - Container header "Hello Operator! / Please Select your call sign."
-      - Section (type 9) with the in-game name + button accessory
-      - Separator (type 14)
-      - Section (type 9) with the current server nickname + button accessory
+      - Container (gold accent) with a "pick your call sign!" caption.
+      - Action row: server-nick button, in-game-name button, plus any
+        Link buttons supplied via ``link_buttons`` (capped at Discord's
+        5-per-row limit). On the verification PASS flow the "Pick Roles"
+        Link button is threaded in here so it sits alongside the call
+        sign choices.
 
-    The two buttons reuse the existing ``nick:y:<uid>:<encoded>`` /
-    ``nick:n:<uid>:<encoded>`` custom_id scheme so ``_handle_nick_interaction``
-    can edit this whole prompt message in place via UPDATE_MESSAGE.
+    The two callsign buttons reuse the existing ``nick:y:<uid>:<encoded>``
+    / ``nick:n:<uid>:<encoded>`` custom_id scheme so
+    ``_handle_nick_interaction`` can edit this whole prompt message in
+    place via UPDATE_MESSAGE.
     """
     yes_id, no_id = _nick_custom_ids(suggestion, user_id)
     ingame_label = (suggestion or "In-game name")[:80]
@@ -1823,6 +1864,16 @@ def _nickname_prompt_components(
             }
         return btn
 
+    row_buttons: list[dict] = [
+        _btn(server_label, no_id, NICK_PROMPT_SERVER_EMOJI_ID),
+        _btn(ingame_label, yes_id, NICK_PROMPT_INGAME_EMOJI_ID),
+    ]
+    for lbl, url in (link_buttons or []):
+        link_btn: dict = {"type": 2, "style": 5, "label": lbl, "url": url}
+        if lbl == "Pick Roles" and PICK_ROLES_EMOJI_PAYLOAD is not None:
+            link_btn["emoji"] = PICK_ROLES_EMOJI_PAYLOAD
+        row_buttons.append(link_btn)
+
     return [
         {
             "type": 17,
@@ -1834,10 +1885,7 @@ def _nickname_prompt_components(
         },
         {
             "type": 1,
-            "components": [
-                _btn(server_label, no_id, NICK_PROMPT_SERVER_EMOJI_ID),
-                _btn(ingame_label, yes_id, NICK_PROMPT_INGAME_EMOJI_ID),
-            ],
+            "components": row_buttons[:5],
         },
     ]
 
@@ -2856,21 +2904,31 @@ def _render_progress_card_png(
     display_name: str,
     count: int,
     target: int,
+    info_lines: list[tuple[str, str]] | None = None,
 ) -> bytes:
-    """Render an 860x160 progress card and return PNG bytes.
+    """Render the progress card and return PNG bytes.
 
     Composition: circular avatar (left) + gradient bar with overlay text
-    on the right. The whole composition is a single PNG so the V2 message
-    only needs one media gallery item.
+    on the right. When ``info_lines`` is provided, the card grows
+    vertically and renders each ``(label, value)`` pair as a bulleted row
+    beneath the bar (used to inline profile / clan / mastery / missing
+    info on the verification PASS embed).
     """
     progress = max(0.0, min(1.0, count / target)) if target > 0 else 0.0
     complete = count >= target
 
+    # Dynamic card height: base 160 + (divider + N*row + bottom-pad) when
+    # info_lines is present.
+    rows = info_lines or []
+    row_h = 28
+    info_block_h = (12 + len(rows) * row_h + 12) if rows else 0
+    card_h = _PROGRESS_CARD_H + info_block_h
+
     canvas = Image.new(
-        "RGBA", (_PROGRESS_CARD_W, _PROGRESS_CARD_H), _PROGRESS_BG + (255,)
+        "RGBA", (_PROGRESS_CARD_W, card_h), _PROGRESS_BG + (255,)
     )
     ImageDraw.Draw(canvas).rounded_rectangle(
-        (0, 0, _PROGRESS_CARD_W - 1, _PROGRESS_CARD_H - 1),
+        (0, 0, _PROGRESS_CARD_W - 1, card_h - 1),
         radius=22, outline=_PROGRESS_BG_EDGE + (255,), width=2,
     )
 
@@ -2943,6 +3001,47 @@ def _render_progress_card_png(
             font=footer_font,
             fill=_PROGRESS_AVATAR_RING,
         )
+
+    # Render the labeled info rows beneath the bar (profile / clan /
+    # mastery / missing). Layout: subtle divider line, then one row per
+    # entry rendered as "  •  Label: Value". Label is muted+bold, value
+    # is brighter+bold to mirror the original bullet list hierarchy.
+    if rows:
+        info_label_font = _load_font(16, bold=True)
+        info_value_font = _load_font(18, bold=True)
+        divider_y = _PROGRESS_CARD_H
+        draw.line(
+            [(pad + 8, divider_y), (_PROGRESS_CARD_W - pad - 8, divider_y)],
+            fill=_PROGRESS_BG_EDGE,
+            width=1,
+        )
+        row_y = divider_y + 12
+        for label, value in rows:
+            prefix = "  \u2022  "
+            label_text = f"{prefix}{label}: "
+            draw.text(
+                (pad, row_y),
+                label_text,
+                font=info_label_font,
+                fill=_PROGRESS_MUTED,
+            )
+            label_w = draw.textlength(label_text, font=info_label_font)
+            # Trim value if it would overflow the card width.
+            max_value_w = _PROGRESS_CARD_W - pad - (pad + label_w)
+            v = value or ""
+            if draw.textlength(v, font=info_value_font) > max_value_w:
+                while v and draw.textlength(
+                    v + "\u2026", font=info_value_font
+                ) > max_value_w:
+                    v = v[:-1]
+                v = v + "\u2026"
+            draw.text(
+                (pad + label_w, row_y - 1),
+                v,
+                font=info_value_font,
+                fill=_PROGRESS_TEXT,
+            )
+            row_y += row_h
 
     buf = io.BytesIO()
     canvas.convert("RGB").save(buf, format="PNG", optimize=True)
