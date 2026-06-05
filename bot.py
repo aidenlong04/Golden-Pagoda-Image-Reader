@@ -2002,7 +2002,7 @@ def _role_categories_for(role_ids: set[int]) -> list[tuple[str, bool]]:
 
 async def _member_profile_info_lines(
     member: discord.Member,
-) -> list[tuple[str, str, bytes | None]]:
+) -> list[tuple]:
     """Gather a member's role-derived verification data for the /profile
     card: ``(label, value, emoji_bytes)`` rows for every category that is
     *configured* on the server (Clan, Platform, Mastery Rank, Syndicate).
@@ -2014,7 +2014,7 @@ async def _member_profile_info_lines(
     ``Clan | Platform`` over ``Mastery Rank | Syndicate``.
     """
     role_ids = {r.id for r in member.roles}
-    rows: list[tuple[str, str, bytes | None]] = []
+    rows: list[tuple] = []
 
     # Durable per-member store: the exact picked/OCR'd Mastery Rank lives
     # here (Discord roles only carry coarse buckets), so prefer it for the
@@ -2031,10 +2031,17 @@ async def _member_profile_info_lines(
             None,
         )
         if slot is not None:
+            clan_role = member.guild.get_role(slot.role_id)
+            clan_color = (
+                clan_role.color.to_rgb()
+                if clan_role is not None and clan_role.color.value
+                else None
+            )
             rows.append((
                 "Clan",
                 _strip_clan_tag(slot.clan_name or "") or "\u2014",
                 await _fetch_emoji_bytes(slot.emoji),
+                clan_color,
             ))
         else:
             rows.append(("Clan", "\u2014", None))
@@ -3533,10 +3540,10 @@ def _draw_feature_row(
     label: str, value: str, emoji_bytes: bytes | None, scale: int,
 ) -> None:
     """Render the headline Mastery Rank field as a full-width "[icon]
-    Label: Value" row beneath the header, in the same text size and
-    visual language as the reference-grid cells below it (no tile/bar
-    background). ``x``/``cy``/``right_edge`` are supersampled pixels;
-    ``scale`` keeps fonts and icons proportional.
+    Label: Value" row beneath the header in gold, at a slightly smaller
+    size than the reference-grid cells below it (no tile/bar background).
+    ``x``/``cy``/``right_edge`` are supersampled pixels; ``scale`` keeps
+    fonts and icons proportional.
     """
     s = scale
 
@@ -3544,9 +3551,9 @@ def _draw_feature_row(
         return int(round(v * s))
 
     draw = ImageDraw.Draw(canvas)
-    label_font = _load_font(sc(16), bold=True)
-    value_font = _load_font(sc(18), bold=True)
-    icon_px = sc(22)
+    label_font = _load_font(sc(13), bold=True)
+    value_font = _load_font(sc(15), bold=True)
+    icon_px = sc(18)
     icon_gap = sc(8)
 
     if _paste_emoji_icon(canvas, emoji_bytes, x, cy, icon_px, label=label):
@@ -3562,7 +3569,7 @@ def _draw_feature_row(
     label_text = f"{label}: "
     draw.text(
         (text_x, cy), label_text, font=label_font,
-        fill=_PROGRESS_MUTED, anchor="lm",
+        fill=_PROGRESS_ACCENT, anchor="lm",
     )
     value_x = text_x + draw.textlength(label_text, font=label_font)
     max_value_w = right_edge - value_x
@@ -3575,7 +3582,7 @@ def _draw_feature_row(
         v = v + "\u2026"
     draw.text(
         (value_x, cy), v, font=value_font,
-        fill=_PROGRESS_TEXT, anchor="lm",
+        fill=_PROGRESS_ACCENT, anchor="lm",
     )
 
 
@@ -3605,8 +3612,11 @@ def _render_profile_card_png(
     # Normalize entries to (label, value, emoji_bytes|None). The profile
     # card has no "Missing" callout, so every row flows into the grid.
     norm_rows: list[tuple[str, str, bytes | None]] = []
+    clan_color: tuple[int, int, int] | None = None
     for entry in info_lines or []:
         emoji = entry[2] if len(entry) >= 3 else None
+        if entry[0] == "Clan" and len(entry) >= 4:
+            clan_color = entry[3]
         norm_rows.append((entry[0], entry[1], emoji))
 
     pad = 22
@@ -3701,9 +3711,10 @@ def _render_profile_card_png(
             clan_val = clan_val + "\u2026"
         clan_text_w = draw.textlength(clan_val, font=clan_value_font)
         block_left = int(right_x - icon_w - clan_text_w)
+        clan_name_fill = clan_color or _PROGRESS_ACCENT
         draw.text(
             (right_x, cy - sc(13)), "CLAN", font=clan_label_font,
-            fill=_PROGRESS_MUTED, anchor="rm",
+            fill=_PROGRESS_ACCENT, anchor="rm",
         )
         if clan_emoji and _paste_emoji_icon(
             canvas, clan_emoji, block_left, cy + sc(10), c_icon_px,
@@ -3711,12 +3722,12 @@ def _render_profile_card_png(
         ):
             draw.text(
                 (block_left + c_icon_px + c_gap, cy + sc(10)), clan_val,
-                font=clan_value_font, fill=_PROGRESS_ACCENT, anchor="lm",
+                font=clan_value_font, fill=clan_name_fill, anchor="lm",
             )
         else:
             draw.text(
                 (right_x, cy + sc(10)), clan_val, font=clan_value_font,
-                fill=_PROGRESS_ACCENT, anchor="rm",
+                fill=clan_name_fill, anchor="rm",
             )
         name_right_bound = block_left - sc(20)
 
