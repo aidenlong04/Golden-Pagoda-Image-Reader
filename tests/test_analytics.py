@@ -69,3 +69,50 @@ def test_disabled_when_path_unwritable(tmp_path, monkeypatch):
     s = analytics.summary()
     assert s["available"] is False
     assert s["total"] == 0
+
+
+def test_member_profile_roundtrip(analytics_module):
+    a = analytics_module
+    a.upsert_member_profile(
+        guild_id=2, user_id=5,
+        mastery_rank="MR 12", in_game_name="Tenno",
+        platform="PC", clan="Golden Pagoda", last_verified_ts=1000,
+    )
+    p = a.get_member_profile(2, 5)
+    assert p is not None
+    assert p["mastery_rank"] == "MR 12"
+    assert p["in_game_name"] == "Tenno"
+    assert p["platform"] == "PC"
+    assert p["clan"] == "Golden Pagoda"
+    assert p["last_verified_ts"] == 1000
+    assert p["updated_ts"] >= 0
+
+
+def test_member_profile_partial_update_preserves_fields(analytics_module):
+    a = analytics_module
+    a.upsert_member_profile(
+        guild_id=2, user_id=5,
+        mastery_rank="MR 12", in_game_name="Tenno",
+        platform="PC", clan="Golden Pagoda", last_verified_ts=1000,
+    )
+    # A mastery-only edit (e.g. the /profile dropdown) must not wipe the
+    # rest of the snapshot.
+    a.upsert_member_profile(guild_id=2, user_id=5, mastery_rank="LR 3")
+    p = a.get_member_profile(2, 5)
+    assert p["mastery_rank"] == "LR 3"
+    assert p["in_game_name"] == "Tenno"
+    assert p["platform"] == "PC"
+    assert p["clan"] == "Golden Pagoda"
+    assert p["last_verified_ts"] == 1000
+
+
+def test_member_profile_missing_returns_none(analytics_module):
+    assert analytics_module.get_member_profile(2, 999) is None
+
+
+def test_member_profile_isolated_by_guild(analytics_module):
+    a = analytics_module
+    a.upsert_member_profile(guild_id=2, user_id=5, mastery_rank="MR 12")
+    a.upsert_member_profile(guild_id=3, user_id=5, mastery_rank="MR 30")
+    assert a.get_member_profile(2, 5)["mastery_rank"] == "MR 12"
+    assert a.get_member_profile(3, 5)["mastery_rank"] == "MR 30"

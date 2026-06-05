@@ -254,6 +254,26 @@ SYNDICATE_ROLE_IDS: list[int] = _csv_ids("SYNDICATE_ROLE_IDS")
 # Surfaces as a link button on the incomplete card.
 HELP_CHANNEL_ID = _int_env("HELP_CHANNEL_ID", 1392582268769271950)
 
+
+def _format_mastery_display(value: str | None) -> str:
+    """Normalize a stored/OCR'd mastery rank to a card-ready value.
+
+    The label on the card is already "Mastery Rank", so the value drops
+    the redundant prefix: ``"MR 28" -> "28"``. Legendary ranks expand:
+    ``"LR 3" -> "Legendary 3"``. Anything else (e.g. "Unranked") passes
+    through unchanged. Shared by the verify card, the /profile gatherer,
+    and the mastery editor so the formatting lives in one place.
+    """
+    if not value:
+        return ""
+    upper = value.upper()
+    if upper.startswith("MR "):
+        return value[3:].strip()
+    if upper.startswith("LR "):
+        return f"Legendary {value[3:].strip()}"
+    return value
+
+
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is required")
 if TARGET_CHANNEL_ID <= 0:
@@ -1300,11 +1320,9 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
                 ("Clan", _strip_clan_tag(clan_name), clan_emoji_bytes)
             )
         if mastery_rank:
-            mr_value = mastery_rank
-            if mr_value.upper().startswith("MR "):
-                mr_value = mr_value[3:].strip()
             info_lines.append(
-                ("Mastery Rank", mr_value, mastery_emoji_bytes)
+                ("Mastery Rank", _format_mastery_display(mastery_rank),
+                 mastery_emoji_bytes)
             )
         if profile_name:
             display_profile = (
@@ -1409,6 +1427,21 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
         ocr_latency_ms=ocr_latency_ms,
         user_id=member.id,
         guild_id=message.guild.id,
+    ))
+
+    # Durable per-member snapshot (in-game name, platform, clan, exact
+    # mastery rank, last-verified). Survives restarts + role changes and
+    # backs the /profile card. Fail-soft + off the event loop; partial
+    # (COALESCE) so unread fields don't clobber a previous good snapshot.
+    _spawn_bg_task(asyncio.to_thread(
+        analytics.upsert_member_profile,
+        guild_id=message.guild.id,
+        user_id=member.id,
+        mastery_rank=mastery_rank,
+        in_game_name=None if profile_name_fallback_used else profile_name,
+        platform=member_platform,
+        clan=_strip_clan_tag(clan_name) if clan_name else None,
+        last_verified_ts=int(time.time()),
     ))
 
 
@@ -1983,6 +2016,14 @@ async def _member_profile_info_lines(
     role_ids = {r.id for r in member.roles}
     rows: list[tuple[str, str, bytes | None]] = []
 
+    # Durable per-member store: the exact picked/OCR'd Mastery Rank lives
+    # here (Discord roles only carry coarse buckets), so prefer it for the
+    # Mastery Rank row when present.
+    stored = await asyncio.to_thread(
+        analytics.get_member_profile, member.guild.id, member.id
+    )
+    mastery_override = (stored or {}).get("mastery_rank")
+
     # Clan — match the member's clan role to its slot for name + emoji.
     if any(s.role_id for s in CLAN_SLOTS):
         slot = next(
@@ -2013,12 +2054,18 @@ async def _member_profile_info_lines(
         else:
             rows.append(("Platform", "\u2014", None))
 
-    # Mastery Rank — use the actual Discord role name(s) the member holds.
-    if MR_ROLE_IDS:
-        mr_names = [r.name for r in member.roles if r.id in set(MR_ROLE_IDS)]
+    # Mastery Rank — prefer the exact stored rank; otherwise fall back to
+    # the coarse role-bucket name(s) the member holds.
+    if MR_ROLE_IDS or mastery_override:
+        if mastery_override:
+            mr_value = _format_mastery_display(mastery_override) or "\u2014"
+        else:
+            mr_ids = set(MR_ROLE_IDS)
+            mr_names = [r.name for r in member.roles if r.id in mr_ids]
+            mr_value = ", ".join(mr_names) if mr_names else "\u2014"
         rows.append((
             "Mastery Rank",
-            ", ".join(mr_names) if mr_names else "\u2014",
+            mr_value,
             await _fetch_emoji_bytes(MASTERY_RANK_EMOJI_RAW),
         ))
 
@@ -3748,18 +3795,235 @@ async def progress_cmd(
             )
 
 
+# ---------- /profile mastery-rank editor ------------------------------------
+#
+# The /profile card can carry an opt-in dropdown that lets a member set
+# their *displayed* Mastery Rank (MR 1-30 / Legendary 1-8). Picking a value
+# both swaps the member's coarse MR role bucket (MR 1-10, 11-15, ... ) to
+# the matching one AND persists the exact rank to the durable per-member
+# store so the card shows it. This uses discord.py's native ui.View/Select
+# (rather than the raw V2 path) because a select menu attached to an
+# uploaded image plus per-pick re-render is exactly what Views handle well;
+# the on_interaction listener ignores their auto-generated custom_ids.
+
+_MR_BUCKET_DIGITS_RE = re.compile(r"\d+")
+
+
+def _parse_mr_bucket_range(name: str) -> tuple[str, int, int] | None:
+    """Parse an MR role *name* into ``(kind, lo, hi)``.
+
+    Handles the configured bucket names (e.g. ``"MR 1-10"`` ->
+    ``("MR", 1, 10)``, ``"MR 30"`` -> ``("MR", 30, 30)``, ``"LR 1-7"`` ->
+    ``("LR", 1, 7)``). ``kind`` is ``"MR"`` or ``"LR"``. Returns None when
+    the name has no recognizable kind or number.
+    """
+    upper = name.upper()
+    if "LR" in upper or "LEGEND" in upper:
+        kind = "LR"
+    elif "MR" in upper or "MASTER" in upper:
+        kind = "MR"
+    else:
+        return None
+    nums = [int(x) for x in _MR_BUCKET_DIGITS_RE.findall(name)]
+    if not nums:
+        return None
+    lo, hi = nums[0], nums[-1]
+    if hi < lo:
+        lo, hi = hi, lo
+    return (kind, lo, hi)
+
+
+def _mr_bucket_role_for(
+    guild: discord.Guild, kind: str, value: int
+) -> "discord.Role | None":
+    """Return the configured MR bucket role whose range covers ``value``.
+
+    Resolves against the live role names (``MR_ROLE_IDS`` is not guaranteed
+    index-aligned with ``MR_ROLE_NAMES`` since unresolved names are
+    skipped), so the mapping stays correct regardless of how the buckets
+    were configured.
+    """
+    for rid in MR_ROLE_IDS:
+        role = guild.get_role(rid)
+        if role is None:
+            continue
+        parsed = _parse_mr_bucket_range(role.name)
+        if parsed and parsed[0] == kind and parsed[1] <= value <= parsed[2]:
+            return role
+    return None
+
+
+async def _apply_mastery_bucket(
+    member: discord.Member, kind: str, value: int
+) -> str:
+    """Swap ``member``'s MR bucket role to the one covering ``(kind, value)``.
+
+    Returns ``"assigned"`` on success (incl. already-correct), ``"no_match"``
+    when no configured bucket covers that rank, or ``"error"`` when the
+    role edit fails (missing perms / role hierarchy).
+    """
+    target = _mr_bucket_role_for(member.guild, kind, value)
+    if target is None:
+        return "no_match"
+    mr_ids = set(MR_ROLE_IDS)
+    have_ids = {r.id for r in member.roles}
+    to_remove = [
+        r for r in member.roles if r.id in mr_ids and r.id != target.id
+    ]
+    try:
+        if to_remove:
+            await member.remove_roles(
+                *to_remove, reason="Mastery rank self-service edit"
+            )
+        if target.id not in have_ids:
+            await member.add_roles(
+                target, reason="Mastery rank self-service edit"
+            )
+        return "assigned"
+    except discord.HTTPException:
+        logger.exception("mastery bucket role swap failed")
+        return "error"
+
+
+def _mastery_select_options() -> tuple[list, list]:
+    """Build the two grouped option lists for the mastery editor.
+
+    Discord caps a select menu at 25 options, so MR 1-30 + Legendary 1-8
+    (38 values) is split: 1-25 in the first menu, 26-30 + Legendary 1-8 in
+    the second. Option values encode ``"<kind>:<n>"`` (e.g. ``"MR:28"``,
+    ``"LR:3"``).
+    """
+    first = [
+        discord.SelectOption(label=f"Mastery Rank {n}", value=f"MR:{n}")
+        for n in range(1, 26)
+    ]
+    second = [
+        discord.SelectOption(label=f"Mastery Rank {n}", value=f"MR:{n}")
+        for n in range(26, 31)
+    ]
+    second += [
+        discord.SelectOption(label=f"Legendary {n}", value=f"LR:{n}")
+        for n in range(1, 9)
+    ]
+    return first, second
+
+
+class _MasterySelect(discord.ui.Select):
+    def __init__(self, parent: "_MasteryEditorView", *, placeholder: str,
+                 options: list) -> None:
+        super().__init__(
+            placeholder=placeholder, min_values=1, max_values=1,
+            options=options,
+        )
+        self._parent = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self._parent.handle_pick(interaction, self.values[0])
+
+
+class _MasteryEditorView(discord.ui.View):
+    """Self-service Mastery Rank editor attached to a /profile card.
+
+    Only the profile owner can use it (``interaction_check``). On a pick we
+    swap the member's MR role bucket, persist the exact rank, re-render the
+    card, and edit the message in place.
+    """
+
+    def __init__(
+        self, *, member: discord.Member, owner_id: int,
+        avatar_bytes: bytes | None, display_name: str,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.member = member
+        self.owner_id = owner_id
+        self.avatar_bytes = avatar_bytes
+        self.display_name = display_name
+        first, second = _mastery_select_options()
+        self.add_item(_MasterySelect(
+            self, placeholder="Set Mastery Rank (1\u201325)", options=first,
+        ))
+        self.add_item(_MasterySelect(
+            self,
+            placeholder="Set Mastery Rank 26\u201330 / Legendary 1\u20138",
+            options=second,
+        ))
+
+    async def interaction_check(
+        self, interaction: discord.Interaction
+    ) -> bool:
+        if interaction.user.id != self.owner_id:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "These controls aren't yours.", ephemeral=True
+                )
+            return False
+        return True
+
+    async def handle_pick(
+        self, interaction: discord.Interaction, raw: str
+    ) -> None:
+        kind, _, num = raw.partition(":")
+        try:
+            value = int(num)
+        except ValueError:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.defer()
+            return
+
+        status = await _apply_mastery_bucket(self.member, kind, value)
+        # Persist synchronously (off-loop) so the re-render below reads the
+        # freshly stored override instead of racing the write.
+        await asyncio.to_thread(
+            analytics.upsert_member_profile,
+            guild_id=self.member.guild.id,
+            user_id=self.member.id,
+            mastery_rank=f"{kind} {value}",
+        )
+        info = await _member_profile_info_lines(self.member)
+        png = await asyncio.to_thread(
+            _render_profile_card_png,
+            avatar_bytes=self.avatar_bytes,
+            display_name=self.display_name,
+            info_lines=info,
+        )
+        await interaction.response.edit_message(
+            attachments=[
+                discord.File(io.BytesIO(png), filename="profile.png")
+            ],
+            view=self,
+        )
+        if status == "no_match":
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.followup.send(
+                    "Saved your displayed rank. No matching rank role is "
+                    "configured here, so your Discord role was left "
+                    "unchanged.",
+                    ephemeral=True,
+                )
+        elif status == "error":
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.followup.send(
+                    "Saved your displayed rank, but I couldn't change your "
+                    "Discord role \u2014 check my Manage Roles permission and "
+                    "role position.",
+                    ephemeral=True,
+                )
+
+
 @tree.command(
     name="profile",
     description="Show a member's Warframe verification profile card.",
 )
 @app_commands.describe(
     user="View another member's profile (defaults to yourself).",
-    ephemeral="Only you can see the reply when true (default: false).",
+    ephemeral="Hide the reply so only you see it (default: true).",
+    edit_mastery="Attach a dropdown to set your Mastery Rank (only on your own profile).",
 )
 async def profile_cmd(
     interaction: discord.Interaction,
     user: discord.Member | None = None,
-    ephemeral: bool = False,
+    ephemeral: bool = True,
+    edit_mastery: bool = False,
 ) -> None:
     target = user or interaction.user
     if not isinstance(target, discord.Member):
@@ -3785,11 +4049,21 @@ async def profile_cmd(
             display_name=display_name,
             info_lines=info,
         )
-        await interaction.followup.send(
+        send_kwargs: dict = dict(
             file=discord.File(io.BytesIO(png), filename="profile.png"),
             ephemeral=ephemeral,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+        # The mastery editor is opt-in and only ever attached to a member's
+        # own profile (it edits their roles + stored rank).
+        if edit_mastery and target.id == interaction.user.id:
+            send_kwargs["view"] = _MasteryEditorView(
+                member=target,
+                owner_id=interaction.user.id,
+                avatar_bytes=avatar_bytes,
+                display_name=display_name,
+            )
+        await interaction.followup.send(**send_kwargs)
     except Exception:
         logger.exception("/profile failed")
         if not interaction.response.is_done():

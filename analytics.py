@@ -100,6 +100,18 @@ def _init() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
                 CREATE INDEX IF NOT EXISTS idx_events_outcome ON events(outcome);
+
+                CREATE TABLE IF NOT EXISTS member_profiles (
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    mastery_rank TEXT,
+                    in_game_name TEXT,
+                    platform TEXT,
+                    clan TEXT,
+                    last_verified_ts INTEGER,
+                    updated_ts INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, user_id)
+                );
                 """
             )
             conn.commit()
@@ -154,6 +166,81 @@ def record_verification(
                 conn.commit()
         except Exception:
             logger.exception("analytics: record failed")
+
+
+def upsert_member_profile(
+    *,
+    guild_id: int,
+    user_id: int,
+    mastery_rank: str | None = None,
+    in_game_name: str | None = None,
+    platform: str | None = None,
+    clan: str | None = None,
+    last_verified_ts: int | None = None,
+) -> None:
+    """Insert or update a durable per-member profile row.
+
+    Only non-None fields overwrite existing values (COALESCE), so a
+    partial update — e.g. the /profile mastery dropdown touching just
+    ``mastery_rank`` — never wipes the snapshot captured at verify time.
+    Fail-soft like :func:`record_verification`.
+    """
+    if _disabled:
+        return
+    with _lock:
+        _init()
+        if _disabled:
+            return
+        try:
+            with _connect() as conn:
+                conn.execute(
+                    "INSERT INTO member_profiles"
+                    " (guild_id, user_id, mastery_rank, in_game_name,"
+                    "  platform, clan, last_verified_ts, updated_ts)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(guild_id, user_id) DO UPDATE SET"
+                    "  mastery_rank=COALESCE(excluded.mastery_rank, mastery_rank),"
+                    "  in_game_name=COALESCE(excluded.in_game_name, in_game_name),"
+                    "  platform=COALESCE(excluded.platform, platform),"
+                    "  clan=COALESCE(excluded.clan, clan),"
+                    "  last_verified_ts=COALESCE(excluded.last_verified_ts, last_verified_ts),"
+                    "  updated_ts=excluded.updated_ts",
+                    (
+                        guild_id,
+                        user_id,
+                        mastery_rank,
+                        in_game_name,
+                        platform,
+                        clan,
+                        last_verified_ts,
+                        int(time.time()),
+                    ),
+                )
+                conn.commit()
+        except Exception:
+            logger.exception("analytics: upsert_member_profile failed")
+
+
+def get_member_profile(guild_id: int, user_id: int) -> dict | None:
+    """Return the stored per-member profile row as a dict, or None."""
+    if _disabled:
+        return None
+    with _lock:
+        _init()
+        if _disabled:
+            return None
+        try:
+            with _connect() as conn:
+                row = conn.execute(
+                    "SELECT mastery_rank, in_game_name, platform, clan,"
+                    " last_verified_ts, updated_ts FROM member_profiles"
+                    " WHERE guild_id=? AND user_id=?",
+                    (guild_id, user_id),
+                ).fetchone()
+                return dict(row) if row is not None else None
+        except Exception:
+            logger.exception("analytics: get_member_profile failed")
+            return None
 
 
 def _percentile(values: list[int], pct: float) -> int:

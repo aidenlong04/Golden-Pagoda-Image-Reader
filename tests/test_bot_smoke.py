@@ -237,5 +237,85 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
             )
 
 
+class MasteryEditorHelperTests(unittest.TestCase):
+    """Pure-logic tests for the /profile mastery-rank editor helpers."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.bot_module = bot_module
+
+    def test_format_mastery_display(self):
+        b = self.bot_module
+        self.assertEqual(b._format_mastery_display("MR 28"), "28")
+        self.assertEqual(b._format_mastery_display("LR 3"), "Legendary 3")
+        self.assertEqual(b._format_mastery_display("Unranked"), "Unranked")
+        self.assertEqual(b._format_mastery_display(None), "")
+        self.assertEqual(b._format_mastery_display(""), "")
+
+    def test_parse_mr_bucket_range(self):
+        b = self.bot_module
+        self.assertEqual(b._parse_mr_bucket_range("MR 1-10"), ("MR", 1, 10))
+        self.assertEqual(b._parse_mr_bucket_range("MR 22-29"), ("MR", 22, 29))
+        self.assertEqual(b._parse_mr_bucket_range("MR 30"), ("MR", 30, 30))
+        self.assertEqual(b._parse_mr_bucket_range("LR 1-7"), ("LR", 1, 7))
+        self.assertEqual(
+            b._parse_mr_bucket_range("Legendary 1-8"), ("LR", 1, 8)
+        )
+        self.assertIsNone(b._parse_mr_bucket_range("no digits"))
+
+    def test_mastery_select_options_within_discord_cap(self):
+        first, second = self.bot_module._mastery_select_options()
+        # Discord caps a select menu at 25 options.
+        self.assertLessEqual(len(first), 25)
+        self.assertLessEqual(len(second), 25)
+        # 30 ranks + 8 legendary tiers across both menus.
+        self.assertEqual(len(first) + len(second), 38)
+        values = [o.value for o in first] + [o.value for o in second]
+        self.assertIn("MR:1", values)
+        self.assertIn("MR:30", values)
+        self.assertIn("LR:1", values)
+        self.assertIn("LR:8", values)
+        # No duplicate values across the two menus.
+        self.assertEqual(len(values), len(set(values)))
+
+    def test_mr_bucket_role_for_maps_rank_to_bucket(self):
+        b = self.bot_module
+
+        class _Role:
+            def __init__(self, rid, name):
+                self.id = rid
+                self.name = name
+
+        roles = {
+            10: _Role(10, "MR 1-10"),
+            15: _Role(15, "MR 11-15"),
+            29: _Role(29, "MR 22-29"),
+            30: _Role(30, "MR 30"),
+            40: _Role(40, "LR 1-7"),
+        }
+
+        class _Guild:
+            def get_role(self, rid):
+                return roles.get(rid)
+
+        original = b.MR_ROLE_IDS
+        b.MR_ROLE_IDS = list(roles.keys())
+        try:
+            guild = _Guild()
+            self.assertEqual(
+                b._mr_bucket_role_for(guild, "MR", 28).name, "MR 22-29"
+            )
+            self.assertEqual(
+                b._mr_bucket_role_for(guild, "MR", 30).name, "MR 30"
+            )
+            self.assertEqual(
+                b._mr_bucket_role_for(guild, "LR", 3).name, "LR 1-7"
+            )
+            # LR 8 has no bucket (top role only covers LR 1-7).
+            self.assertIsNone(b._mr_bucket_role_for(guild, "LR", 8))
+        finally:
+            b.MR_ROLE_IDS = original
+
+
 if __name__ == "__main__":
     unittest.main()
