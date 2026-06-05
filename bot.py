@@ -1707,25 +1707,26 @@ def _pass_components(
     inner = "\n".join(inner_lines)
 
     # When a progress card is attached the bullet list (profile / clan /
-    # mastery / missing) is rendered INTO the PNG, so the message is just
-    # the image plus a "Pick Roles" Link button — both wrapped in a
-    # gold-accented V2 container so the button lives INSIDE the embed.
-    # Keeping the button on the card (rather than threading it into the
-    # nickname prompt) means it ALWAYS sends, even when OCR falls back to
-    # "Tenno #N" and there's no in-game name to host it.
+    # mastery / missing) is rendered INTO the PNG, so the message is the
+    # image on top (a top-level media gallery, OUTSIDE any embed) followed
+    # by a gold-accented V2 container that holds the "Pick Roles" Link
+    # button. Keeping the button in its own container (rather than
+    # threading it into the nickname prompt) means it ALWAYS sends, even
+    # when OCR falls back to "Tenno #N" and there's no in-game name to
+    # host it.
     if progress_attachment:
-        card_children: list[dict] = [{
+        top_components: list[dict] = [{
             "type": 12,
             "items": [{"media": {"url": f"attachment://{progress_attachment}"}}],
         }]
         button_row = _link_button_row(link_buttons)
         if button_row:
-            card_children.append(button_row)
-        return [{
-            "type": 17,
-            "accent_color": ACCENT_PASS,
-            "components": card_children,
-        }]
+            top_components.append({
+                "type": 17,
+                "accent_color": ACCENT_PASS,
+                "components": [button_row],
+            })
+        return top_components
 
     # Fallback path (no progress card): render the legacy V2 container
     # with the bullet list and Pick Roles action row so the user still

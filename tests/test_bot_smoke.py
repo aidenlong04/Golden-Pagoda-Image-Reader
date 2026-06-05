@@ -76,10 +76,10 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
                     )
 
     def test_pass_components_with_progress_card_keeps_button(self):
-        """With a progress card attached, the Pick Roles link button must
-        still be present, wrapped inside the V2 container alongside the
-        card image (regression: the button used to be dropped when there
-        was no nickname suggestion to host it)."""
+        """With a progress card attached, the card image sits on top as a
+        top-level media gallery and the Pick Roles link button lives in a
+        V2 container below it (regression: the button used to be dropped
+        when there was no nickname suggestion to host it)."""
         result = self.bot_module._pass_components(
             profile="Tenno #465",
             clan="Golden Tenno",
@@ -88,27 +88,24 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
             ],
             progress_attachment="progress.png",
         )
-
-        def _walk(components):
-            for comp in components:
-                yield comp
-                if comp.get("type") in (1, 17):
-                    yield from _walk(comp.get("components") or [])
-
-        nodes = list(_walk(result))
-        # The card image lives in a media gallery (type 12) inside the
-        # gold V2 container (type 17).
-        self.assertTrue(
-            any(c.get("type") == 17 for c in result),
-            "expected a top-level type:17 container",
+        # The card image is a TOP-LEVEL media gallery (type 12), on top.
+        self.assertEqual(
+            result[0].get("type"), 12,
+            "expected the progress card media gallery on top",
         )
-        self.assertTrue(
-            any(c.get("type") == 12 for c in nodes),
-            "expected the progress card media gallery",
+        # A V2 container (type 17) follows and holds the link button.
+        container = next(
+            (c for c in result if c.get("type") == 17), None
         )
-        # A link button (style 5) must be present inside the container.
+        self.assertIsNotNone(
+            container, "expected a type:17 container for the button"
+        )
         link_buttons = [
-            c for c in nodes if c.get("style") == 5 and c.get("url")
+            btn
+            for row in (container.get("components") or [])
+            if row.get("type") == 1
+            for btn in (row.get("components") or [])
+            if btn.get("style") == 5 and btn.get("url")
         ]
         self.assertTrue(
             link_buttons, "Pick Roles link button missing from pass card"
