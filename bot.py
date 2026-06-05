@@ -3954,7 +3954,7 @@ def _render_profile_card_png(
         glow = Image.new("RGBA", (glow_d, glow_d), (0, 0, 0, 0))
         ImageDraw.Draw(glow).ellipse(
             (glow_d * 0.2, glow_d * 0.2, glow_d * 0.8, glow_d * 0.8),
-            fill=_PROGRESS_ACCENT + (95,),
+            fill=_PROGRESS_ACCENT + (55,),
         )
         glow = glow.filter(ImageFilter.GaussianBlur(sc(7)))
         canvas.alpha_composite(
