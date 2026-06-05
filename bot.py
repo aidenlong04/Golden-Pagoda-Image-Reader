@@ -1236,6 +1236,16 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
     # up later via the user's own self-service flow.
     effective_role_ids = {r.id for r in member.roles} | assigned_role_ids
     cats = _role_categories_for(effective_role_ids)
+    if passed and mastery_rank:
+        # On a pass we render the OCR-read Mastery Rank as its own row, so
+        # count it as a satisfied category here too. Otherwise the bar
+        # (driven by role possession) and the "Missing" pill (which hides
+        # MR once it's been shown) disagree — e.g. a 2/4 bar that lists
+        # only one missing field.
+        cats = [
+            (name, True if name == "Mastery Rank" else ok)
+            for name, ok in cats
+        ]
     have = sum(1 for _, ok in cats if ok)
     total = len(cats)
     extra_missing = [name for name, ok in cats if not ok]
@@ -1244,19 +1254,10 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
         # pass the user already gets the progress bar showing them.
         issues.extend(f"Missing **{cat}** role." for cat in extra_missing)
 
-    # Compute pass_missing up front so it can be baked into the progress
-    # card's info rows (when the verification passes).
-    pass_missing: list[str] = []
-    if passed:
-        # On the pass embed, "Missing Data" reflects what the user still
-        # needs to act on. Mastery Rank should only appear when OCR
-        # couldn't read it from the screenshot — if we parsed it
-        # successfully, the user has already shown their MR and we'll
-        # render it as its own row above.
-        pass_missing = [
-            c for c in extra_missing
-            if c != "Mastery Rank" or not mastery_rank
-        ]
+    # On a pass, "Missing Data" mirrors the bar exactly (it derives from
+    # the same cats), so the number of missing fields always equals
+    # total − have.
+    pass_missing: list[str] = list(extra_missing) if passed else []
 
     # Build the labeled rows rendered beneath the progress bar on a
     # passing card: profile name, platform, clan, mastery rank, missing
