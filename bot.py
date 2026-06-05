@@ -2414,15 +2414,12 @@ async def preview_responses(interaction: discord.Interaction) -> None:
 EPHEMERAL_FLAG = 1 << 6  # 64
 
 
-def _health_age() -> int | None:
-    try:
-        return int(time.time() - os.path.getmtime(HEALTH_PATH))
-    except OSError:
-        return None
+def _status_page_bot(_interaction: discord.Interaction, _snap: dict) -> str:
+    user = client.user
+    latency_ms = int(client.latency * 1000) if client.latency >= 0 else -1
 
-
-def _fmt_uptime(seconds: float) -> str:
-    seconds = int(seconds)
+    # Uptime
+    seconds = int(time.time() - BOT_START_TIME)
     d, rem = divmod(seconds, 86400)
     h, rem = divmod(rem, 3600)
     m, s = divmod(rem, 60)
@@ -2434,35 +2431,34 @@ def _fmt_uptime(seconds: float) -> str:
     if m:
         parts.append(f"{m}m")
     parts.append(f"{s}s")
-    return " ".join(parts)
+    uptime = " ".join(parts)
 
-
-def _status_page_bot(interaction: discord.Interaction) -> str:
-    user = client.user
-    latency_ms = int(client.latency * 1000) if client.latency >= 0 else -1
-    uptime = _fmt_uptime(time.time() - BOT_START_TIME)
-    hb = _health_age()
+    # Health signal age
+    try:
+        hb: int | None = int(time.time() - os.path.getmtime(HEALTH_PATH))
+    except OSError:
+        hb = None
     if hb is None:
         hb_line = "\u26a0\ufe0f unhealthy (no signal)"
     elif hb > 90:
         hb_line = f"\u274C unhealthy ({hb}s stale)"
     else:
         hb_line = f"\u2705 healthy ({hb}s ago)"
+
     guilds = len(client.guilds)
     members = sum(g.member_count or 0 for g in client.guilds)
     py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
 
     # Resident set size from /proc/self/status (no psutil dep).
-    rss_kb: int | None = None
+    rss_label = "`?`"
     try:
         with open("/proc/self/status", "r") as fh:
             for line in fh:
                 if line.startswith("VmRSS:"):
-                    rss_kb = int(line.split()[1])
+                    rss_label = f"`{int(line.split()[1]) // 1024} MiB`"
                     break
     except OSError:
         pass
-    rss_label = f"`{rss_kb // 1024} MiB`" if rss_kb else "`?`"
 
     return (
         f"**Bot**\n"
@@ -2474,15 +2470,10 @@ def _status_page_bot(interaction: discord.Interaction) -> str:
     )
 
 
-def _status_page_roles(interaction: discord.Interaction) -> str:
-    head, tail = _status_page_roles_split(interaction)
-    return f"{head}\n\n{tail}"
-
-
 def _status_page_roles_split(
     interaction: discord.Interaction,
 ) -> tuple[str, str]:
-    """Return (clan_slots_section, platform+special_roles_section).
+    """Return (clan_slots_section, platform_roles_section).
 
     Used by `_status_components` to wedge the "Emblems" button
     directly under the Clan slots block, between the two text blobs.
@@ -2512,22 +2503,14 @@ def _status_page_roles_split(
     return "\n".join(clan_lines), "\n".join(rest_lines)
 
 
-def _status_page_channels(interaction: discord.Interaction) -> str:
+def _status_page_channels(
+    _interaction: discord.Interaction, _snap: dict
+) -> str:
     def fmt(cid: int) -> str:
-        if not cid:
-            return "*(unset)*"
-        return f"<#{cid}> `{cid}`"
+        return f"<#{cid}> `{cid}`" if cid else "*(unset)*"
 
     last_seen = _load_catchup_state()
-    if last_seen:
-        catchup = (
-            f"`{CATCHUP_LOOKBACK_HOURS}h` lookback \u2022 last id: "
-            f"`{last_seen}`"
-        )
-    else:
-        catchup = (
-            f"`{CATCHUP_LOOKBACK_HOURS}h` lookback \u2022 last id: *(none)*"
-        )
+    last = f"`{last_seen}`" if last_seen else "*(none)*"
 
     return (
         f"**Channels**\n"
@@ -2540,71 +2523,158 @@ def _status_page_channels(interaction: discord.Interaction) -> str:
         f"-# Fail: {FAIL_REACTION}\n"
         f"\n**Messaging**\n"
         f"-# Reply TTL: `{REPLY_TTL_SECONDS}s`\n"
-        f"-# Catch-up: {catchup}"
+        f"-# Catch-up: `{CATCHUP_LOOKBACK_HOURS}h` lookback \u2022 last id: {last}"
     )
 
 
-_STATUS_PAGES: list[tuple[str, str, str, Callable]] = [
-    ("bot",       "\U0001F916 Bot",          "Bot identity, latency, uptime.",  lambda i, _s: _status_page_bot(i)),
-    ("roles",     "\U0001F6E1\ufe0f Roles",  "Configured roles + slot map.",    lambda i, _s: _status_page_roles(i)),
-    ("channels",  "\U0001F4FA Channels",     "Channels, reactions, messaging.", lambda i, _s: _status_page_channels(i)),
-    ("ocr",       "\U0001F50D OCR",          "OCR backend + latency stats.",    lambda _i, s: _status_page_ocr(s)),
-    ("stats",     "\U0001F4C8 Stats",        "Verification totals + windows.",  lambda _i, s: _stats_page_overview(s)),
-    ("clans",     "\U0001F3F0 Clans",        "Configured clans + member counts.", lambda i, _s: _status_page_clans(i)),
+def _status_page_ocr(_interaction: discord.Interaction, snap: dict) -> str:
+    backend = "OCR.space (engine 3)" if OCR_API_KEY else (
+        "Tesseract (local)" if pytesseract else "*(none configured)*"
+    )
+    lines = [
+        "**OCR**",
+        f"-# Backend: `{backend}`",
+        "",
+        "**Latency** (last 500 events)",
+    ]
+    ocr = snap.get("ocr") or {}
+    if ocr.get("samples"):
+        lines.append(f"-# Samples: `{ocr['samples']}`")
+        lines.append(f"-# Avg: `{ocr['avg_ms']} ms`")
+        lines.append(f"-# p50: `{ocr['p50_ms']} ms` \u2022 p95: `{ocr['p95_ms']} ms`")
+    else:
+        lines.append("-# No samples yet.")
+    return "\n".join(lines)
+
+
+def _status_page_stats(_interaction: discord.Interaction, snap: dict) -> str:
+    if not snap.get("available"):
+        return (
+            "**Analytics**\n"
+            "-# Storage unavailable.\n"
+            f"-# DB path: `{snap.get('db_path')}`\n"
+            "-# Mount `/opt/golden-pagoda/data:/app/data` to enable."
+        )
+    total = snap["total"]
+    by = snap["by_outcome"]
+    p = by.get("pass", 0)
+    f = by.get("fail", 0)
+    inc = by.get("incomplete", 0)
+    unr = by.get("unreadable", 0)
+    err = by.get("ocr_error", 0)
+    pct = lambda n: f"{(n / total * 100):.1f}%" if total else "-"  # noqa: E731
+
+    win = snap["windows"]
+    return (
+        f"**Verifications**\n"
+        f"-# Total: `{total}`\n"
+        f"-# Pass: `{p}` ({pct(p)})\n"
+        f"-# Incomplete: `{inc}` ({pct(inc)})\n"
+        f"-# Fail: `{f}` ({pct(f)})\n"
+        f"-# Unreadable: `{unr}` ({pct(unr)})\n"
+        f"-# OCR error: `{err}` ({pct(err)})\n"
+        f"\n**Windows**\n"
+        f"-# Last 24h: `{win.get('24h', 0)}`\n"
+        f"-# Last 7d: `{win.get('7d', 0)}`\n"
+        f"-# Last 30d: `{win.get('30d', 0)}`"
+    )
+
+
+def _status_page_clans(interaction: discord.Interaction, _snap: dict) -> str:
+    guild = interaction.guild if interaction else None
+    if guild is None:
+        return "**Clans**\n-# No guild context."
+    configured = [s for s in CLAN_SLOTS if s.clan_name]
+    if not configured:
+        return "**Clans**\n-# No clan slots configured."
+
+    rows: list[tuple[str, str, int, bool]] = []
+    for slot in configured:
+        role = guild.get_role(slot.role_id) if slot.role_id else None
+        members = len(role.members) if role else 0
+        glyph = slot.emoji or "\u2022"
+        rows.append((slot.clan_name, glyph, members, role is None))
+
+    rows.sort(key=lambda r: (-r[2], r[0].lower()))
+
+    lines = [f"**Clans** ({len(rows)} configured)"]
+    for name, glyph, members, missing in rows:
+        suffix = " \u26a0\ufe0f missing role" if missing else ""
+        lines.append(f"-# {glyph} `{name}` \u2014 `{members}` members{suffix}")
+    return "\n".join(lines)
+
+
+# Each entry: (key, title, builder). Builders take (interaction, snap) and
+# return a Markdown body. The "roles" page is special-cased in
+# `_status_components` to wedge the Emblems button between sections, so its
+# builder slot is None.
+_StatusBuilder = Callable[[discord.Interaction, dict], str]
+_STATUS_PAGES: list[tuple[str, str, _StatusBuilder | None]] = [
+    ("bot",      "\U0001F916 Bot",         _status_page_bot),
+    ("roles",    "\U0001F6E1\ufe0f Roles", None),
+    ("channels", "\U0001F4FA Channels",    _status_page_channels),
+    ("ocr",      "\U0001F50D OCR",         _status_page_ocr),
+    ("stats",    "\U0001F4C8 Stats",       _status_page_stats),
+    ("clans",    "\U0001F3F0 Clans",       _status_page_clans),
 ]
-_STATUS_PAGE_INDEX: dict[str, int] = {key: idx for idx, (key, *_rest) in enumerate(_STATUS_PAGES)}
+
+# Pages that consume `analytics.summary()`. Computing the snapshot fires
+# ~7 SQL queries, so we only do it when the active page needs it.
+_PAGES_NEEDING_SNAPSHOT = frozenset({"ocr", "stats"})
+
+
+def _status_nav_row(page: int) -> dict:
+    last = len(_STATUS_PAGES) - 1
+    return {
+        "type": 1,
+        "components": [
+            {"type": 2, "style": 2, "label": "\u25C0 Prev",
+             "custom_id": f"status:{page - 1}", "disabled": page == 0},
+            {"type": 2, "style": 2,
+             "label": f"{page + 1}/{len(_STATUS_PAGES)}",
+             "custom_id": "status:noop", "disabled": True},
+            {"type": 2, "style": 2, "label": "Next \u25B6",
+             "custom_id": f"status:{page + 1}", "disabled": page >= last},
+            {"type": 2, "style": 1, "label": "\U0001F504 Refresh",
+             "custom_id": f"status:{page}"},
+        ],
+    }
 
 
 def _status_components(interaction: discord.Interaction, page: int) -> list[dict]:
     page = max(0, min(page, len(_STATUS_PAGES) - 1))
-    key, title, _desc, builder = _STATUS_PAGES[page]
-    snap = analytics.summary()  # cheap; reused for stats pages, ignored for live ones
-    header = {
-        "type": 10,
-        "content": f"### \U0001F4CA  Status \u2014 {title}",
-    }
-    nav_buttons = [
-        {"type": 2, "style": 2, "label": "\u25C0 Prev",
-         "custom_id": f"status:{page - 1}", "disabled": page == 0},
-        {"type": 2, "style": 2,
-         "label": f"{page + 1}/{len(_STATUS_PAGES)}",
-         "custom_id": "status:noop", "disabled": True},
-        {"type": 2, "style": 2, "label": "Next \u25B6",
-         "custom_id": f"status:{page + 1}",
-         "disabled": page >= len(_STATUS_PAGES) - 1},
-        {"type": 2, "style": 1, "label": "\U0001F504 Refresh",
-         "custom_id": f"status:{page}"},
-    ]
+    key, title, builder = _STATUS_PAGES[page]
+    nav_row = _status_nav_row(page)
+
     if key == "roles":
-        # Wedge the Emblems button between Clan slots and the rest
-        # of the Roles page so it lives directly under the clan listing.
+        # Wedge the Emblems button between Clan slots and Platform roles
+        # so it lives directly under the clan listing.
         clan_text, rest_text = _status_page_roles_split(interaction)
-        assign_row = {
-            "type": 1,
-            "components": [
-                {"type": 2, "style": 3,
-                 "label": "Emblems",
-                 "custom_id": "status:assign_emblems"},
-            ],
-        }
         container_components = [
             {"type": 10, "content": clan_text},
-            assign_row,
+            {"type": 1, "components": [
+                {"type": 2, "style": 3, "label": "Emblems",
+                 "custom_id": "status:assign_emblems"},
+            ]},
             {"type": 10, "content": rest_text},
-            {"type": 1, "components": nav_buttons},
+            nav_row,
         ]
     else:
-        body = builder(interaction, snap)
+        snap = analytics.summary() if key in _PAGES_NEEDING_SNAPSHOT else {}
+        assert builder is not None  # only the "roles" slot is None
         container_components = [
-            {"type": 10, "content": body},
-            {"type": 1, "components": nav_buttons},
+            {"type": 10, "content": builder(interaction, snap)},
+            nav_row,
         ]
-    container = {
-        "type": 17,
-        "accent_color": ACCENT_PASS,
-        "components": container_components,
-    }
-    return [header, container]
+
+    return [
+        {"type": 10, "content": f"### \U0001F4CA  Status \u2014 {title}"},
+        {
+            "type": 17,
+            "accent_color": ACCENT_PASS,
+            "components": container_components,
+        },
+    ]
 
 
 async def _interaction_callback(
@@ -2641,8 +2711,8 @@ async def _interaction_callback(
 
 
 async def _send_status_page(interaction: discord.Interaction, page: int) -> None:
-    components = _status_components(interaction, page)
     try:
+        components = _status_components(interaction, page)
         await _interaction_callback(interaction, 4, components)
     except Exception:
         logger.exception("status page %s failed", page)
@@ -3301,83 +3371,6 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         await _interaction_callback(interaction, 7, components)  # UPDATE_MESSAGE
     except Exception:
         logger.exception("pagination failed")
-
-
-def _stats_page_overview(s: dict) -> str:
-    if not s.get("available"):
-        return (
-            "**Analytics**\n"
-            "-# Storage unavailable.\n"
-            f"-# DB path: `{s.get('db_path')}`\n"
-            "-# Mount `/opt/golden-pagoda/data:/app/data` to enable."
-        )
-    total = s["total"]
-    by = s["by_outcome"]
-    p = by.get("pass", 0)
-    f = by.get("fail", 0)
-    inc = by.get("incomplete", 0)
-    unr = by.get("unreadable", 0)
-    err = by.get("ocr_error", 0)
-    pct = lambda n: f"{(n / total * 100):.1f}%" if total else "-"  # noqa: E731
-
-    win = s["windows"]
-    return (
-        f"**Verifications**\n"
-        f"-# Total: `{total}`\n"
-        f"-# Pass: `{p}` ({pct(p)})\n"
-        f"-# Incomplete: `{inc}` ({pct(inc)})\n"
-        f"-# Fail: `{f}` ({pct(f)})\n"
-        f"-# Unreadable: `{unr}` ({pct(unr)})\n"
-        f"-# OCR error: `{err}` ({pct(err)})\n"
-        f"\n**Windows**\n"
-        f"-# Last 24h: `{win.get('24h', 0)}`\n"
-        f"-# Last 7d: `{win.get('7d', 0)}`\n"
-        f"-# Last 30d: `{win.get('30d', 0)}`"
-    )
-
-
-def _status_page_clans(interaction: discord.Interaction | None) -> str:
-    guild = interaction.guild if interaction else None
-    if guild is None:
-        return "**Clans**\n-# No guild context."
-    configured = [s for s in CLAN_SLOTS if s.clan_name]
-    if not configured:
-        return "**Clans**\n-# No clan slots configured."
-
-    rows: list[tuple[str, str, int, bool]] = []  # (label, glyph, members, missing_role)
-    for slot in configured:
-        role = guild.get_role(slot.role_id) if slot.role_id else None
-        members = len(role.members) if role else 0
-        glyph = slot.emoji or "\u2022"
-        rows.append((slot.clan_name, glyph, members, role is None))
-
-    rows.sort(key=lambda r: (-r[2], r[0].lower()))
-
-    lines = [f"**Clans** ({len(rows)} configured)"]
-    for name, glyph, members, missing in rows:
-        suffix = " \u26a0\ufe0f missing role" if missing else ""
-        lines.append(f"-# {glyph} `{name}` \u2014 `{members}` members{suffix}")
-    return "\n".join(lines)
-
-
-def _status_page_ocr(s: dict) -> str:
-    backend = "OCR.space (engine 3)" if OCR_API_KEY else (
-        "Tesseract (local)" if pytesseract else "*(none configured)*"
-    )
-    lines = [
-        "**OCR**",
-        f"-# Backend: `{backend}`",
-        "",
-        "**Latency** (last 500 events)",
-    ]
-    ocr = s.get("ocr") or {}
-    if ocr.get("samples"):
-        lines.append(f"-# Samples: `{ocr['samples']}`")
-        lines.append(f"-# Avg: `{ocr['avg_ms']} ms`")
-        lines.append(f"-# p50: `{ocr['p50_ms']} ms` \u2022 p95: `{ocr['p95_ms']} ms`")
-    else:
-        lines.append("-# No samples yet.")
-    return "\n".join(lines)
 
 
 
