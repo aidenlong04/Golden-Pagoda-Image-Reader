@@ -4419,6 +4419,12 @@ def _can_use_profile(member: discord.Member) -> bool:
     ephemeral="Hide the reply so only you see it (default: true).",
     edit_mastery="Attach a dropdown to set your Mastery Rank (only on your own profile).",
 )
+# Hide /profile from everyone by default (default_member_permissions = 0).
+# Discord doesn't let a bot scope a command's visibility to a specific role,
+# so a server admin grants PROFILE_ACCESS_ROLE_ID via Server Settings →
+# Integrations → /profile. The _can_use_profile runtime check is the matching
+# safety net for the same role.
+@app_commands.default_permissions()
 async def profile_cmd(
     interaction: discord.Interaction,
     user: discord.Member | None = None,
