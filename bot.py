@@ -3784,7 +3784,7 @@ def _render_profile_card_png(
             canvas, platform_row[2], row_cx, plat_cy, plat_icon_px,
             label="Platform",
         )
-        row_cx += plat_icon_px + sc(16)
+        row_cx += plat_icon_px + sc(10)
     if len(syndicate_factions) == 1:
         sname, scolor, sbytes = syndicate_factions[0]
         syn_icon_px = sc(24)
