@@ -3592,11 +3592,13 @@ def _render_profile_card_png(
     A sibling of :func:`_render_progress_card_png` with the progress bar
     removed. The header stacks a gold "USER PROFILE" eyebrow, the member
     name, and a row of icons beneath it (the platform icon with a soft
-    gold glow, trailed by each syndicate's faction flag) on the left of
-    the circular avatar, with the Clan as a gold callout on the right.
-    Beneath the header the Mastery Rank sits in a gold capsule badge.
-    ``info_lines`` come from :func:`_member_profile_info_lines`. Rendered
-    at ``_PROGRESS_SS``x for crisp HiDPI output.
+    gold glow, trailed by the syndicate flags — a lone syndicate shows
+    its icon + faction-coloured name, two or more collapse to icon-only)
+    on the left of the circular avatar, with the Clan as a gold callout
+    on the right. Beneath the header the Mastery Rank sits in a gold
+    capsule badge. ``info_lines`` come from
+    :func:`_member_profile_info_lines`. Rendered at ``_PROGRESS_SS``x for
+    crisp HiDPI output.
     """
     s = _PROGRESS_SS
 
@@ -3759,10 +3761,11 @@ def _render_profile_card_png(
         fill=_PROGRESS_TEXT, anchor="lm",
     )
 
-    # Platform + syndicate flag icons share one row beneath the name
-    # (icon-only). The platform icon leads with a soft gold glow; each
-    # syndicate flag trails it, with a faction-coloured dot as the
-    # fallback when its custom emoji is unset.
+    # Platform + syndicate flags share one row beneath the name. The
+    # platform icon leads with a soft gold glow; a lone syndicate trails
+    # it as icon + faction-coloured name, while two or more collapse to
+    # icon-only flags (faction-coloured dot fallback when an emoji is
+    # unset).
     row_cx = text_x
     if platform_row is not None and platform_row[2]:
         plat_icon_px = sc(26)
@@ -3782,7 +3785,37 @@ def _render_profile_card_png(
             label="Platform",
         )
         row_cx += plat_icon_px + sc(16)
-    if syndicate_factions:
+    if len(syndicate_factions) == 1:
+        sname, scolor, sbytes = syndicate_factions[0]
+        syn_icon_px = sc(24)
+        if sbytes and _paste_emoji_icon(
+            canvas, sbytes, row_cx, plat_cy, syn_icon_px, label="Syndicate"
+        ):
+            row_cx += syn_icon_px + sc(9)
+        else:
+            r = syn_icon_px // 3
+            ImageDraw.Draw(canvas).ellipse(
+                (
+                    row_cx + syn_icon_px // 2 - r, plat_cy - r,
+                    row_cx + syn_icon_px // 2 + r, plat_cy + r,
+                ),
+                fill=(scolor or _PROGRESS_MUTED) + (255,),
+            )
+            row_cx += syn_icon_px + sc(9)
+        syn_font = _load_font(sc(15), bold=True)
+        nm = sname or ""
+        max_w = name_right_bound - row_cx
+        if draw.textlength(nm, font=syn_font) > max_w:
+            while nm and draw.textlength(
+                nm + "\u2026", font=syn_font
+            ) > max_w:
+                nm = nm[:-1]
+            nm = nm + "\u2026"
+        draw.text(
+            (row_cx, plat_cy), nm, font=syn_font,
+            fill=scolor or _PROGRESS_TEXT, anchor="lm",
+        )
+    elif syndicate_factions:
         syn_icon_px = sc(24)
         syn_gap = sc(10)
         for _sname, scolor, sbytes in syndicate_factions:
