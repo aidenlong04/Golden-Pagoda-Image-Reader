@@ -2804,7 +2804,7 @@ _PROGRESS_BORDER = (58, 62, 70)        # crisp outer hairline
 _PROGRESS_TRACK = (43, 45, 49)         # #2B2D31 bar track
 _PROGRESS_TRACK_EDGE = (24, 25, 28)    # track rim for definition
 _PROGRESS_FILL_START = (93, 208, 243)  # Warframe energy cyan
-_PROGRESS_FILL_END = (134, 230, 168)   # mint — gradient end
+_PROGRESS_FILL_END = (134, 230, 168)   # mint — gradient mid-stop
 _PROGRESS_FILL_GOLD = (208, 162, 80)   # Orokin gold for finished bars
 _PROGRESS_FILL_GOLD_END = (240, 214, 140)  # warm gold highlight end
 _PROGRESS_TEXT = (236, 238, 240)
@@ -2939,9 +2939,11 @@ def _segmented_bar(
     """Render a segmented progress bar: one rounded segment per
     verification category.
 
-    The first ``count`` segments carry the glassy energy gradient (gold
-    when complete) cropped from a single full-width fill so the light
-    flows continuously across the bar; the remaining segments are
+    The first ``count`` segments carry the glassy energy gradient —
+    Warframe energy cyan flowing through mint into Orokin gold, the gold
+    growing more pronounced toward the filled edge (fully gold when
+    complete) — cropped from a single full-width fill so the light flows
+    continuously across the bar; the remaining segments are
     recessed track with a faint amber "pending" tint so unmet categories
     read as outstanding. Small gaps separate the segments, and the last
     filled segment gets a soft leading-edge glow while in progress.
@@ -2954,18 +2956,35 @@ def _segmented_bar(
     line_w = max(1, int(round(1.5 * scale)))
     gap = max(2, int(round(4 * scale)))
 
+    # Horizontal gradient stops. In progress the bar flows from the
+    # Warframe energy cyan through mint and into Orokin gold, with the
+    # gold weighted toward the filled (right) edge so it grows more
+    # pronounced the further a member progresses — easing into the
+    # all-gold complete state. Filled segments crop their slice from this
+    # single full-width fill so the light flows continuously rather than
+    # restarting per segment.
     if complete:
-        start, end = _PROGRESS_FILL_GOLD, _PROGRESS_FILL_GOLD_END
+        stops = ((0.0, _PROGRESS_FILL_GOLD), (1.0, _PROGRESS_FILL_GOLD_END))
     else:
-        start, end = _PROGRESS_FILL_START, _PROGRESS_FILL_END
+        stops = (
+            (0.0, _PROGRESS_FILL_START),
+            (0.40, _PROGRESS_FILL_END),
+            (1.0, _PROGRESS_FILL_GOLD),
+        )
+    end = stops[-1][1]
 
-    # Full-width glassy fill (horizontal gradient + vertical shading blend
-    # + top gloss); filled segments crop their slice so the energy flows
-    # continuously rather than restarting per segment.
     t = np.linspace(0.0, 1.0, max(1, width), dtype=np.float32)
-    cs = np.array(start[:3], dtype=np.float32)
-    ce = np.array(end[:3], dtype=np.float32)
-    grad_row = cs + (ce - cs) * t[:, None]
+    xp = np.array([p for p, _ in stops], dtype=np.float32)
+    grad_row = np.stack(
+        [
+            np.interp(
+                t, xp,
+                np.array([c[ch] for _, c in stops], dtype=np.float32),
+            )
+            for ch in range(3)
+        ],
+        axis=1,
+    ).astype(np.float32)
     grad_base = np.repeat(grad_row[None, :, :], height, axis=0)
     shade = np.linspace(1.16, 0.80, height, dtype=np.float32)[:, None, None]
     fill_arr = np.empty((height, width, 4), dtype=np.uint8)
