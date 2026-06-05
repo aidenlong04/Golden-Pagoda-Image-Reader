@@ -3817,7 +3817,7 @@ def _render_profile_card_png(
         )
     elif syndicate_factions:
         syn_icon_px = sc(24)
-        syn_gap = sc(10)
+        syn_gap = sc(4)
         for _sname, scolor, sbytes in syndicate_factions:
             if row_cx + syn_icon_px > name_right_bound:
                 break
