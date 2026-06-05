@@ -1293,15 +1293,11 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
     if passed:
         # Order matters: the card grid fills row-major (index 0 = top-left,
         # 1 = top-right, 2 = bottom-left, 3 = bottom-right), so this order
-        # lays out as:  Profile | Mastery Rank  /  Clan | Platform  —
-        # keeping Clan directly under Profile in the left column.
-        if profile_name:
-            display_profile = (
-                profile_name if profile_name.startswith("Tenno #")
-                else _strip_clan_tag(profile_name)
-            )
+        # lays out as:  Clan | Mastery Rank  /  Profile | Platform  —
+        # keeping Profile directly under Clan in the left column.
+        if clan_name:
             info_lines.append(
-                ("Profile", display_profile, profile_emoji_bytes)
+                ("Clan", _strip_clan_tag(clan_name), clan_emoji_bytes)
             )
         if mastery_rank:
             mr_value = mastery_rank
@@ -1310,9 +1306,13 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
             info_lines.append(
                 ("Mastery Rank", mr_value, mastery_emoji_bytes)
             )
-        if clan_name:
+        if profile_name:
+            display_profile = (
+                profile_name if profile_name.startswith("Tenno #")
+                else _strip_clan_tag(profile_name)
+            )
             info_lines.append(
-                ("Clan", _strip_clan_tag(clan_name), clan_emoji_bytes)
+                ("Profile", display_profile, profile_emoji_bytes)
             )
         if member_platform:
             info_lines.append(
