@@ -2640,7 +2640,8 @@ def _status_nav_row(page: int) -> dict:
              "custom_id": "status:noop", "disabled": True},
             {"type": 2, "style": 2, "label": "Next \u25B6",
              "custom_id": f"status:{page + 1}", "disabled": page >= last},
-            {"type": 2, "style": 1, "label": "\U0001F504 Refresh",
+            {"type": 2, "style": 1,
+             "emoji": {"name": "\U0001F504"},
              "custom_id": f"status:{page}"},
         ],
     }
