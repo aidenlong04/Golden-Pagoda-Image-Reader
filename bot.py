@@ -1789,9 +1789,12 @@ def _incomplete_components(
     children: list[dict] = [
         {
             "type": 10,
+            # Custom emoji don't render inside markdown headings (Discord
+            # falls back to the `:name:` shortcode), so keep the heading
+            # plain and lead the reason subtext with the warning icon.
             "content": (
-                f"### {warn_icon}  Please select the missing roles\n"
-                f"-# {reason}"
+                f"### Please select the missing roles\n"
+                f"-# {warn_icon}  {reason}"
             ),
         },
     ]
@@ -3647,8 +3650,11 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             f"</clan-emblems:{cmd_id}>" if cmd_id else "`/clan-emblems`"
         )
         body = (
-            f"### <:GoldenPagoda_Emblem:1416905638428020877>  Emblems\n"
-            f"Click {mention} to set or clear a clan emoji.\n"
+            # Custom emoji don't render inside markdown headings; keep the
+            # heading plain and render the emblem inline on the body line.
+            f"### Emblems\n"
+            f"<:GoldenPagoda_Emblem:1416905638428020877>  Click {mention} "
+            f"to set or clear a clan emoji.\n"
             f"-# > Select clan member role and then input clan emblem emoji. "
             f"Leave emoji blank to clear"
         )
