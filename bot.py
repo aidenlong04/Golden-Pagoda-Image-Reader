@@ -3153,8 +3153,12 @@ def _render_progress_card_png(
     miss_gap = 12
     base_h = _PROGRESS_CARD_H
     info_block_h = 0
+    # Regular rows render in two columns so the reference data spreads
+    # across the full width instead of bunching on the left; the block
+    # height therefore scales with the number of GRID rows (ceil(n / 2)).
+    n_grid_rows = (len(norm_rows) + 1) // 2
     if has_info:
-        info_block_h = 14 + len(norm_rows) * row_h
+        info_block_h = 14 + n_grid_rows * row_h
         if missing_row:
             info_block_h += miss_gap + missing_h
         info_block_h += 14
@@ -3270,29 +3274,16 @@ def _render_progress_card_png(
             width=max(1, sc(1)),
         )
 
-        # (label, value, emoji, label_font, value_font, row_h, icon, gap)
-        specs: list[tuple] = []
-        for label, value, emoji_bytes in norm_rows:
-            specs.append((
-                label, value, emoji_bytes, info_label_font,
-                info_value_font, sc(row_h), sc(22), 0,
-            ))
-        if missing_row:
-            specs.append((
-                missing_row[0], missing_row[1], missing_row[2],
-                miss_label_font, miss_value_font, sc(missing_h), sc(27),
-                sc(miss_gap),
-            ))
-
         leading_pad = sc(8)
         icon_gap = sc(8)
-        row_y = divider_y + sc(14)
-        for (label, value, emoji_bytes, lf, vf, rhpx, icon_px,
-             top_gap) in specs:
-            row_y += top_gap
-            cy = row_y + rhpx // 2
-            row_x = sc(pad) + leading_pad
 
+        def _draw_cell(
+            x0: int, cy: int, label: str, value: str,
+            emoji_bytes: bytes | None, lf: ImageFont.FreeTypeFont,
+            vf: ImageFont.FreeTypeFont, icon_px: int, right_edge: int,
+        ) -> None:
+            # Draw "[icon]  Label: Value" anchored at x0, vertically
+            # centred on cy and clipped/ellipsized to right_edge.
             icon_img: Image.Image | None = None
             if emoji_bytes:
                 try:
@@ -3300,7 +3291,7 @@ def _render_progress_card_png(
                     src.load()
                     src = src.convert("RGBA")
                     # Preserve aspect ratio (contain), then centre inside
-                    # the square icon box so non-square art never stretches.
+                    # the square box so non-square art never stretches.
                     src = ImageOps.contain(
                         src, (icon_px, icon_px), Image.LANCZOS
                     )
@@ -3321,28 +3312,24 @@ def _render_progress_card_png(
                     icon_img = None
 
             if icon_img is not None:
-                canvas.alpha_composite(
-                    icon_img, (row_x, cy - icon_px // 2)
-                )
+                canvas.alpha_composite(icon_img, (x0, cy - icon_px // 2))
                 icon_img.close()
-                text_start_x = row_x + icon_px + icon_gap
+                text_x0 = x0 + icon_px + icon_gap
             else:
                 bullet = "\u2022 "
                 draw.text(
-                    (row_x, cy), bullet, font=lf,
+                    (x0, cy), bullet, font=lf,
                     fill=_PROGRESS_MUTED, anchor="lm",
                 )
-                bullet_w = draw.textlength(bullet, font=lf)
-                text_start_x = row_x + int(bullet_w)
+                text_x0 = x0 + int(draw.textlength(bullet, font=lf))
 
             label_text = f"{label}: "
             draw.text(
-                (text_start_x, cy), label_text, font=lf,
+                (text_x0, cy), label_text, font=lf,
                 fill=_PROGRESS_MUTED, anchor="lm",
             )
-            label_w = draw.textlength(label_text, font=lf)
-            value_x = text_start_x + label_w
-            max_value_w = W - sc(pad) - value_x
+            value_x = text_x0 + draw.textlength(label_text, font=lf)
+            max_value_w = right_edge - value_x
             v = value or ""
             if draw.textlength(v, font=vf) > max_value_w:
                 while v and draw.textlength(
@@ -3354,7 +3341,42 @@ def _render_progress_card_png(
                 (value_x, cy), v, font=vf,
                 fill=_PROGRESS_TEXT, anchor="lm",
             )
-            row_y += rhpx
+
+        # Two-column grid: pull the reference data outward to use the full
+        # card width. Items fill left-to-right, top-to-bottom.
+        left_x = sc(pad) + leading_pad
+        inner_right = W - sc(pad) - leading_pad
+        col_gap = sc(24)
+        mid_x = (left_x + inner_right) // 2
+        left_col_right = mid_x - col_gap // 2
+        right_col_x = mid_x + col_gap // 2
+        icon_px = sc(22)
+        row_y = divider_y + sc(14)
+        for i in range(0, len(norm_rows), 2):
+            cy = row_y + sc(row_h) // 2
+            lbl, val, emj = norm_rows[i]
+            _draw_cell(
+                left_x, cy, lbl, val, emj, info_label_font,
+                info_value_font, icon_px, left_col_right,
+            )
+            if i + 1 < len(norm_rows):
+                lbl2, val2, emj2 = norm_rows[i + 1]
+                _draw_cell(
+                    right_col_x, cy, lbl2, val2, emj2, info_label_font,
+                    info_value_font, icon_px, inner_right,
+                )
+            row_y += sc(row_h)
+
+        # Missing Data spans the full width, last and larger — the card's
+        # call to action set apart from the grid above.
+        if missing_row:
+            row_y += sc(miss_gap)
+            cy = row_y + sc(missing_h) // 2
+            _draw_cell(
+                left_x, cy, missing_row[0], missing_row[1], missing_row[2],
+                miss_label_font, miss_value_font, sc(27), inner_right,
+            )
+            row_y += sc(missing_h)
 
     buf = io.BytesIO()
     # Keep the alpha channel so the rounded corners stay transparent and
