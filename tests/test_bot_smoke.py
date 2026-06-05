@@ -215,6 +215,27 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
         )
         self.assertIsInstance(result, list)
 
+    def test_render_profile_card_png_returns_png(self):
+        """_render_profile_card_png returns PNG bytes for full, partial
+        (em-dash placeholders) and empty grids without raising."""
+        rows = [
+            ("Clan", "Golden Tenno", None),
+            ("Platform", "PC", None),
+            ("Mastery Rank", "Mastery Rank 28", None),
+            ("Syndicate", "\u2014", None),
+        ]
+        for info in (rows, [("Clan", "\u2014", None)], []):
+            png = self.bot_module._render_profile_card_png(
+                avatar_bytes=None,
+                display_name="Tenno",
+                info_lines=info,
+            )
+            self.assertIsInstance(png, bytes)
+            self.assertTrue(
+                png.startswith(b"\x89PNG\r\n\x1a\n"),
+                "expected PNG magic bytes",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

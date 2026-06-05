@@ -1612,6 +1612,7 @@ OPERATOR_EMOJI_RAW = os.getenv(
 MASTERY_RANK_EMOJI_RAW = os.getenv(
     "MASTERY_RANK_EMOJI", "<:mastery:1511640736318226553>"
 ).strip()
+SYNDICATE_EMOJI_RAW = os.getenv("SYNDICATE_EMOJI", "").strip()
 WARNING_EMOJI_RAW = os.getenv(
     "WARNING_EMOJI", "<:WarningStatus:1512253042270142634>"
 ).strip()
@@ -1964,6 +1965,75 @@ def _role_categories_for(role_ids: set[int]) -> list[tuple[str, bool]]:
             continue
         out.append((name, any(rid in role_ids for rid in ids)))
     return out
+
+
+async def _member_profile_info_lines(
+    member: discord.Member,
+) -> list[tuple[str, str, bytes | None]]:
+    """Gather a member's role-derived verification data for the /profile
+    card: ``(label, value, emoji_bytes)`` rows for every category that is
+    *configured* on the server (Clan, Platform, Mastery Rank, Syndicate).
+
+    Values come straight from the member's roles (no OCR), so the card
+    reflects exactly what they hold. A category the member hasn't earned
+    yet renders an em-dash placeholder so the grid stays balanced. The row
+    order (Clan, Platform, Mastery Rank, Syndicate) lays out row-major as
+    ``Clan | Platform`` over ``Mastery Rank | Syndicate``.
+    """
+    role_ids = {r.id for r in member.roles}
+    rows: list[tuple[str, str, bytes | None]] = []
+
+    # Clan — match the member's clan role to its slot for name + emoji.
+    if any(s.role_id for s in CLAN_SLOTS):
+        slot = next(
+            (s for s in CLAN_SLOTS if s.role_id and s.role_id in role_ids),
+            None,
+        )
+        if slot is not None:
+            rows.append((
+                "Clan",
+                _strip_clan_tag(slot.clan_name or "") or "\u2014",
+                await _fetch_emoji_bytes(slot.emoji),
+            ))
+        else:
+            rows.append(("Clan", "\u2014", None))
+
+    # Platform — first configured platform role the member holds.
+    platforms = {p: rid for p, rid in PLATFORM_ROLE_IDS.items() if rid}
+    if platforms:
+        member_platform = next(
+            (p for p, rid in platforms.items() if rid in role_ids), None
+        )
+        if member_platform is not None:
+            rows.append((
+                "Platform",
+                member_platform,
+                await _fetch_emoji_bytes(PLATFORM_EMOJIS.get(member_platform)),
+            ))
+        else:
+            rows.append(("Platform", "\u2014", None))
+
+    # Mastery Rank — use the actual Discord role name(s) the member holds.
+    if MR_ROLE_IDS:
+        mr_names = [r.name for r in member.roles if r.id in set(MR_ROLE_IDS)]
+        rows.append((
+            "Mastery Rank",
+            ", ".join(mr_names) if mr_names else "\u2014",
+            await _fetch_emoji_bytes(MASTERY_RANK_EMOJI_RAW),
+        ))
+
+    # Syndicate — members may pledge to several, so join every match.
+    if SYNDICATE_ROLE_IDS:
+        syn_names = [
+            r.name for r in member.roles if r.id in set(SYNDICATE_ROLE_IDS)
+        ]
+        rows.append((
+            "Syndicate",
+            ", ".join(syn_names) if syn_names else "\u2014",
+            await _fetch_emoji_bytes(SYNDICATE_EMOJI_RAW),
+        ))
+
+    return rows
 
 
 def _help_link_buttons(guild: "discord.Guild | None") -> list[tuple[str, str]]:
@@ -3101,6 +3171,108 @@ def _paste_emoji_icon(
         return False
 
 
+def _draw_info_grid(
+    canvas: Image.Image,
+    *,
+    norm_rows: list[tuple[str, str, bytes | None]],
+    width: int,
+    divider_y: int,
+    pad: int,
+    row_h: int,
+    scale: int,
+) -> None:
+    """Draw the two-column reference grid shared by the progress and
+    profile cards.
+
+    Renders a hairline divider at ``divider_y`` then fills each
+    ``(label, value, emoji_bytes)`` row into a cell as "[icon]  Label:
+    Value" (icon aspect-preserved, bullet fallback), pulling the data
+    outward across the full card width. Items fill left-to-right,
+    top-to-bottom. ``divider_y`` and ``width`` are in supersampled pixels;
+    ``pad`` / ``row_h`` are logical units scaled by ``scale``.
+    """
+    s = scale
+
+    def sc(v: float) -> int:
+        return int(round(v * s))
+
+    draw = ImageDraw.Draw(canvas)
+    W = width
+    info_label_font = _load_font(sc(16), bold=True)
+    info_value_font = _load_font(sc(18), bold=True)
+    draw.line(
+        [(sc(pad + 8), divider_y), (W - sc(pad + 8), divider_y)],
+        fill=_PROGRESS_BG_EDGE,
+        width=max(1, sc(1)),
+    )
+
+    leading_pad = sc(8)
+    icon_gap = sc(8)
+
+    def _draw_cell(
+        x0: int, cy: int, label: str, value: str,
+        emoji_bytes: bytes | None, lf: ImageFont.FreeTypeFont,
+        vf: ImageFont.FreeTypeFont, icon_px: int, right_edge: int,
+    ) -> None:
+        # Draw "[icon]  Label: Value" anchored at x0, vertically
+        # centred on cy and clipped/ellipsized to right_edge.
+        if _paste_emoji_icon(
+            canvas, emoji_bytes, x0, cy, icon_px, label=label
+        ):
+            text_x0 = x0 + icon_px + icon_gap
+        else:
+            bullet = "\u2022 "
+            draw.text(
+                (x0, cy), bullet, font=lf,
+                fill=_PROGRESS_MUTED, anchor="lm",
+            )
+            text_x0 = x0 + int(draw.textlength(bullet, font=lf))
+
+        label_text = f"{label}: "
+        draw.text(
+            (text_x0, cy), label_text, font=lf,
+            fill=_PROGRESS_MUTED, anchor="lm",
+        )
+        value_x = text_x0 + draw.textlength(label_text, font=lf)
+        max_value_w = right_edge - value_x
+        v = value or ""
+        if draw.textlength(v, font=vf) > max_value_w:
+            while v and draw.textlength(
+                v + "\u2026", font=vf
+            ) > max_value_w:
+                v = v[:-1]
+            v = v + "\u2026"
+        draw.text(
+            (value_x, cy), v, font=vf,
+            fill=_PROGRESS_TEXT, anchor="lm",
+        )
+
+    # Two-column grid: pull the reference data outward to use the full
+    # card width. Items fill left-to-right, top-to-bottom.
+    left_x = sc(pad) + leading_pad
+    inner_right = W - sc(pad) - leading_pad
+    col_gap = sc(24)
+    mid_x = (left_x + inner_right) // 2
+    left_col_right = mid_x - col_gap // 2
+    right_col_x = mid_x + col_gap // 2
+    icon_px = sc(22)
+    row_y = divider_y + sc(14)
+    for i in range(0, len(norm_rows), 2):
+        cy = row_y + sc(row_h) // 2
+        lbl, val, emj = norm_rows[i]
+        _draw_cell(
+            left_x, cy, lbl, val, emj, info_label_font,
+            info_value_font, icon_px, left_col_right,
+        )
+        if i + 1 < len(norm_rows):
+            lbl2, val2, emj2 = norm_rows[i + 1]
+            _draw_cell(
+                right_col_x, cy, lbl2, val2, emj2, info_label_font,
+                info_value_font, icon_px, inner_right,
+            )
+        row_y += sc(row_h)
+
+
 def _render_progress_card_png(
     *,
     avatar_bytes: bytes | None,
@@ -3294,89 +3466,127 @@ def _render_progress_card_png(
         )
 
     # Render the labeled reference rows beneath the divider in a
-    # two-column grid (profile / platform / clan / mastery). Each cell is
+    # two-column grid (clan / mastery / profile / platform). Each cell is
     # "[icon]  Label: Value" with the icon aspect-preserved (no stretch)
     # and vertically centred. The missing-data callout lives above, under
     # the bar, so the grid is purely the data that was read.
     if norm_rows:
-        info_label_font = _load_font(sc(16), bold=True)
-        info_value_font = _load_font(sc(18), bold=True)
-        divider_y = sc(base_h)
-        draw.line(
-            [(sc(pad + 8), divider_y), (W - sc(pad + 8), divider_y)],
-            fill=_PROGRESS_BG_EDGE,
-            width=max(1, sc(1)),
+        _draw_info_grid(
+            canvas, norm_rows=norm_rows, width=W, divider_y=sc(base_h),
+            pad=pad, row_h=row_h, scale=s,
         )
-
-        leading_pad = sc(8)
-        icon_gap = sc(8)
-
-        def _draw_cell(
-            x0: int, cy: int, label: str, value: str,
-            emoji_bytes: bytes | None, lf: ImageFont.FreeTypeFont,
-            vf: ImageFont.FreeTypeFont, icon_px: int, right_edge: int,
-        ) -> None:
-            # Draw "[icon]  Label: Value" anchored at x0, vertically
-            # centred on cy and clipped/ellipsized to right_edge.
-            if _paste_emoji_icon(
-                canvas, emoji_bytes, x0, cy, icon_px, label=label
-            ):
-                text_x0 = x0 + icon_px + icon_gap
-            else:
-                bullet = "\u2022 "
-                draw.text(
-                    (x0, cy), bullet, font=lf,
-                    fill=_PROGRESS_MUTED, anchor="lm",
-                )
-                text_x0 = x0 + int(draw.textlength(bullet, font=lf))
-
-            label_text = f"{label}: "
-            draw.text(
-                (text_x0, cy), label_text, font=lf,
-                fill=_PROGRESS_MUTED, anchor="lm",
-            )
-            value_x = text_x0 + draw.textlength(label_text, font=lf)
-            max_value_w = right_edge - value_x
-            v = value or ""
-            if draw.textlength(v, font=vf) > max_value_w:
-                while v and draw.textlength(
-                    v + "\u2026", font=vf
-                ) > max_value_w:
-                    v = v[:-1]
-                v = v + "\u2026"
-            draw.text(
-                (value_x, cy), v, font=vf,
-                fill=_PROGRESS_TEXT, anchor="lm",
-            )
-
-        # Two-column grid: pull the reference data outward to use the full
-        # card width. Items fill left-to-right, top-to-bottom.
-        left_x = sc(pad) + leading_pad
-        inner_right = W - sc(pad) - leading_pad
-        col_gap = sc(24)
-        mid_x = (left_x + inner_right) // 2
-        left_col_right = mid_x - col_gap // 2
-        right_col_x = mid_x + col_gap // 2
-        icon_px = sc(22)
-        row_y = divider_y + sc(14)
-        for i in range(0, len(norm_rows), 2):
-            cy = row_y + sc(row_h) // 2
-            lbl, val, emj = norm_rows[i]
-            _draw_cell(
-                left_x, cy, lbl, val, emj, info_label_font,
-                info_value_font, icon_px, left_col_right,
-            )
-            if i + 1 < len(norm_rows):
-                lbl2, val2, emj2 = norm_rows[i + 1]
-                _draw_cell(
-                    right_col_x, cy, lbl2, val2, emj2, info_label_font,
-                    info_value_font, icon_px, inner_right,
-                )
-            row_y += sc(row_h)
 
     buf = io.BytesIO()
     # Keep the alpha channel so the rounded corners stay transparent and
     # blend into Discord's message background instead of showing as black.
+    canvas.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _render_profile_card_png(
+    *,
+    avatar_bytes: bytes | None,
+    display_name: str,
+    info_lines: list[tuple] | None = None,
+) -> bytes:
+    """Render the "user profile" card and return PNG bytes.
+
+    A sibling of :func:`_render_progress_card_png` with the progress bar
+    removed: same rounded slate panel, circular avatar and two-column
+    reference grid (shared via :func:`_draw_info_grid`), but the header is
+    refined to a gold "USER PROFILE" eyebrow above the member name since
+    there is no bar/percentage to anchor the layout. ``info_lines`` are
+    ``(label, value)`` or ``(label, value, emoji_png_bytes)`` rows and
+    fill the grid row-major (Clan | Platform over Mastery Rank |
+    Syndicate). Rendered at ``_PROGRESS_SS``x for crisp HiDPI output.
+    """
+    s = _PROGRESS_SS
+
+    def sc(v: float) -> int:
+        return int(round(v * s))
+
+    # Normalize entries to (label, value, emoji_bytes|None). The profile
+    # card has no "Missing" callout, so every row flows into the grid.
+    norm_rows: list[tuple[str, str, bytes | None]] = []
+    for entry in info_lines or []:
+        emoji = entry[2] if len(entry) >= 3 else None
+        norm_rows.append((entry[0], entry[1], emoji))
+
+    pad = 22
+    row_h = 30
+    # Header zone holds only the avatar + eyebrow + name now that the bar
+    # is gone, so it can be tighter than the progress card's.
+    header_h = 118
+    base_h = header_h + 12
+    info_block_h = 0
+    n_grid_rows = (len(norm_rows) + 1) // 2
+    if norm_rows:
+        info_block_h = 14 + n_grid_rows * row_h + 16
+    card_h = base_h + info_block_h
+
+    W, H = sc(_PROGRESS_CARD_W), sc(card_h)
+    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    panel = _vertical_gradient(W, H, _PROGRESS_BG_TOP, _PROGRESS_BG_BOTTOM)
+    panel_mask = _rounded_mask(W, H, sc(_PROGRESS_RADIUS))
+    canvas.paste(panel, (0, 0), panel_mask)
+    ImageDraw.Draw(canvas).rounded_rectangle(
+        (0, 0, W - 1, H - 1),
+        radius=sc(_PROGRESS_RADIUS), outline=_PROGRESS_BORDER + (255,),
+        width=sc(2),
+    )
+
+    avatar_px = sc(_PROGRESS_AVATAR_SIZE)
+    avatar = _circular_avatar(avatar_bytes, avatar_px)
+    avatar_y = sc((header_h - _PROGRESS_AVATAR_SIZE) // 2)
+
+    shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).ellipse(
+        (
+            sc(pad) + sc(6), avatar_y + avatar_px - sc(10),
+            sc(pad) + avatar_px - sc(6), avatar_y + avatar_px + sc(14),
+        ),
+        fill=(0, 0, 0, 120),
+    )
+    shadow = shadow.filter(ImageFilter.GaussianBlur(sc(7)))
+    canvas.alpha_composite(shadow)
+    canvas.alpha_composite(avatar, (sc(pad), avatar_y))
+
+    text_x = sc(pad) + avatar_px + sc(22)
+    right_x = W - sc(pad)
+    draw = ImageDraw.Draw(canvas)
+
+    eyebrow_font = _load_font(sc(14), bold=True)
+    name_font = _load_font(sc(28), bold=True)
+
+    # Centre the eyebrow + name as a group on the header's vertical
+    # midline so the avatar and text read as one balanced row.
+    cy = sc(header_h) // 2
+    eyebrow = "USER PROFILE"
+    draw.text(
+        (text_x, cy - sc(13)), eyebrow, font=eyebrow_font,
+        fill=_PROGRESS_ACCENT, anchor="lm",
+    )
+
+    name = display_name or "Member"
+    max_name_w = right_x - text_x
+    if draw.textlength(name, font=name_font) > max_name_w:
+        while name and draw.textlength(
+            name + "\u2026", font=name_font
+        ) > max_name_w:
+            name = name[:-1]
+        name = name + "\u2026"
+    draw.text(
+        (text_x, cy + sc(10)), name, font=name_font,
+        fill=_PROGRESS_TEXT, anchor="lm",
+    )
+
+    if norm_rows:
+        _draw_info_grid(
+            canvas, norm_rows=norm_rows, width=W, divider_y=sc(base_h),
+            pad=pad, row_h=row_h, scale=s,
+        )
+
+    buf = io.BytesIO()
     canvas.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
@@ -3535,6 +3745,56 @@ async def progress_cmd(
         if not interaction.response.is_done():
             await interaction.response.send_message(
                 "\u274C Failed to render progress.", ephemeral=True
+            )
+
+
+@tree.command(
+    name="profile",
+    description="Show a member's Warframe verification profile card.",
+)
+@app_commands.describe(
+    user="View another member's profile (defaults to yourself).",
+    ephemeral="Only you can see the reply when true (default: false).",
+)
+async def profile_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    ephemeral: bool = False,
+) -> None:
+    target = user or interaction.user
+    if not isinstance(target, discord.Member):
+        await interaction.response.send_message(
+            "\u274C /profile can only be used in a server.", ephemeral=True
+        )
+        return
+
+    display_name = target.display_name
+    avatar_asset = target.display_avatar or target.default_avatar
+    avatar_url = avatar_asset.replace(size=256, format="png").url
+
+    # Gather role-derived data first, then render off the event loop. The
+    # card carries the same reference grid as /progress (Clan / Platform /
+    # Mastery / Syndicate) without the progress bar.
+    try:
+        await interaction.response.defer(ephemeral=ephemeral)
+        info = await _member_profile_info_lines(target)
+        avatar_bytes = await _fetch_avatar_bytes(avatar_url)
+        png = await asyncio.to_thread(
+            _render_profile_card_png,
+            avatar_bytes=avatar_bytes,
+            display_name=display_name,
+            info_lines=info,
+        )
+        await interaction.followup.send(
+            file=discord.File(io.BytesIO(png), filename="profile.png"),
+            ephemeral=ephemeral,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except Exception:
+        logger.exception("/profile failed")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "\u274C Failed to render profile.", ephemeral=True
             )
 
 
