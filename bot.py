@@ -114,7 +114,6 @@ def _float_env(name: str, default: float = 0.0) -> float:
 
 TARGET_CHANNEL_ID = _int_env("TARGET_CHANNEL_ID")
 GUILD_ID = _int_env("GUILD_ID", 1361846841905381629)
-PASS_INFO_CHANNEL_ID = _int_env("PASS_INFO_CHANNEL_ID", 1392582268769271950)
 
 # Platform name → list of acceptable Discord role-name aliases (case-insensitive).
 PLATFORM_ROLE_ALIASES: dict[str, tuple[str, ...]] = {
@@ -1347,14 +1346,13 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
     nick_target = _nickname_suggestion(member, profile_name)
     if passed:
         # _pass_components owns the entire pass reply: the progress card
-        # image on top, then ONE gold container holding every button (the
-        # call-sign choices plus "Pick Roles"). Hand it the nick
-        # suggestion directly rather than appending a separate prompt.
+        # image on top, then ONE gold container holding the call-sign
+        # choices. Hand it the nick suggestion directly rather than
+        # appending a separate prompt.
         components = _pass_components(
             profile_name, clan_name,
             clan_emoji=clan_emoji,
             mastery_rank=mastery_rank,
-            link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
             progress_attachment="progress.png" if progress_png else None,
             nick_suggestion=nick_target,
             user_id=member.id,
@@ -1610,9 +1608,6 @@ CLAN_EMOJI = os.getenv("CLAN_EMOJI", "").strip() or "\U0001F6E1\ufe0f"  # 🛡�
 OPERATOR_EMOJI_RAW = os.getenv(
     "OPERATOR_EMOJI", "<:operator:1467922510908494098>"
 ).strip()
-PICK_ROLES_EMOJI_RAW = os.getenv(
-    "PICK_ROLES_EMOJI", "<:roles:1502055976830894291>"
-).strip()
 MASTERY_RANK_EMOJI_RAW = os.getenv(
     "MASTERY_RANK_EMOJI", "<:mastery:1511640736318226553>"
 ).strip()
@@ -1621,29 +1616,9 @@ WARNING_EMOJI_RAW = os.getenv(
 ).strip()
 
 
-def _emoji_to_button_payload(raw: str) -> dict | None:
-    """Parse a `<:name:id>` (or `<a:name:id>`) string into the Discord
-    button-emoji payload `{"id": str, "name": str, "animated": bool}`.
-    Returns None for unicode emojis (callers can just prefix the label)."""
-    if not raw:
-        return None
-    m = re.match(r"^<(a?):([A-Za-z0-9_]{2,}):(\d{15,25})>$", raw)
-    if not m:
-        return None
-    return {"id": m.group(3), "name": m.group(2), "animated": m.group(1) == "a"}
-
-
-PICK_ROLES_EMOJI_PAYLOAD = _emoji_to_button_payload(PICK_ROLES_EMOJI_RAW)
-
-
 def _link_button(label: str, url: str) -> dict:
-    """Build a Components V2 Link button (style 5), attaching the
-    "Pick Roles" custom emoji when configured so every entry point
-    renders it consistently."""
-    btn: dict = {"type": 2, "style": 5, "label": label, "url": url}
-    if label == "Pick Roles" and PICK_ROLES_EMOJI_PAYLOAD is not None:
-        btn["emoji"] = PICK_ROLES_EMOJI_PAYLOAD
-    return btn
+    """Build a Components V2 Link button (style 5)."""
+    return {"type": 2, "style": 5, "label": label, "url": url}
 
 
 def _link_button_row(
@@ -1665,7 +1640,6 @@ def _pass_components(
     *,
     clan_emoji: str | None = None,
     mastery_rank: str | None = None,
-    link_buttons: list[tuple[str, str]] | None = None,
     progress_attachment: str | None = None,
     nick_suggestion: str | None = None,
     user_id: int | None = None,
@@ -1677,12 +1651,9 @@ def _pass_components(
     # Normal path: the profile / clan / mastery / missing bullets are
     # rendered INTO the progress PNG, so the reply is just the image on
     # top (a top-level media gallery, OUTSIDE any container) followed by a
-    # SINGLE gold container holding every button in one action row — the
-    # in-game-name call-sign choices (when there's a name worth
-    # suggesting) plus the "Pick Roles" Link button. Folding the nickname
-    # prompt in here keeps the whole pass reply to one image + one
-    # container, and Pick Roles still ALWAYS sends even when OCR falls
-    # back to "Tenno #N" and there's no name to host.
+    # SINGLE gold container holding the in-game-name call-sign choices
+    # (when there's a name worth suggesting). Folding the nickname prompt
+    # in here keeps the whole pass reply to one image + one container.
     if progress_attachment:
         top_components: list[dict] = [{
             "type": 12,
@@ -1691,8 +1662,6 @@ def _pass_components(
         caption, row_buttons = _callsign_buttons(
             nick_suggestion, user_id, current_nick
         )
-        for lbl, url in (link_buttons or []):
-            row_buttons.append(_link_button(lbl, url))
         children = list(caption)
         if row_buttons:
             children.append({"type": 1, "components": row_buttons[:5]})
@@ -1706,8 +1675,8 @@ def _pass_components(
 
     # Fallback path (progress card render failed): the bullets live in
     # text instead of the image, but the shape stays identical — one gold
-    # container holding the bullet list, the call-sign prompt, and Pick
-    # Roles, so there's never a stray container or loose action row.
+    # container holding the bullet list and the call-sign prompt, so
+    # there's never a stray container or loose action row.
     display_clan = _strip_clan_tag(clan) if clan else None
     clan_part = (
         f"> * {emoji} **`{display_clan}`**"
@@ -1742,8 +1711,6 @@ def _pass_components(
     caption, row_buttons = _callsign_buttons(
         nick_suggestion, user_id, current_nick
     )
-    for lbl, url in (link_buttons or []):
-        row_buttons.append(_link_button(lbl, url))
     children = [{"type": 10, "content": "\n".join(inner_lines)}, *caption]
     if row_buttons:
         children.append({"type": 1, "components": row_buttons[:5]})
@@ -1752,29 +1719,6 @@ def _pass_components(
         "accent_color": ACCENT_PASS,
         "components": children,
     }]
-
-
-def _channel_url(guild_id: int, channel_id: int) -> str:
-    return f"https://discord.com/channels/{guild_id}/{channel_id}"
-
-
-def _resolve_pass_link_buttons(
-    guild: discord.Guild | None, clan_name: str | None
-) -> list[tuple[str, str]]:
-    """Return [(label, url), ...] for pass response buttons.
-
-    Currently a single "Pick Roles" link button targeting
-    ``PASS_INFO_CHANNEL_ID``. ``clan_name`` is accepted for signature
-    stability with callers but is no longer used (the clan-chat button
-    was retired).
-    """
-    buttons: list[tuple[str, str]] = []
-    if guild is None:
-        return buttons
-    pick = guild.get_channel(PASS_INFO_CHANNEL_ID)
-    if pick is not None:
-        buttons.append(("Pick Roles", _channel_url(guild.id, pick.id)))
-    return buttons
 
 
 def _fail_components(headline: str, reason: str, *, image_url: str | None = None) -> list[dict]:
@@ -1933,9 +1877,8 @@ def _callsign_buttons(
     offering.
 
     Single source of truth shared by the pass reply (which folds these
-    into its gold container alongside Pick Roles) and the standalone
-    incomplete-flow prompt, so the caption text and the two ``nick:``
-    buttons are defined once.
+    into its gold container) and the standalone incomplete-flow prompt,
+    so the caption text and the two ``nick:`` buttons are defined once.
     """
     if not (suggestion and user_id is not None):
         return [], []
@@ -1956,17 +1899,11 @@ def _callsign_buttons(
 
 def _nickname_prompt_components(
     suggestion: str, user_id: int, *, current_nick: str = "",
-    link_buttons: list[tuple[str, str]] | None = None,
 ) -> list[dict]:
     """Standalone V2 message for the in-game-name selection prompt.
 
-    Layout (per design spec):
-      - Container (gold accent) with a "pick your call sign!" caption.
-      - Action row: server-nick button, in-game-name button, plus any
-        Link buttons supplied via ``link_buttons`` (capped at Discord's
-        5-per-row limit). On the verification PASS flow the "Pick Roles"
-        Link button is threaded in here so it sits alongside the call
-        sign choices.
+    Layout: one gold-accent container with a "pick your call sign!"
+    caption and an action row of the server-nick + in-game-name buttons.
 
     The two callsign buttons reuse the existing ``nick:y:<uid>:<encoded>``
     / ``nick:n:<uid>:<encoded>`` custom_id scheme so
@@ -1974,8 +1911,6 @@ def _nickname_prompt_components(
     place via UPDATE_MESSAGE.
     """
     caption, row_buttons = _callsign_buttons(suggestion, user_id, current_nick)
-    for lbl, url in (link_buttons or []):
-        row_buttons.append(_link_button(lbl, url))
 
     # Caption AND buttons live INSIDE one gold container so the prompt
     # reads as a single embedded block (no stray action row floating
@@ -2408,7 +2343,6 @@ async def preview_responses(interaction: discord.Interaction) -> None:
         else "Golden Tenno"
     )
     sample_emoji = (CLAN_SLOTS[0].emoji if CLAN_SLOTS else None) or CLAN_EMOJI
-    pass_buttons = _resolve_pass_link_buttons(interaction.guild, sample_clan)
     sample_uid = interaction.user.id
 
     samples: list[tuple[str, list[dict]]] = [
@@ -2419,7 +2353,6 @@ async def preview_responses(interaction: discord.Interaction) -> None:
                 sample_clan,
                 clan_emoji=sample_emoji,
                 mastery_rank="MR 28",
-                link_buttons=pass_buttons,
                 missing_categories=["Platform", "Syndicate"],
             ),
         ),
@@ -2430,7 +2363,6 @@ async def preview_responses(interaction: discord.Interaction) -> None:
                 sample_clan,
                 clan_emoji=sample_emoji,
                 mastery_rank="MR 30",
-                link_buttons=pass_buttons,
             ),
         ),
         (
@@ -2635,7 +2567,6 @@ def _status_page_channels(
     return (
         f"**Channels**\n"
         f"-# Target: {fmt(TARGET_CHANNEL_ID)}\n"
-        f"-# Pass info: {fmt(PASS_INFO_CHANNEL_ID)}\n"
         f"-# Preview: {fmt(PREVIEW_CHANNEL_ID)}\n"
         f"\n**Reactions**\n"
         f"-# Pass: {fmt_reaction(PASS_REACTION_ID)}\n"
@@ -3758,9 +3689,8 @@ def _strip_nick_prompt(components: list[dict]) -> list[dict]:
       * the incomplete flow appends a STANDALONE gold container (accent
         ``_NICK_PROMPT_ACCENT``) — drop it wholesale;
       * the pass flow folds the caption + ``nick:`` buttons INTO its
-        ``ACCENT_PASS`` container alongside the Pick Roles link button —
-        reach in and remove just those, keeping the link button (and
-        dropping the container only if nothing survives).
+        ``ACCENT_PASS`` container — reach in and remove just those,
+        dropping the container only if nothing survives.
     """
     result: list[dict] = []
     for comp in components:

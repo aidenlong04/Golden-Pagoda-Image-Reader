@@ -9,7 +9,7 @@ signature-drift bugs at test time instead of runtime.
 from __future__ import annotations
 
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import discord
 
@@ -42,7 +42,6 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
             clan="Golden Pagoda",
             clan_emoji="<:GoldenPagoda_Emblem:123>",
             mastery_rank="MR 12",
-            link_buttons=[("Pick Roles", "https://discord.com/channels/1/2")],
             progress_attachment="progress.png",
             nick_suggestion="Tenno",
             user_id=9999,
@@ -56,9 +55,6 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
             clan="Golden Pagoda",
             clan_emoji="<:e:1>",
             mastery_rank="MR 12",
-            link_buttons=[
-                ("Pick Roles", "https://discord.com/channels/1/2"),
-            ],
             missing_categories=["Platform"],
         )
         # Must produce at least one top-level container.
@@ -75,17 +71,13 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
                         "action row exceeds 5-button cap",
                     )
 
-    def test_pass_components_with_progress_card_keeps_button(self):
-        """With a progress card attached, the card image sits on top as a
-        top-level media gallery and the Pick Roles link button lives in a
-        V2 container below it (regression: the button used to be dropped
-        when there was no nickname suggestion to host it)."""
+    def test_pass_components_with_progress_card_image_only(self):
+        """With a progress card attached and no nickname suggestion to host,
+        the reply is just the card image as a top-level media gallery
+        (type 12) — no empty container or stray action row trails it."""
         result = self.bot_module._pass_components(
             profile="Tenno #465",
             clan="Golden Tenno",
-            link_buttons=[
-                ("Pick Roles", "https://discord.com/channels/1/2"),
-            ],
             progress_attachment="progress.png",
         )
         # The card image is a TOP-LEVEL media gallery (type 12), on top.
@@ -93,34 +85,19 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
             result[0].get("type"), 12,
             "expected the progress card media gallery on top",
         )
-        # A V2 container (type 17) follows and holds the link button.
-        container = next(
-            (c for c in result if c.get("type") == 17), None
-        )
-        self.assertIsNotNone(
-            container, "expected a type:17 container for the button"
-        )
-        link_buttons = [
-            btn
-            for row in (container.get("components") or [])
-            if row.get("type") == 1
-            for btn in (row.get("components") or [])
-            if btn.get("style") == 5 and btn.get("url")
-        ]
-        self.assertTrue(
-            link_buttons, "Pick Roles link button missing from pass card"
+        # Nothing else: no container, no action row.
+        self.assertEqual(
+            len(result), 1,
+            "expected only the media gallery when there's no nick prompt",
         )
 
-    def test_pass_components_card_merges_nick_and_pick_roles(self):
+    def test_pass_components_card_nick_buttons_in_one_container(self):
         """With a progress card AND a nick suggestion, the call-sign
-        buttons and the Pick Roles link button live together in ONE gold
-        container (no second container, no stray top-level action row)."""
+        buttons live in ONE gold container below the image (no second
+        container, no stray top-level action row)."""
         result = self.bot_module._pass_components(
             profile="GoldenTenno#200",
             clan="Golden Tenno",
-            link_buttons=[
-                ("Pick Roles", "https://discord.com/channels/1/2"),
-            ],
             progress_attachment="progress.png",
             nick_suggestion="GoldenTenno",
             user_id=4242,
@@ -146,11 +123,7 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
         has_nick = any(
             str(b.get("custom_id", "")).startswith("nick:") for b in buttons
         )
-        has_link = any(
-            b.get("style") == 5 and b.get("url") for b in buttons
-        )
         self.assertTrue(has_nick, "call-sign nick button missing")
-        self.assertTrue(has_link, "Pick Roles link button missing")
         self.assertLessEqual(len(buttons), 5, "row exceeds 5-button cap")
 
     def test_nick_custom_ids_within_100_chars(self):

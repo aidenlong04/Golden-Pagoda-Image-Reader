@@ -37,14 +37,6 @@ def _build_samples() -> list[tuple[str, list[dict]]]:
         (bot.CLAN_SLOTS[0].emoji if bot.CLAN_SLOTS else None)
         or bot.CLAN_EMOJI
     )
-    # Skip guild-dependent lookups (channel jump URLs need a real guild,
-    # which the preview script doesn't have at SAMPLES-build time).
-    pass_buttons: list[tuple[str, str]] = []
-    if bot.PASS_INFO_CHANNEL_ID:
-        pass_buttons.append((
-            "Pick Roles",
-            bot._channel_url(bot.GUILD_ID, bot.PASS_INFO_CHANNEL_ID),
-        ))
 
     return [
         (
@@ -54,7 +46,6 @@ def _build_samples() -> list[tuple[str, list[dict]]]:
                 sample_clan,
                 clan_emoji=sample_emoji,
                 mastery_rank="MR 28",
-                link_buttons=pass_buttons,
                 missing_categories=["Platform", "Syndicate"],
             ),
         ),
@@ -65,7 +56,6 @@ def _build_samples() -> list[tuple[str, list[dict]]]:
                 sample_clan,
                 clan_emoji=sample_emoji,
                 mastery_rank="MR 30",
-                link_buttons=pass_buttons,
             ),
         ),
         (
