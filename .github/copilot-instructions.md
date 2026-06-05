@@ -50,7 +50,7 @@ Discord bot ("**Oda Helper**") that OCRs Warframe profile screenshots, verifies 
 - `/status` — single ephemeral V2 paginated message with 8 pages (bot, roles, channels, misc, stats, platforms, clans, ocr). Prev/Next/Refresh buttons walk every page. Requires Manage Server perm. The "Bot" page surfaces `healthy`/`unhealthy` based on the health signal age (>90s = stale).
 - `/progress [user] [ephemeral]` — render a member's verification completion (0-100%) as a progress-card PNG (circular avatar + gradient bar + labeled info rows). Defaults to the caller; `ephemeral` hides the reply. Any member can run it.
 - Sync happens in `on_ready` via `tree.sync()` — currently 4 top-level commands.
-- **Progress card** (`_render_progress_card_png` in `bot.py`): composites the avatar, a numpy-vectorized gradient bar, and optional `(label, value, emoji_bytes)` info rows. Clan + platform rows render their configured custom emoji (fetched once via `_fetch_emoji_bytes`, cached per emoji ID) in place of the bullet; `CLAN_ROLE_*_EMOJI` and `PLATFORM_EMOJI_*` literals feed it.
+- **Progress card** (`_render_progress_card_png` in `bot.py`): laid out in logical units and rendered at `_PROGRESS_SS`× (supersampled) for crisp text/icons on HiDPI. Composites a circular avatar, a numpy-shaded capsule progress bar (vertical shading blend, top gloss, traced outline, leading-edge energy glow; gold when complete), and optional `(label, value, emoji_bytes)` info rows. Row icons are aspect-preserved (`ImageOps.contain`, centered — never stretched); clan/platform/profile/mastery/missing rows render their configured custom emoji (fetched once at 128px via `_fetch_emoji_bytes`, cached per emoji ID) in place of the bullet. The "Missing Data" row is pulled to the bottom and rendered larger. `CLAN_ROLE_*_EMOJI`, `PLATFORM_EMOJI_*`, `OPERATOR_EMOJI`, `MASTERY_RANK_EMOJI`, and `WARNING_EMOJI` literals feed it. On a pass, `_pass_components` renders the card image plus a top-level "Pick Roles" Link action row so the button always sends (even when there's no nickname suggestion).
 
 ## Code Conventions
 
@@ -59,7 +59,7 @@ Discord bot ("**Oda Helper**") that OCRs Warframe profile screenshots, verifies 
 - Logging via `logger = logging.getLogger(__name__)`, level INFO.
 - Components V2 messages sent via raw HTTP (`_send_v2`, `_interaction_callback` in `bot.py`) — discord.py 2.x has no native v2 support. Flags: `COMPONENTS_V2_FLAG = 1<<15`, `EPHEMERAL_FLAG = 64`. Callback types: 4 initial, 6 deferred-update, 7 update-message.
 - Don't add docstrings/comments/type annotations to code you didn't change.
-- Tests use `pytest`. Run with `pytest tests/` (34 tests across `test_logic.py`, `test_analytics.py`, `test_bot_smoke.py`, `test_catchup.py`).
+- Tests use `pytest`. Run with `pytest tests/` (35 tests across `test_logic.py`, `test_analytics.py`, `test_bot_smoke.py`, `test_catchup.py`).
 - `.env` writers (`_update_env_clan_slots`, `_update_env_platform_ids`, `_update_env_id_list`) share one `_rewrite_env_file(replace_line, missing_lines)` skeleton — add new persisters through it rather than re-implementing the read→replace→append loop. CDN fetches (avatar + emoji) share `_fetch_cdn_bytes`.
 
 ## Repository

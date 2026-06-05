@@ -75,6 +75,35 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
                         "action row exceeds 5-button cap",
                     )
 
+    def test_pass_components_with_progress_card_keeps_button(self):
+        """With a progress card attached, the Pick Roles link button must
+        still be present (regression: it used to be dropped when there was
+        no nickname suggestion to host it)."""
+        result = self.bot_module._pass_components(
+            profile="Tenno #465",
+            clan="Golden Tenno",
+            link_buttons=[
+                ("Pick Roles", "https://discord.com/channels/1/2"),
+            ],
+            progress_attachment="progress.png",
+        )
+        # The media gallery (type 12) carries the card image.
+        self.assertTrue(
+            any(c.get("type") == 12 for c in result),
+            "expected the progress card media gallery",
+        )
+        # A top-level action row (type 1) must carry the link button.
+        link_buttons = [
+            btn
+            for top in result
+            if top.get("type") == 1
+            for btn in (top.get("components") or [])
+            if btn.get("style") == 5 and btn.get("url")
+        ]
+        self.assertTrue(
+            link_buttons, "Pick Roles link button missing from pass card"
+        )
+
     def test_nick_custom_ids_within_100_chars(self):
         """_nick_custom_ids never produces a custom_id over Discord's 100-char cap."""
         # Long unicode suggestion forces URL-encoding to expand bytes.

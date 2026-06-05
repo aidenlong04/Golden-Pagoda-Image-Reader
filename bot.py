@@ -1344,17 +1344,13 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
     nick_extra: list[dict] = []
     if nick_target:
         try:
-            # On a pass, route the "Pick Roles" Link button through the
-            # nickname prompt's action row so it sits next to the call
-            # sign buttons (the progress card embed no longer carries it).
-            np_links = (
-                _resolve_pass_link_buttons(message.guild, clan_name)
-                if passed else None
-            )
+            # The "Pick Roles" Link button is rendered on the pass card
+            # itself (see _pass_components), so the nick prompt only
+            # carries the call-sign choices — no link buttons here, or it
+            # would show "Pick Roles" twice.
             nick_extra = _nickname_prompt_components(
                 nick_target, member.id,
                 current_nick=member.display_name or "",
-                link_buttons=np_links,
             )
         except Exception:
             logger.exception("nick prompt build failed")
@@ -1688,16 +1684,27 @@ def _pass_components(
     inner = "\n".join(inner_lines)
 
     # When a progress card is attached the bullet list (profile / clan /
-    # mastery / missing) is rendered INTO the PNG and the "Pick Roles"
-    # button has been moved to the nickname prompt's action row, so this
-    # message is just the image. The verification container is only kept
-    # as a fallback for the rare case where the avatar fetch or render
-    # fails and we cannot attach a progress card.
+    # mastery / missing) is rendered INTO the PNG, so the message is just
+    # the image plus a "Pick Roles" Link button. The button is rendered
+    # as a top-level action row here so it ALWAYS sends — previously it
+    # was threaded into the nickname prompt, which is skipped when OCR
+    # falls back to "Tenno #N" (no in-game name to suggest), silently
+    # dropping the button. The legacy V2 container below is only the
+    # fallback for when the avatar fetch or render fails.
     if progress_attachment:
-        return [{
+        top: list[dict] = [{
             "type": 12,
             "items": [{"media": {"url": f"attachment://{progress_attachment}"}}],
         }]
+        gallery_buttons: list[dict] = []
+        for label, url in (link_buttons or []):
+            btn = {"type": 2, "style": 5, "label": label, "url": url}
+            if label == "Pick Roles" and PICK_ROLES_EMOJI_PAYLOAD is not None:
+                btn["emoji"] = PICK_ROLES_EMOJI_PAYLOAD
+            gallery_buttons.append(btn)
+        if gallery_buttons:
+            top.append({"type": 1, "components": gallery_buttons[:5]})
+        return top
 
     # Fallback path (no progress card): render the legacy V2 container
     # with the bullet list and Pick Roles action row so the user still
@@ -2872,6 +2879,10 @@ _PROGRESS_MUTED = (163, 166, 170)
 _PROGRESS_ACCENT = (212, 168, 87)      # gold accent (footer / pct)
 _PROGRESS_AVATAR_SIZE = 112
 _PROGRESS_AVATAR_RING = (212, 168, 87)
+# Supersample factor: the card is laid out in logical units then rendered
+# at this multiple so text, icons, and the bar stay crisp on Discord's
+# HiDPI clients (the previous 1x output looked soft when scaled).
+_PROGRESS_SS = 2
 
 
 def _load_font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
@@ -2916,8 +2927,13 @@ def _vertical_gradient(
 
 
 def _rounded_mask(width: int, height: int, radius: int) -> Image.Image:
-    """Antialiased rounded-rectangle alpha mask (rendered at 4x)."""
-    scale = 4
+    """Antialiased rounded-rectangle alpha mask (rendered at 2x).
+
+    The card is already drawn at ``_PROGRESS_SS`` so a 2x mask is plenty
+    of edge antialiasing without the memory cost of a 4x buffer on the
+    full panel.
+    """
+    scale = 2
     mask = Image.new("L", (width * scale, height * scale), 0)
     ImageDraw.Draw(mask).rounded_rectangle(
         (0, 0, width * scale - 1, height * scale - 1),
@@ -2973,7 +2989,7 @@ def _circular_avatar(
         ImageDraw.Draw(ring).ellipse(
             (0, 0, diameter - 1, diameter - 1),
             outline=_PROGRESS_AVATAR_RING + (255,),
-            width=4,
+            width=max(2, diameter // 28),
         )
         avatar.alpha_composite(ring)
         return avatar
@@ -2983,58 +2999,101 @@ def _circular_avatar(
 
 
 def _gradient_bar(
-    width: int, height: int, progress: float, *, complete: bool
+    width: int, height: int, progress: float, *, complete: bool,
+    scale: int = 1,
 ) -> Image.Image:
-    """Render the rounded progress bar with a horizontal colour gradient."""
+    """Render the capsule progress bar.
+
+    Design: a fully-rounded (oval-ended) track with an inset top shadow,
+    a horizontally-graded fill that carries a top→bottom shading blend
+    (glassy tube), a soft top gloss band, a traced brighter outline, and
+    a leading-edge energy glow at the fill tip. ``scale`` widens the
+    hairline/outline strokes so they stay proportional when the whole
+    card is supersampled.
+    """
+    line_w = max(1, int(round(1.5 * scale)))
     bar = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     radius = height // 2
+    track_mask = _rounded_mask(width, height, radius)
     bar_draw = ImageDraw.Draw(bar)
     bar_draw.rounded_rectangle(
         (0, 0, width - 1, height - 1), radius=radius, fill=_PROGRESS_TRACK
     )
+
+    # Inset top shadow: a black overlay fading top→bottom, clipped to the
+    # track, makes the empty channel read as a recessed groove.
+    tm = np.asarray(track_mask, dtype=np.float32) / 255.0
+    inset_a = np.linspace(70.0, 0.0, height, dtype=np.float32)
+    inset = np.zeros((height, width, 4), dtype=np.uint8)
+    inset[..., 3] = np.clip(inset_a[:, None] * tm, 0, 255).astype(np.uint8)
+    bar.alpha_composite(Image.fromarray(inset, mode="RGBA"))
+
     # Track rim for definition against the panel.
     bar_draw.rounded_rectangle(
         (0, 0, width - 1, height - 1), radius=radius,
-        outline=_PROGRESS_TRACK_EDGE + (255,), width=1,
+        outline=_PROGRESS_TRACK_EDGE + (255,), width=line_w,
     )
     if progress <= 0:
         return bar
 
     fill_w = max(height, int(round(width * progress)))
+    full = fill_w >= width
 
     if complete:
         start, end = _PROGRESS_FILL_GOLD, _PROGRESS_FILL_GOLD_END
     else:
         start, end = _PROGRESS_FILL_START, _PROGRESS_FILL_END
 
-    # Vectorized gradient (was a per-pixel Python loop; numpy turns the
-    # fill_w*height inner work into a few BLAS-backed broadcasts).
+    # Horizontal gradient (vectorized) with a vertical shading blend so the
+    # fill looks like a lit glass tube: brighter at the top, darker below.
     if fill_w > 1:
         t = np.linspace(0.0, 1.0, fill_w, dtype=np.float32)
     else:
         t = np.zeros(1, dtype=np.float32)
     s = np.array(start[:3], dtype=np.float32)
     e = np.array(end[:3], dtype=np.float32)
-    row = (s + (e - s) * t[:, None]).astype(np.uint8)  # (fill_w, 3)
+    row = s + (e - s) * t[:, None]                       # (fill_w, 3)
+    base = np.repeat(row[None, :, :], height, axis=0)    # (h, fill_w, 3)
+    shade = np.linspace(1.16, 0.80, height, dtype=np.float32)[:, None, None]
+    shaded = np.clip(base * shade, 0, 255).astype(np.uint8)
     grad_arr = np.empty((height, fill_w, 4), dtype=np.uint8)
-    grad_arr[..., :3] = row[None, :, :]
+    grad_arr[..., :3] = shaded
     grad_arr[..., 3] = 255
     grad = Image.fromarray(grad_arr, mode="RGBA")
 
-    fill_mask = Image.new("L", (fill_w, height), 0)
-    ImageDraw.Draw(fill_mask).rounded_rectangle(
-        (0, 0, fill_w - 1, height - 1), radius=radius, fill=255
-    )
+    fill_mask = _rounded_mask(fill_w, height, radius)
     bar.paste(grad, (0, 0), fill_mask)
+    fm = np.asarray(fill_mask, dtype=np.float32) / 255.0
 
-    # Glossy sheen: a white overlay whose alpha fades top→bottom, clipped
-    # to the filled (rounded) region so the bar reads as a glassy capsule.
-    fm = np.asarray(fill_mask, dtype=np.float32) / 255.0          # (h, fill_w)
-    col_a = np.linspace(78.0, 0.0, height, dtype=np.float32)      # top→bottom
-    sheen = np.zeros((height, fill_w, 4), dtype=np.uint8)
-    sheen[..., :3] = 255
-    sheen[..., 3] = np.clip(col_a[:, None] * fm, 0, 255).astype(np.uint8)
-    bar.alpha_composite(Image.fromarray(sheen, mode="RGBA"))
+    # Top gloss band: white overlay fading out by ~55% height, clipped to
+    # the fill so only the upper curve catches the light.
+    gloss_a = np.linspace(118.0, 0.0, height, dtype=np.float32)
+    gloss_a[int(height * 0.55):] = 0.0
+    gloss = np.zeros((height, fill_w, 4), dtype=np.uint8)
+    gloss[..., :3] = 255
+    gloss[..., 3] = np.clip(gloss_a[:, None] * fm, 0, 255).astype(np.uint8)
+    bar.alpha_composite(Image.fromarray(gloss, mode="RGBA"))
+
+    # Leading-edge energy glow: a soft bright vertical highlight at the
+    # fill tip (only while the bar isn't full), clipped to the fill.
+    if not full:
+        cap = Image.new("RGBA", (fill_w, height), (0, 0, 0, 0))
+        cap_x = fill_w - max(2, int(round(3 * scale)))
+        ImageDraw.Draw(cap).line(
+            (cap_x, line_w, cap_x, height - line_w - 1),
+            fill=(255, 255, 255, 170), width=max(1, int(round(2 * scale))),
+        )
+        cap = cap.filter(ImageFilter.GaussianBlur(max(1, int(round(1.4 * scale)))))
+        ca = (np.asarray(cap.getchannel("A"), dtype=np.float32) * fm)
+        cap.putalpha(Image.fromarray(ca.astype(np.uint8), mode="L"))
+        bar.alpha_composite(cap)
+
+    # Trace the fill with a brighter tint of its end colour (line traced).
+    trace = tuple(min(255, int(c * 1.18)) for c in end[:3])
+    ImageDraw.Draw(bar).rounded_rectangle(
+        (0, 0, fill_w - 1, height - 1), radius=radius,
+        outline=trace + (220,), width=line_w,
+    )
     return bar
 
 
@@ -3057,82 +3116,100 @@ def _render_progress_card_png(
     ``info_lines`` entries may be 2-tuples ``(label, value)`` or 3-tuples
     ``(label, value, emoji_png_bytes)``. When emoji bytes are supplied,
     they are composited at the start of the row in place of the bullet.
+    The whole card is laid out in logical units and rendered at
+    ``_PROGRESS_SS``x so text and icons stay sharp on HiDPI clients.
     """
     progress = max(0.0, min(1.0, count / target)) if target > 0 else 0.0
     complete = count >= target
+    s = _PROGRESS_SS
 
-    # Normalize entries to (label, value, emoji_bytes|None) so the loop
-    # below can stay branch-light. Accept legacy 2-tuples.
-    rows: list[tuple[str, str, bytes | None]] = []
+    def sc(v: float) -> int:
+        return int(round(v * s))
+
+    # Normalize entries to (label, value, emoji_bytes|None). The
+    # "Missing Data" line is pulled out so it can render last, slightly
+    # larger, set apart from the regular profile/clan/mastery rows.
+    norm_rows: list[tuple[str, str, bytes | None]] = []
+    missing_row: tuple[str, str, bytes | None] | None = None
     for entry in info_lines or []:
-        if len(entry) >= 3:
-            rows.append((entry[0], entry[1], entry[2]))
+        label = entry[0]
+        value = entry[1]
+        emoji = entry[2] if len(entry) >= 3 else None
+        if str(label).strip().lower().startswith("missing"):
+            missing_row = (label, value, emoji)
         else:
-            rows.append((entry[0], entry[1], None))
+            norm_rows.append((label, value, emoji))
 
-    # Dynamic card height: base 160 + (divider + N*row + bottom-pad) when
-    # info_lines is present.
-    row_h = 28
-    info_block_h = (12 + len(rows) * row_h + 12) if rows else 0
-    card_h = _PROGRESS_CARD_H + info_block_h
+    has_info = bool(norm_rows or missing_row)
 
-    canvas = Image.new(
-        "RGBA", (_PROGRESS_CARD_W, card_h), (0, 0, 0, 0)
-    )
+    # Logical layout sizes (1x); everything below is scaled via sc().
+    pad = 22
+    row_h = 30
+    missing_h = 40
+    miss_gap = 12
+    base_h = _PROGRESS_CARD_H
+    info_block_h = 0
+    if has_info:
+        info_block_h = 14 + len(norm_rows) * row_h
+        if missing_row:
+            info_block_h += miss_gap + missing_h
+        info_block_h += 14
+    card_h = base_h + info_block_h
+
+    W, H = sc(_PROGRESS_CARD_W), sc(card_h)
+    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     # Slate panel: vertical gradient clipped to rounded, transparent
     # corners so the card blends into Discord's message background.
-    panel = _vertical_gradient(
-        _PROGRESS_CARD_W, card_h, _PROGRESS_BG_TOP, _PROGRESS_BG_BOTTOM
-    )
-    panel_mask = _rounded_mask(_PROGRESS_CARD_W, card_h, _PROGRESS_RADIUS)
+    panel = _vertical_gradient(W, H, _PROGRESS_BG_TOP, _PROGRESS_BG_BOTTOM)
+    panel_mask = _rounded_mask(W, H, sc(_PROGRESS_RADIUS))
     canvas.paste(panel, (0, 0), panel_mask)
     # Crisp hairline border tracing the rounded panel edge.
     ImageDraw.Draw(canvas).rounded_rectangle(
-        (0, 0, _PROGRESS_CARD_W - 1, card_h - 1),
-        radius=_PROGRESS_RADIUS, outline=_PROGRESS_BORDER + (255,), width=2,
+        (0, 0, W - 1, H - 1),
+        radius=sc(_PROGRESS_RADIUS), outline=_PROGRESS_BORDER + (255,),
+        width=sc(2),
     )
 
-    pad = 22
-    avatar = _circular_avatar(avatar_bytes, _PROGRESS_AVATAR_SIZE)
-    avatar_y = (_PROGRESS_CARD_H - _PROGRESS_AVATAR_SIZE) // 2
+    avatar_px = sc(_PROGRESS_AVATAR_SIZE)
+    avatar = _circular_avatar(avatar_bytes, avatar_px)
+    avatar_y = sc((base_h - _PROGRESS_AVATAR_SIZE) // 2)
 
     # Soft drop shadow under the avatar.
     shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     ImageDraw.Draw(shadow).ellipse(
         (
-            pad + 6, avatar_y + _PROGRESS_AVATAR_SIZE - 10,
-            pad + _PROGRESS_AVATAR_SIZE - 6,
-            avatar_y + _PROGRESS_AVATAR_SIZE + 14,
+            sc(pad) + sc(6), avatar_y + avatar_px - sc(10),
+            sc(pad) + avatar_px - sc(6), avatar_y + avatar_px + sc(14),
         ),
         fill=(0, 0, 0, 120),
     )
-    shadow = shadow.filter(ImageFilter.GaussianBlur(7))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(sc(7)))
     canvas.alpha_composite(shadow)
-    canvas.alpha_composite(avatar, (pad, avatar_y))
+    canvas.alpha_composite(avatar, (sc(pad), avatar_y))
 
-    text_x = pad + _PROGRESS_AVATAR_SIZE + 22
-    right_x = _PROGRESS_CARD_W - pad
+    text_x = sc(pad) + avatar_px + sc(22)
+    right_x = W - sc(pad)
     draw = ImageDraw.Draw(canvas)
 
-    name_font = _load_font(28, bold=True)
-    label_font = _load_font(16, bold=True)
-    count_font = _load_font(22, bold=True)
-    footer_font = _load_font(14)
+    name_font = _load_font(sc(28), bold=True)
+    label_font = _load_font(sc(16), bold=True)
+    count_font = _load_font(sc(22), bold=True)
+    footer_font = _load_font(sc(14))
 
     name = display_name or "Member"
-    max_name_w = right_x - text_x - 10
+    max_name_w = right_x - text_x - sc(10)
     if draw.textlength(name, font=name_font) > max_name_w:
         while name and draw.textlength(
             name + "\u2026", font=name_font
         ) > max_name_w:
             name = name[:-1]
         name = name + "\u2026"
-    draw.text((text_x, 18), name, font=name_font, fill=_PROGRESS_TEXT)
+    draw.text((text_x, sc(18)), name, font=name_font, fill=_PROGRESS_TEXT)
 
     count_text = f"{count} / {target}"
     count_w = draw.textlength(count_text, font=count_font)
     draw.text(
-        (right_x - count_w, 60),
+        (right_x - count_w, sc(60)),
         count_text,
         font=count_font,
         fill=_PROGRESS_TEXT,
@@ -3140,68 +3217,98 @@ def _render_progress_card_png(
 
     pct_label = f"{int(round(progress * 100))}%"
     pct_prefix = "PROGRESS  \u2022  "
-    draw.text(
-        (text_x, 64),
-        pct_prefix,
-        font=label_font,
-        fill=_PROGRESS_MUTED,
-    )
+    draw.text((text_x, sc(64)), pct_prefix, font=label_font,
+              fill=_PROGRESS_MUTED)
     prefix_w = draw.textlength(pct_prefix, font=label_font)
     draw.text(
-        (text_x + prefix_w, 64),
-        pct_label,
-        font=label_font,
+        (text_x + prefix_w, sc(64)), pct_label, font=label_font,
         fill=_PROGRESS_ACCENT if complete else _PROGRESS_TEXT,
     )
 
-    bar_h = 22
+    bar_h = sc(24)
     bar_w = right_x - text_x
-    bar_y = 100
-    bar = _gradient_bar(bar_w, bar_h, progress, complete=complete)
+    bar_y = sc(98)
+    bar = _gradient_bar(bar_w, bar_h, progress, complete=complete, scale=s)
+    # Soft drop shadow under the bar for depth.
+    bshadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    ImageDraw.Draw(bshadow).rounded_rectangle(
+        (text_x, bar_y + sc(3), text_x + bar_w - 1, bar_y + bar_h - 1 + sc(3)),
+        radius=bar_h // 2, fill=(0, 0, 0, 90),
+    )
+    bshadow = bshadow.filter(ImageFilter.GaussianBlur(sc(4)))
+    canvas.alpha_composite(bshadow)
     canvas.alpha_composite(bar, (text_x, bar_y))
 
     # Only show a footer when the user has hit their target; the previous
     # "X more to reach the goal" copy duplicated the bar and was noisy.
     if complete:
         draw.text(
-            (text_x, bar_y + bar_h + 8),
+            (text_x, bar_y + bar_h + sc(8)),
             "Operator, all roles have been registered!",
             font=footer_font,
-            fill=_PROGRESS_AVATAR_RING,
+            fill=_PROGRESS_ACCENT,
         )
 
-    # Render the labeled info rows beneath the bar (profile / clan /
-    # mastery / missing). Layout: subtle divider line, then one row per
-    # entry rendered as "  [icon]  Label: Value" where the icon is the
-    # row's custom emoji image when provided, otherwise a bullet glyph.
-    # Label is muted+bold, value is brighter+bold to mirror the original
-    # bullet list hierarchy.
-    if rows:
-        info_label_font = _load_font(16, bold=True)
-        info_value_font = _load_font(18, bold=True)
-        divider_y = _PROGRESS_CARD_H
+    # Render the labeled info rows beneath the bar. Regular rows
+    # (profile / platform / clan / mastery) render at one size; the
+    # "Missing Data" row is rendered last, larger, and spaced apart so it
+    # reads as the call to action. Each row is "[icon]  Label: Value"
+    # with the icon aspect-preserved (no stretch) and vertically centred.
+    if has_info:
+        info_label_font = _load_font(sc(16), bold=True)
+        info_value_font = _load_font(sc(18), bold=True)
+        miss_label_font = _load_font(sc(18), bold=True)
+        miss_value_font = _load_font(sc(21), bold=True)
+        divider_y = sc(base_h)
         draw.line(
-            [(pad + 8, divider_y), (_PROGRESS_CARD_W - pad - 8, divider_y)],
+            [(sc(pad + 8), divider_y), (W - sc(pad + 8), divider_y)],
             fill=_PROGRESS_BG_EDGE,
-            width=1,
+            width=max(1, sc(1)),
         )
-        row_y = divider_y + 12
-        icon_size = 22  # square; sits within the 28px row
-        icon_gap = 8     # space between icon and label text
-        leading_pad = 8  # left padding before the icon/bullet
-        for label, value, emoji_bytes in rows:
-            row_x = pad + leading_pad
-            # Render the per-row icon: a Discord custom emoji when
-            # supplied, otherwise the bullet character used previously.
+
+        # (label, value, emoji, label_font, value_font, row_h, icon, gap)
+        specs: list[tuple] = []
+        for label, value, emoji_bytes in norm_rows:
+            specs.append((
+                label, value, emoji_bytes, info_label_font,
+                info_value_font, sc(row_h), sc(22), 0,
+            ))
+        if missing_row:
+            specs.append((
+                missing_row[0], missing_row[1], missing_row[2],
+                miss_label_font, miss_value_font, sc(missing_h), sc(27),
+                sc(miss_gap),
+            ))
+
+        leading_pad = sc(8)
+        icon_gap = sc(8)
+        row_y = divider_y + sc(14)
+        for (label, value, emoji_bytes, lf, vf, rhpx, icon_px,
+             top_gap) in specs:
+            row_y += top_gap
+            cy = row_y + rhpx // 2
+            row_x = sc(pad) + leading_pad
+
             icon_img: Image.Image | None = None
             if emoji_bytes:
                 try:
-                    icon_img = Image.open(io.BytesIO(emoji_bytes))
-                    icon_img.load()
-                    icon_img = icon_img.convert("RGBA")
-                    icon_img = icon_img.resize(
-                        (icon_size, icon_size), Image.LANCZOS
+                    src = Image.open(io.BytesIO(emoji_bytes))
+                    src.load()
+                    src = src.convert("RGBA")
+                    # Preserve aspect ratio (contain), then centre inside
+                    # the square icon box so non-square art never stretches.
+                    src = ImageOps.contain(
+                        src, (icon_px, icon_px), Image.LANCZOS
                     )
+                    icon_img = Image.new(
+                        "RGBA", (icon_px, icon_px), (0, 0, 0, 0)
+                    )
+                    icon_img.alpha_composite(
+                        src,
+                        ((icon_px - src.width) // 2,
+                         (icon_px - src.height) // 2),
+                    )
+                    src.close()
                 except Exception:
                     logger.warning(
                         "progress: emoji decode failed for row %r",
@@ -3210,46 +3317,40 @@ def _render_progress_card_png(
                     icon_img = None
 
             if icon_img is not None:
-                icon_y = row_y + (row_h - icon_size) // 2
-                canvas.alpha_composite(icon_img, (row_x, icon_y))
+                canvas.alpha_composite(
+                    icon_img, (row_x, cy - icon_px // 2)
+                )
                 icon_img.close()
-                text_start_x = row_x + icon_size + icon_gap
+                text_start_x = row_x + icon_px + icon_gap
             else:
                 bullet = "\u2022 "
                 draw.text(
-                    (row_x, row_y),
-                    bullet,
-                    font=info_label_font,
-                    fill=_PROGRESS_MUTED,
+                    (row_x, cy), bullet, font=lf,
+                    fill=_PROGRESS_MUTED, anchor="lm",
                 )
-                bullet_w = draw.textlength(bullet, font=info_label_font)
+                bullet_w = draw.textlength(bullet, font=lf)
                 text_start_x = row_x + int(bullet_w)
 
             label_text = f"{label}: "
             draw.text(
-                (text_start_x, row_y),
-                label_text,
-                font=info_label_font,
-                fill=_PROGRESS_MUTED,
+                (text_start_x, cy), label_text, font=lf,
+                fill=_PROGRESS_MUTED, anchor="lm",
             )
-            label_w = draw.textlength(label_text, font=info_label_font)
-            # Trim value if it would overflow the card width.
+            label_w = draw.textlength(label_text, font=lf)
             value_x = text_start_x + label_w
-            max_value_w = _PROGRESS_CARD_W - pad - value_x
+            max_value_w = W - sc(pad) - value_x
             v = value or ""
-            if draw.textlength(v, font=info_value_font) > max_value_w:
+            if draw.textlength(v, font=vf) > max_value_w:
                 while v and draw.textlength(
-                    v + "\u2026", font=info_value_font
+                    v + "\u2026", font=vf
                 ) > max_value_w:
                     v = v[:-1]
                 v = v + "\u2026"
             draw.text(
-                (value_x, row_y - 1),
-                v,
-                font=info_value_font,
-                fill=_PROGRESS_TEXT,
+                (value_x, cy), v, font=vf,
+                fill=_PROGRESS_TEXT, anchor="lm",
             )
-            row_y += row_h
+            row_y += rhpx
 
     buf = io.BytesIO()
     # Keep the alpha channel so the rounded corners stay transparent and
@@ -3306,7 +3407,7 @@ async def _fetch_emoji_bytes(literal: str | None) -> bytes | None:
     if eid is None:
         return None
     if eid not in _EMOJI_BYTES_CACHE:
-        url = f"https://cdn.discordapp.com/emojis/{eid}.png?size=64&quality=lossless"
+        url = f"https://cdn.discordapp.com/emojis/{eid}.png?size=128&quality=lossless"
         _EMOJI_BYTES_CACHE[eid] = await _fetch_cdn_bytes(url)
     return _EMOJI_BYTES_CACHE[eid]
 
