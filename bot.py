@@ -1341,32 +1341,22 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
     # opposite-state role, and posting the V2 reply all hit different
     # Discord endpoints and never depend on each other.
     nick_target = _nickname_suggestion(member, profile_name)
-    nick_extra: list[dict] = []
-    if nick_target:
-        try:
-            # The "Pick Roles" Link button is rendered on the pass card
-            # itself (see _pass_components), so the nick prompt only
-            # carries the call-sign choices — no link buttons here, or it
-            # would show "Pick Roles" twice.
-            nick_extra = _nickname_prompt_components(
-                nick_target, member.id,
-                current_nick=member.display_name or "",
-            )
-        except Exception:
-            logger.exception("nick prompt build failed")
-            nick_extra = []
     if passed:
+        # _pass_components owns the entire pass reply: the progress card
+        # image on top, then ONE gold container holding every button (the
+        # call-sign choices plus "Pick Roles"). Hand it the nick
+        # suggestion directly rather than appending a separate prompt.
         components = _pass_components(
             profile_name, clan_name,
             clan_emoji=clan_emoji,
             mastery_rank=mastery_rank,
             link_buttons=_resolve_pass_link_buttons(message.guild, clan_name),
             progress_attachment="progress.png" if progress_png else None,
+            nick_suggestion=nick_target,
+            user_id=member.id,
+            current_nick=member.display_name or "",
             missing_categories=pass_missing,
         )
-        # Append nickname prompt to the bottom of the verification message
-        # so it lives inside the same Discord message as the pass embed.
-        components.extend(nick_extra)
         outbound = [
             _react(message, "pass"),
             _remove_unverified_role(member),
@@ -1382,7 +1372,14 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
             link_buttons=_help_link_buttons(message.guild),
             progress_attachment="progress.png" if progress_png else None,
         )
-        components.extend(nick_extra)
+        if nick_target:
+            try:
+                components.extend(_nickname_prompt_components(
+                    nick_target, member.id,
+                    current_nick=member.display_name or "",
+                ))
+            except Exception:
+                logger.exception("nick prompt build failed")
         outbound = [
             _react(message, "incomplete"),
             _add_incomplete_role(member),
@@ -1668,6 +1665,7 @@ def _pass_components(
     progress_attachment: str | None = None,
     nick_suggestion: str | None = None,
     user_id: int | None = None,
+    current_nick: str = "",
     missing_categories: list[str] | None = None,
 ) -> list[dict]:
     emoji = (clan_emoji or "").strip() or CLAN_EMOJI
@@ -1708,23 +1706,45 @@ def _pass_components(
 
     # When a progress card is attached the bullet list (profile / clan /
     # mastery / missing) is rendered INTO the PNG, so the message is the
-    # image on top (a top-level media gallery, OUTSIDE any embed) followed
-    # by a gold-accented V2 container that holds the "Pick Roles" Link
-    # button. Keeping the button in its own container (rather than
-    # threading it into the nickname prompt) means it ALWAYS sends, even
-    # when OCR falls back to "Tenno #N" and there's no in-game name to
-    # host it.
+    # image on top (a top-level media gallery, OUTSIDE any container)
+    # followed by a SINGLE gold-accented V2 container that holds EVERY
+    # button: the in-game-name call-sign choices (when there's a name
+    # worth suggesting) and the "Pick Roles" Link button, together in one
+    # action row. Folding the nickname prompt in here — instead of
+    # appending a second container — keeps the whole pass reply to one
+    # image + one container, and Pick Roles still ALWAYS sends even when
+    # OCR falls back to "Tenno #N" and there's no name to host.
     if progress_attachment:
         top_components: list[dict] = [{
             "type": 12,
             "items": [{"media": {"url": f"attachment://{progress_attachment}"}}],
         }]
-        button_row = _link_button_row(link_buttons)
-        if button_row:
+        container_children: list[dict] = []
+        row_buttons: list[dict] = []
+        if nick_suggestion and user_id is not None:
+            yes_id, no_id = _nick_custom_ids(nick_suggestion, user_id)
+            container_children.append(
+                {"type": 10, "content": _CALLSIGN_CAPTION}
+            )
+            row_buttons.append(_nick_button(
+                (current_nick or "Current nickname")[:80],
+                no_id, NICK_PROMPT_SERVER_EMOJI_ID,
+            ))
+            row_buttons.append(_nick_button(
+                (nick_suggestion or "In-game name")[:80],
+                yes_id, NICK_PROMPT_INGAME_EMOJI_ID,
+            ))
+        for lbl, url in (link_buttons or []):
+            row_buttons.append(_link_button(lbl, url))
+        if row_buttons:
+            container_children.append(
+                {"type": 1, "components": row_buttons[:5]}
+            )
+        if container_children:
             top_components.append({
                 "type": 17,
                 "accent_color": ACCENT_PASS,
-                "components": [button_row],
+                "components": container_children,
             })
         return top_components
 
@@ -1933,6 +1953,26 @@ NICK_PROMPT_SERVER_EMOJI_ID = os.getenv(
     "NICK_PROMPT_SERVER_EMOJI_ID", "1511640752424222760"
 ).strip()
 
+# Caption shown above the call-sign buttons. Defined once so the pass
+# reply (which folds the prompt into its gold container) and
+# _strip_nick_prompt (which removes it after a choice is made) agree on
+# the exact text.
+_CALLSIGN_CAPTION = "-# Operator, pick your call sign!"
+
+
+def _nick_button(label: str, custom_id: str, emoji_id: str) -> dict:
+    """Build a secondary (style 2) call-sign button, attaching the
+    configured custom emoji when one is provided."""
+    btn: dict = {
+        "style": 2,
+        "type": 2,
+        "label": label,
+        "custom_id": custom_id,
+    }
+    if emoji_id:
+        btn["emoji"] = {"id": emoji_id, "name": "unknown", "animated": False}
+    return btn
+
 
 def _nickname_prompt_components(
     suggestion: str, user_id: int, *, current_nick: str = "",
@@ -1957,40 +1997,24 @@ def _nickname_prompt_components(
     ingame_label = (suggestion or "In-game name")[:80]
     server_label = (current_nick or "Current nickname")[:80]
 
-    def _btn(label: str, custom_id: str, emoji_id: str) -> dict:
-        btn: dict = {
-            "style": 2,
-            "type": 2,
-            "label": label,
-            "custom_id": custom_id,
-        }
-        if emoji_id:
-            btn["emoji"] = {
-                "id": emoji_id, "name": "unknown", "animated": False,
-            }
-        return btn
-
     row_buttons: list[dict] = [
-        _btn(server_label, no_id, NICK_PROMPT_SERVER_EMOJI_ID),
-        _btn(ingame_label, yes_id, NICK_PROMPT_INGAME_EMOJI_ID),
+        _nick_button(server_label, no_id, NICK_PROMPT_SERVER_EMOJI_ID),
+        _nick_button(ingame_label, yes_id, NICK_PROMPT_INGAME_EMOJI_ID),
     ]
     for lbl, url in (link_buttons or []):
         row_buttons.append(_link_button(lbl, url))
 
-    return [
-        {
-            "type": 17,
-            "accent_color": 0xD4AF37,
-            "components": [{
-                "type": 10,
-                "content": "-# Operator, pick your call sign!",
-            }],
-        },
-        {
-            "type": 1,
-            "components": row_buttons[:5],
-        },
-    ]
+    # Caption AND buttons live INSIDE one gold container so the prompt
+    # reads as a single embedded block (no stray action row floating
+    # outside the container).
+    return [{
+        "type": 17,
+        "accent_color": 0xD4AF37,
+        "components": [
+            {"type": 10, "content": _CALLSIGN_CAPTION},
+            {"type": 1, "components": row_buttons[:5]},
+        ],
+    }]
 
 
 def _nickname_resolved_components(text: str, accent: int) -> list[dict]:
@@ -3789,7 +3813,34 @@ def _strip_nick_prompt(components: list[dict]) -> list[dict]:
             out.pop()
             continue
         break
-    return out
+
+    # The pass reply folds the call-sign prompt INTO its gold container
+    # (alongside the Pick Roles button), so it isn't pruned wholesale
+    # above. Reach into any surviving container and drop just the
+    # call-sign caption and the nick: buttons, keeping the rest (e.g.
+    # Pick Roles). A container left empty by that pruning is dropped.
+    result: list[dict] = []
+    for comp in out:
+        if comp.get("type") == 17 and isinstance(comp.get("components"), list):
+            kept: list[dict] = []
+            for child in comp["components"]:
+                ct = child.get("type")
+                if ct == 10 and child.get("content") == _CALLSIGN_CAPTION:
+                    continue
+                if ct == 1:
+                    btns = [
+                        b for b in (child.get("components") or [])
+                        if not str(b.get("custom_id", "")).startswith("nick:")
+                    ]
+                    if not btns:
+                        continue
+                    child = {**child, "components": btns}
+                kept.append(child)
+            if not kept:
+                continue
+            comp = {**comp, "components": kept}
+        result.append(comp)
+    return result
 
 
 @client.event

@@ -111,6 +111,48 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
             link_buttons, "Pick Roles link button missing from pass card"
         )
 
+    def test_pass_components_card_merges_nick_and_pick_roles(self):
+        """With a progress card AND a nick suggestion, the call-sign
+        buttons and the Pick Roles link button live together in ONE gold
+        container (no second container, no stray top-level action row)."""
+        result = self.bot_module._pass_components(
+            profile="GoldenTenno#200",
+            clan="Golden Tenno",
+            link_buttons=[
+                ("Pick Roles", "https://discord.com/channels/1/2"),
+            ],
+            progress_attachment="progress.png",
+            nick_suggestion="GoldenTenno",
+            user_id=4242,
+            current_nick="oldnick",
+        )
+        # Image on top, then exactly one container.
+        self.assertEqual(result[0].get("type"), 12)
+        containers = [c for c in result if c.get("type") == 17]
+        self.assertEqual(
+            len(containers), 1, "expected exactly one type:17 container"
+        )
+        # No action row floats at the top level — every button is nested.
+        self.assertFalse(
+            any(c.get("type") == 1 for c in result),
+            "action row should live inside the container, not top-level",
+        )
+        rows = [
+            ch for ch in (containers[0].get("components") or [])
+            if ch.get("type") == 1
+        ]
+        self.assertTrue(rows, "expected an action row inside the container")
+        buttons = rows[0].get("components") or []
+        has_nick = any(
+            str(b.get("custom_id", "")).startswith("nick:") for b in buttons
+        )
+        has_link = any(
+            b.get("style") == 5 and b.get("url") for b in buttons
+        )
+        self.assertTrue(has_nick, "call-sign nick button missing")
+        self.assertTrue(has_link, "Pick Roles link button missing")
+        self.assertLessEqual(len(buttons), 5, "row exceeds 5-button cap")
+
     def test_nick_custom_ids_within_100_chars(self):
         """_nick_custom_ids never produces a custom_id over Discord's 100-char cap."""
         # Long unicode suggestion forces URL-encoding to expand bytes.
