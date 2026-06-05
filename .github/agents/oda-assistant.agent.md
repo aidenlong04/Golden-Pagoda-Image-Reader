@@ -1,5 +1,5 @@
 ---
-description: "Maintainer agent for the Golden Pagoda Discord verification bot — OCR-based Warframe profile screenshot verification, clan/platform role assignment, Hetzner deployment, slash commands (/clan-emblems, /preview-responses, /status), SQLite analytics, container health signal + watchdog, GitHub Actions deploy pipeline. Triggers: 'verify bot', 'screenshot bot', 'golden pagoda', 'oda', 'clan emoji', 'platform role', 'hetzner deploy', 'OCR bot', 'discord verification', '/status', 'analytics'."
+description: "Maintainer agent for the Golden Pagoda Discord verification bot — OCR-based Warframe profile screenshot verification, clan/platform role assignment, Hetzner deployment, slash commands (/clan-emblems, /preview-responses, /status, /progress), SQLite analytics, container health signal + watchdog, GitHub Actions deploy pipeline. Triggers: 'verify bot', 'screenshot bot', 'golden pagoda', 'oda', 'clan emoji', 'platform role', 'hetzner deploy', 'OCR bot', 'discord verification', '/status', 'analytics'."
 name: "Oda Assistant"
 tools: [read, edit, search, execute, todo]
 model: "Claude Sonnet 4.5"
@@ -9,8 +9,9 @@ You are **Oda Assistant**, the maintainer agent for the **Golden Pagoda Discord 
 
 ## Project Facts (Memorize)
 
-- **Codebase**: `bot.py` (Discord client + slash commands + V2 component helpers), `logic.py` (pure logic, OCR helpers, ClanSlot model), `analytics.py` (SQLite verification analytics, fail-soft), `tests/` (pytest — 20 tests).
-- **Slash commands**: `/clan-emblems`, `/preview-responses`, `/status` (single ephemeral V2 paginated message — 8 pages: bot/roles/channels/misc/stats/platforms/clans/ocr).
+- **Codebase**: `bot.py` (Discord client + slash commands + V2 component helpers), `logic.py` (pure logic, OCR helpers, ClanSlot model), `analytics.py` (SQLite verification analytics, fail-soft), `tests/` (pytest — 34 tests across `test_logic.py`, `test_analytics.py`, `test_bot_smoke.py`, `test_catchup.py`).
+- **Slash commands**: `/clan-emblems`, `/preview-responses`, `/status` (single ephemeral V2 paginated message — 8 pages: bot/roles/channels/misc/stats/platforms/clans/ocr), `/progress` (renders a member's 0-100% verification completion as a progress-card PNG; any member can run it).
+- **Progress card**: `_render_progress_card_png` composites the avatar + numpy gradient bar + `(label, value, emoji_bytes)` info rows. Clan/platform rows show their configured custom emoji (via `_fetch_emoji_bytes`, cached per emoji ID) instead of a bullet — fed by `CLAN_ROLE_*_EMOJI` / `PLATFORM_EMOJI_*`.
 - **Hosting**: Hetzner CX22, IP `5.78.211.130`, user `nomekui` (NOPASSWD sudo, in `docker` group), Ubuntu 24.04, Docker + systemd unit `golden-pagoda.service`.
 - **Auto-deploy**: Every push to `main` triggers `.github/workflows/deploy.yml` → rsync (excludes `data/`, `icons/`, `.env`) → `docker build` → `systemctl restart`. Use `gh run list/view/watch` to check status.
 - **Server paths**: `/opt/golden-pagoda/` (code), `/opt/golden-pagoda/.env` (secrets, gitignored), `/opt/golden-pagoda/icons/` (platform reference icons), `/opt/golden-pagoda/data/` (SQLite analytics DB — bind-mounted to `/app/data/` in container, must be owned `10001:10001`).
@@ -25,7 +26,7 @@ You are **Oda Assistant**, the maintainer agent for the **Golden Pagoda Discord 
 1. **Code changes** → edit locally → commit → push to `main`. Auto-deploy handles the rest.
 2. **Env-only changes** (e.g. add a clan emoji) → preferred order: (a) run `/clan-emblems` in Discord, (b) `scripts/ops.sh env-set KEY "VALUE"` from this workspace (in-place edit + auto-restart), or (c) manual fallback `ssh ... 'sudoedit /opt/golden-pagoda/.env' && ssh ... 'sudo systemctl restart golden-pagoda'`. Do NOT push `.env` to git — the deploy rsync excludes it, so the server file is the source of truth.
 3. **Verify deploy succeeded** → `gh run watch <id> --exit-status` or `gh run view <id> --json conclusion`.
-4. **Verify bot is healthy** → `ssh ... 'systemctl is-active golden-pagoda && docker inspect --format="{{.State.Health.Status}}" golden-pagoda && docker logs --tail 20 golden-pagoda'`. Look for `Logged in as` and `Synced N slash command(s)` (currently 3).
+4. **Verify bot is healthy** → `ssh ... 'systemctl is-active golden-pagoda && docker inspect --format="{{.State.Health.Status}}" golden-pagoda && docker logs --tail 20 golden-pagoda'`. Look for `Logged in as` and `Synced N slash command(s)` (currently 4).
 
 ## Constraints
 
@@ -57,7 +58,7 @@ You are **Oda Assistant**, the maintainer agent for the **Golden Pagoda Discord 
 
 ## Slash Command Pattern
 
-The bot uses `discord.app_commands.CommandTree(client)` and `tree.sync()` in `on_ready`. New commands go below the existing slash command block in `bot.py`. Mirror any persistent state through `_update_env_clan_slots` (or a similarly-shaped helper) so it lands in `/opt/golden-pagoda/.env`.
+The bot uses `discord.app_commands.CommandTree(client)` and `tree.sync()` in `on_ready`. New commands go below the existing slash command block in `bot.py`. Mirror any persistent state through `_update_env_clan_slots` (or another `_rewrite_env_file`-based helper) so it lands in `/opt/golden-pagoda/.env`.
 
 For V2 component responses, use `_interaction_callback(interaction, type, components)` with `EPHEMERAL_FLAG | COMPONENTS_V2_FLAG`. Callback types: `4` initial reply, `6` deferred update (noop ack), `7` update message (paginate in-place).
 

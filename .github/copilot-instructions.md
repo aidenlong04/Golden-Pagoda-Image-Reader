@@ -48,7 +48,9 @@ Discord bot ("**Oda Helper**") that OCRs Warframe profile screenshots, verifies 
 - `/clan-emblems role:<role> emoji:<:name:id>` — set per-clan emoji at runtime. Updates in-memory `CLAN_SLOTS`, `os.environ`, AND rewrites `/opt/golden-pagoda/.env`. Requires Manage Server perm.
 - `/preview-responses` — post sample pass/fail/incomplete V2 messages to the preview channel.
 - `/status` — single ephemeral V2 paginated message with 8 pages (bot, roles, channels, misc, stats, platforms, clans, ocr). Prev/Next/Refresh buttons walk every page. Requires Manage Server perm. The "Bot" page surfaces `healthy`/`unhealthy` based on the health signal age (>90s = stale).
-- Sync happens in `on_ready` via `tree.sync()` — currently 3 top-level commands.
+- `/progress [user] [ephemeral]` — render a member's verification completion (0-100%) as a progress-card PNG (circular avatar + gradient bar + labeled info rows). Defaults to the caller; `ephemeral` hides the reply. Any member can run it.
+- Sync happens in `on_ready` via `tree.sync()` — currently 4 top-level commands.
+- **Progress card** (`_render_progress_card_png` in `bot.py`): composites the avatar, a numpy-vectorized gradient bar, and optional `(label, value, emoji_bytes)` info rows. Clan + platform rows render their configured custom emoji (fetched once via `_fetch_emoji_bytes`, cached per emoji ID) in place of the bullet; `CLAN_ROLE_*_EMOJI` and `PLATFORM_EMOJI_*` literals feed it.
 
 ## Code Conventions
 
@@ -57,7 +59,8 @@ Discord bot ("**Oda Helper**") that OCRs Warframe profile screenshots, verifies 
 - Logging via `logger = logging.getLogger(__name__)`, level INFO.
 - Components V2 messages sent via raw HTTP (`_send_v2`, `_interaction_callback` in `bot.py`) — discord.py 2.x has no native v2 support. Flags: `COMPONENTS_V2_FLAG = 1<<15`, `EPHEMERAL_FLAG = 64`. Callback types: 4 initial, 6 deferred-update, 7 update-message.
 - Don't add docstrings/comments/type annotations to code you didn't change.
-- Tests use `pytest`. Run with `pytest tests/`.
+- Tests use `pytest`. Run with `pytest tests/` (34 tests across `test_logic.py`, `test_analytics.py`, `test_bot_smoke.py`, `test_catchup.py`).
+- `.env` writers (`_update_env_clan_slots`, `_update_env_platform_ids`, `_update_env_id_list`) share one `_rewrite_env_file(replace_line, missing_lines)` skeleton — add new persisters through it rather than re-implementing the read→replace→append loop. CDN fetches (avatar + emoji) share `_fetch_cdn_bytes`.
 
 ## Repository
 

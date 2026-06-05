@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import logging
 import re
-
-_CLAN_TAG_SUFFIX_RE = re.compile(r"#\d+\s*$")
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+_CLAN_TAG_SUFFIX_RE = re.compile(r"#\d+\s*$")
 
 
 # --- Profile name -----------------------------------------------------------
@@ -38,8 +38,6 @@ def parse_profile_name(ocr_text: str) -> str | None:
     if match:
         return match.group(0).strip()
 
-    if header_match is None:
-        return None
     return None
 
 
@@ -50,6 +48,12 @@ _NO_CLAN_TOKENS = ("UNAFFILIATED", "NO CLAN")
 
 
 _MASTERY_HEADER_RE = re.compile(r"MASTERY\s*RANK", re.IGNORECASE)
+# Digit groups with thousands separators (e.g. "2,037,372" / "3 837 977") and
+# long pure runs ("65128") are XP/credit totals that can leak below the header;
+# the MR badge itself is always a small 1-3 digit standalone integer.
+_THOUSANDS_RE = re.compile(r"\d[\d,\s\.]*\d{3}\b")
+_LONG_DIGITS_RE = re.compile(r"\b\d{4,}\b")
+_SMALL_INT_RE = re.compile(r"\b(\d{1,3})\b")
 
 
 def parse_mastery_rank(ocr_text: str) -> str | None:
@@ -74,15 +78,13 @@ def parse_mastery_rank(ocr_text: str) -> str | None:
             upper = candidate.upper()
             if "UNRANKED" in upper:
                 return "Unranked"
-            # Skip lines that look like XP / credit totals (digit groups
-            # with thousands separators e.g. "2,037,372" or "3 837 977"
-            # or pure 4+ digit runs like "65128"). The MR badge itself
-            # is always a small 1-3 digit standalone integer.
-            if re.search(r"\d[\d,\s\.]*\d{3}\b", candidate):
+            # Skip lines that look like XP / credit totals; the MR badge
+            # itself is always a small 1-3 digit standalone integer.
+            if _THOUSANDS_RE.search(candidate):
                 continue
-            if re.search(r"\b\d{4,}\b", candidate):
+            if _LONG_DIGITS_RE.search(candidate):
                 continue
-            m = re.search(r"\b(\d{1,3})\b", candidate)
+            m = _SMALL_INT_RE.search(candidate)
             if m:
                 value = int(m.group(1))
                 # Warframe MR currently caps well under 100; treat

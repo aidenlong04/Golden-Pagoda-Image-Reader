@@ -27,7 +27,9 @@ warnings.filterwarnings(
     category=DeprecationWarning,
 )
 
+import aiohttp  # noqa: E402
 import discord  # noqa: E402
+import numpy as np  # noqa: E402
 import requests  # noqa: E402
 from discord import app_commands  # noqa: E402
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps  # noqa: E402
@@ -99,6 +101,17 @@ def _int_env(name: str, default: int = 0) -> int:
         return default
 
 
+def _float_env(name: str, default: float = 0.0) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Env var %s=%r is not a valid float; using %s", name, raw, default)
+        return default
+
+
 TARGET_CHANNEL_ID = _int_env("TARGET_CHANNEL_ID")
 GUILD_ID = _int_env("GUILD_ID", 1361846841905381629)
 PASS_INFO_CHANNEL_ID = _int_env("PASS_INFO_CHANNEL_ID", 1392582268769271950)
@@ -125,6 +138,16 @@ PLATFORM_ROLE_ID_ENV_KEYS: dict[str, str] = {
 PLATFORM_ROLE_IDS: dict[str, int | None] = {
     platform: (_int_env(key) or None)
     for platform, key in PLATFORM_ROLE_ID_ENV_KEYS.items()
+}
+
+# Per-platform custom emoji literals (``<:Name:id>``), used when rendering the
+# progress card so each platform row gets its own icon instead of the bullet.
+PLATFORM_EMOJIS: dict[str, str | None] = {
+    "PC": (os.getenv("PLATFORM_EMOJI_PC") or "").strip() or None,
+    "Xbox": (os.getenv("PLATFORM_EMOJI_XBOX") or "").strip() or None,
+    "PlayStation": (os.getenv("PLATFORM_EMOJI_PLAYSTATION") or "").strip() or None,
+    "Switch": (os.getenv("PLATFORM_EMOJI_SWITCH") or "").strip() or None,
+    "Mobile": (os.getenv("PLATFORM_EMOJI_MOBILE") or "").strip() or None,
 }
 
 # Clan slots (auto-synced with the .env file on connect).
@@ -155,6 +178,19 @@ def _parse_reaction_emoji(raw: str):
         return raw
     animated, name, eid = m.group(1) == "a", m.group(2), int(m.group(3))
     return discord.PartialEmoji(name=name, id=eid, animated=animated)
+
+
+def _emoji_id_from_literal(raw: str | None) -> int | None:
+    """Return the numeric ID from a ``<:Name:id>`` / ``<a:Name:id>`` literal."""
+    if not raw:
+        return None
+    m = _CUSTOM_EMOJI_RE.match(raw.strip())
+    if not m:
+        return None
+    try:
+        return int(m.group(3))
+    except ValueError:
+        return None
 FAIL_REACTION_EMOJI = _parse_reaction_emoji(FAIL_REACTION)
 # Reaction cleared from the post when verification passes (e.g. a "pending"
 # marker added upstream). Set to 0 to disable.
@@ -181,7 +217,7 @@ VERIFY_REMOVE_ROLE_ID = _int_env("VERIFY_REMOVE_ROLE_ID", 1459326361968574555)
 # Catch-up scan: process missed messages from recent history on startup.
 CATCHUP_LOOKBACK_HOURS = _int_env("CATCHUP_LOOKBACK_HOURS", 24)
 CATCHUP_STATE_PATH = Path(os.getenv("CATCHUP_STATE_PATH", "/app/data/catchup_state.json"))
-CATCHUP_DELAY_SECONDS = float(os.getenv("CATCHUP_DELAY_SECONDS") or "1.0")
+CATCHUP_DELAY_SECONDS = _float_env("CATCHUP_DELAY_SECONDS", 1.0)
 
 # Role IDs that count as "has MR verified" / "has joined a syndicate" for
 # the /progress completion check. Both accept a comma-separated list — a
@@ -262,41 +298,59 @@ def _atomic_write_text(path: Path, content: str) -> None:
     os.replace(tmp, path)
 
 
-def _update_env_clan_slots(slots: list[ClanSlot]) -> bool:
-    """Rewrite the CLAN_ROLE_{i}_NAME/_ID/_EMOJI entries in the .env file in place."""
+def _rewrite_env_file(
+    replace_line: Callable[[str], str | None],
+    missing_lines: Callable[[], list[str]],
+) -> bool:
+    """Rewrite ``.env`` in place using a shared read→replace→append skeleton.
+
+    ``replace_line`` is called for every existing line and returns either a
+    replacement string or ``None`` to leave the line untouched. Any entries
+    returned by ``missing_lines()`` are appended (after a blank separator).
+    Returns ``False`` when the file doesn't exist. Centralises the logic the
+    clan / platform / id-list writers previously duplicated.
+    """
     if not ENV_FILE_PATH.exists():
         return False
-
-    by_slot = {s.slot: s for s in slots}
     lines = ENV_FILE_PATH.read_text().splitlines()
-    seen: set[tuple[int, str]] = set()
-
     for idx, line in enumerate(lines):
-        m = _ENV_CLAN_SLOT_RE.match(line)
-        if not m:
-            continue
-        indent, slot_num, field = m.group(1), int(m.group(2)), m.group(3)
-        slot = by_slot.get(slot_num)
-        if slot is None:
-            continue
-        value = _slot_field_value(slot, field)
-        lines[idx] = f"{indent}CLAN_ROLE_{slot_num}_{field}={value}"
-        seen.add((slot_num, field))
-
-    missing: list[str] = []
-    for i in sorted(by_slot):
-        for field in ("NAME", "ID", "EMOJI"):
-            if (i, field) in seen:
-                continue
-            value = _slot_field_value(by_slot[i], field)
-            missing.append(f"CLAN_ROLE_{i}_{field}={value}")
+        replacement = replace_line(line)
+        if replacement is not None:
+            lines[idx] = replacement
+    missing = missing_lines()
     if missing:
         if lines and lines[-1].strip():
             lines.append("")
         lines.extend(missing)
-
     _atomic_write_text(ENV_FILE_PATH, "\n".join(lines) + "\n")
     return True
+
+
+def _update_env_clan_slots(slots: list[ClanSlot]) -> bool:
+    """Rewrite the CLAN_ROLE_{i}_NAME/_ID/_EMOJI entries in the .env file in place."""
+    by_slot = {s.slot: s for s in slots}
+    seen: set[tuple[int, str]] = set()
+
+    def replace(line: str) -> str | None:
+        m = _ENV_CLAN_SLOT_RE.match(line)
+        if not m:
+            return None
+        indent, slot_num, field = m.group(1), int(m.group(2)), m.group(3)
+        slot = by_slot.get(slot_num)
+        if slot is None:
+            return None
+        seen.add((slot_num, field))
+        return f"{indent}CLAN_ROLE_{slot_num}_{field}={_slot_field_value(slot, field)}"
+
+    def missing() -> list[str]:
+        out: list[str] = []
+        for i in sorted(by_slot):
+            for field in ("NAME", "ID", "EMOJI"):
+                if (i, field) not in seen:
+                    out.append(f"CLAN_ROLE_{i}_{field}={_slot_field_value(by_slot[i], field)}")
+        return out
+
+    return _rewrite_env_file(replace, missing)
 
 
 CLAN_SLOTS: list[ClanSlot] = _load_clan_slots()
@@ -304,60 +358,49 @@ CLAN_SLOTS: list[ClanSlot] = _load_clan_slots()
 
 def _update_env_platform_ids(ids: dict[str, int | None]) -> bool:
     """Rewrite the PLATFORM_ROLE_*_ID entries in the .env file in place."""
-    if not ENV_FILE_PATH.exists():
-        return False
-
     key_to_platform = {v: k for k, v in PLATFORM_ROLE_ID_ENV_KEYS.items()}
-    lines = ENV_FILE_PATH.read_text().splitlines()
     seen: set[str] = set()
 
-    for idx, line in enumerate(lines):
+    def replace(line: str) -> str | None:
         m = _ENV_PLATFORM_ID_RE.match(line)
         if not m:
-            continue
+            return None
         indent, key = m.group(1), m.group(2)
         platform = key_to_platform.get(key)
         if platform is None:
-            continue
-        value = str(ids.get(platform)) if ids.get(platform) else ""
-        lines[idx] = f"{indent}{key}={value}"
+            return None
         seen.add(key)
+        return f"{indent}{key}={str(ids.get(platform)) if ids.get(platform) else ''}"
 
-    missing: list[str] = []
-    for platform, key in PLATFORM_ROLE_ID_ENV_KEYS.items():
-        if key in seen:
-            continue
-        value = str(ids.get(platform)) if ids.get(platform) else ""
-        missing.append(f"{key}={value}")
-    if missing:
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines.extend(missing)
+    def missing() -> list[str]:
+        return [
+            f"{key}={str(ids.get(platform)) if ids.get(platform) else ''}"
+            for platform, key in PLATFORM_ROLE_ID_ENV_KEYS.items()
+            if key not in seen
+        ]
 
-    _atomic_write_text(ENV_FILE_PATH, "\n".join(lines) + "\n")
-    return True
+    return _rewrite_env_file(replace, missing)
 
 
 def _update_env_id_list(env_key: str, ids: list[int]) -> bool:
     """Rewrite (or append) ``ENV_KEY=id1,id2,...`` in the .env file."""
-    if not ENV_FILE_PATH.exists():
-        return False
     value = ",".join(str(i) for i in ids)
-    lines = ENV_FILE_PATH.read_text().splitlines()
-    pattern = re.compile(rf"^(\s*){re.escape(env_key)}\s*=.*$")
-    replaced = False
-    for idx, line in enumerate(lines):
-        m = pattern.match(line)
-        if m:
-            lines[idx] = f"{m.group(1)}{env_key}={value}"
-            replaced = True
-            break
-    if not replaced:
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines.append(f"{env_key}={value}")
-    _atomic_write_text(ENV_FILE_PATH, "\n".join(lines) + "\n")
-    return True
+    seen = False
+
+    def replace(line: str) -> str | None:
+        nonlocal seen
+        if seen:
+            return None
+        m = _ENV_GENERIC_KEY_RE.match(line)
+        if not m or m.group(2) != env_key:
+            return None
+        seen = True
+        return f"{m.group(1)}{env_key}={value}"
+
+    def missing() -> list[str]:
+        return [] if seen else [f"{env_key}={value}"]
+
+    return _rewrite_env_file(replace, missing)
 
 
 # ---------- Discord client --------------------------------------------------
@@ -498,7 +541,6 @@ async def _get_http_session():
     global _HTTP_SESSION
     if _HTTP_SESSION is not None and not _HTTP_SESSION.closed:
         return _HTTP_SESSION
-    import aiohttp
 
     async with _HTTP_SESSION_LOCK:
         if _HTTP_SESSION is None or _HTTP_SESSION.closed:
@@ -689,6 +731,7 @@ _CLAN_TAG_SUFFIX_RE = re.compile(r"#\d+\s*$")
 _WS_RE = re.compile(r"\s+")
 _ENV_CLAN_SLOT_RE = re.compile(r"^(\s*)CLAN_ROLE_(\d+)_(NAME|ID|EMOJI)\s*=.*$")
 _ENV_PLATFORM_ID_RE = re.compile(r"^(\s*)(PLATFORM_ROLE_[A-Z]+_ID)\s*=.*$")
+_ENV_GENERIC_KEY_RE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*=.*$")
 _PLACEHOLDER_NAME_RE = re.compile(r"^place[\s\-_]*holder", re.IGNORECASE)
 
 
@@ -1217,24 +1260,50 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
         ]
 
     # Build the labeled rows rendered beneath the progress bar on a
-    # passing card: profile name, clan, mastery rank, missing data.
-    info_lines: list[tuple[str, str]] = []
+    # passing card: profile name, platform, clan, mastery rank, missing
+    # data. Clan + platform rows carry their custom emoji bytes (fetched
+    # below) so the card renders the same icons the env defines.
+    member_platform: str | None = None
+    for plat, rid in PLATFORM_ROLE_IDS.items():
+        if rid and rid in effective_role_ids:
+            member_platform = plat
+            break
+
+    clan_emoji_bytes: bytes | None = None
+    platform_emoji_bytes: bytes | None = None
+    if passed:
+        if clan_emoji:
+            clan_emoji_bytes = await _fetch_emoji_bytes(clan_emoji)
+        if member_platform:
+            platform_emoji_bytes = await _fetch_emoji_bytes(
+                PLATFORM_EMOJIS.get(member_platform)
+            )
+
+    info_lines: list[tuple] = []
     if passed:
         if profile_name:
             display_profile = (
                 profile_name if profile_name.startswith("Tenno #")
                 else _strip_clan_tag(profile_name)
             )
-            info_lines.append(("Profile", display_profile))
+            info_lines.append(("Profile", display_profile, None))
+        if member_platform:
+            info_lines.append(
+                ("Platform", member_platform, platform_emoji_bytes)
+            )
         if clan_name:
-            info_lines.append(("Clan", _strip_clan_tag(clan_name)))
+            info_lines.append(
+                ("Clan", _strip_clan_tag(clan_name), clan_emoji_bytes)
+            )
         if mastery_rank:
             mr_value = mastery_rank
             if mr_value.upper().startswith("MR "):
                 mr_value = mr_value[3:].strip()
-            info_lines.append(("Mastery Rank", mr_value))
+            info_lines.append(("Mastery Rank", mr_value, None))
         if pass_missing:
-            info_lines.append(("Missing Data", ", ".join(pass_missing)))
+            info_lines.append(
+                ("Missing Data", ", ".join(pass_missing), None)
+            )
 
     # Render the progress card once; both pass and incomplete embeds attach it.
     progress_png: bytes | None = None
@@ -2004,8 +2073,6 @@ async def _send_v2(
             # multipart bodies for V2, so post directly with aiohttp using
             # the bot token. Per-channel rate limits apply but a single
             # reply is well within the bucket.
-            import aiohttp
-
             form = aiohttp.FormData()
             form.add_field(
                 "payload_json", json.dumps(payload),
@@ -2061,11 +2128,9 @@ async def _send_v2(
     if sent_id:
         _remember_reply(reply_to.id, reply_to.channel.id, sent_id)
         if REPLY_TTL_SECONDS > 0:
-            task = asyncio.create_task(
+            _spawn_bg_task(
                 _delete_after(reply_to.channel.id, sent_id, REPLY_TTL_SECONDS)
             )
-            _BG_TASKS.add(task)
-            task.add_done_callback(_BG_TASKS.discard)
 
 
 async def _edit_message_v2_with_file(
@@ -2085,8 +2150,6 @@ async def _edit_message_v2_with_file(
     keeps the same filename so any ``attachment://progress.png``
     references inside components resolve to the fresh file.
     """
-    import aiohttp
-
     payload = {
         "components": components,
         "attachments": [{"id": 0, "filename": file_name}],
@@ -2806,7 +2869,7 @@ def _load_font_cached(size: int, bold: bool) -> ImageFont.FreeTypeFont:
     for path in candidates:
         try:
             return ImageFont.truetype(path, size=size)
-        except (OSError, IOError):
+        except OSError:
             continue
     return ImageFont.load_default()  # type: ignore[return-value]
 
@@ -2888,8 +2951,6 @@ def _gradient_bar(
 
     # Vectorized gradient (was a per-pixel Python loop; numpy turns the
     # fill_w*height inner work into a few BLAS-backed broadcasts).
-    import numpy as np
-
     if fill_w > 1:
         t = np.linspace(0.0, 1.0, fill_w, dtype=np.float32)
     else:
@@ -2916,7 +2977,7 @@ def _render_progress_card_png(
     display_name: str,
     count: int,
     target: int,
-    info_lines: list[tuple[str, str]] | None = None,
+    info_lines: list[tuple] | None = None,
 ) -> bytes:
     """Render the progress card and return PNG bytes.
 
@@ -2925,13 +2986,25 @@ def _render_progress_card_png(
     vertically and renders each ``(label, value)`` pair as a bulleted row
     beneath the bar (used to inline profile / clan / mastery / missing
     info on the verification PASS embed).
+
+    ``info_lines`` entries may be 2-tuples ``(label, value)`` or 3-tuples
+    ``(label, value, emoji_png_bytes)``. When emoji bytes are supplied,
+    they are composited at the start of the row in place of the bullet.
     """
     progress = max(0.0, min(1.0, count / target)) if target > 0 else 0.0
     complete = count >= target
 
+    # Normalize entries to (label, value, emoji_bytes|None) so the loop
+    # below can stay branch-light. Accept legacy 2-tuples.
+    rows: list[tuple[str, str, bytes | None]] = []
+    for entry in info_lines or []:
+        if len(entry) >= 3:
+            rows.append((entry[0], entry[1], entry[2]))
+        else:
+            rows.append((entry[0], entry[1], None))
+
     # Dynamic card height: base 160 + (divider + N*row + bottom-pad) when
     # info_lines is present.
-    rows = info_lines or []
     row_h = 28
     info_block_h = (12 + len(rows) * row_h + 12) if rows else 0
     card_h = _PROGRESS_CARD_H + info_block_h
@@ -3016,8 +3089,10 @@ def _render_progress_card_png(
 
     # Render the labeled info rows beneath the bar (profile / clan /
     # mastery / missing). Layout: subtle divider line, then one row per
-    # entry rendered as "  •  Label: Value". Label is muted+bold, value
-    # is brighter+bold to mirror the original bullet list hierarchy.
+    # entry rendered as "  [icon]  Label: Value" where the icon is the
+    # row's custom emoji image when provided, otherwise a bullet glyph.
+    # Label is muted+bold, value is brighter+bold to mirror the original
+    # bullet list hierarchy.
     if rows:
         info_label_font = _load_font(16, bold=True)
         info_value_font = _load_font(18, bold=True)
@@ -3028,18 +3103,56 @@ def _render_progress_card_png(
             width=1,
         )
         row_y = divider_y + 12
-        for label, value in rows:
-            prefix = "  \u2022  "
-            label_text = f"{prefix}{label}: "
+        icon_size = 22  # square; sits within the 28px row
+        icon_gap = 8     # space between icon and label text
+        leading_pad = 8  # left padding before the icon/bullet
+        for label, value, emoji_bytes in rows:
+            row_x = pad + leading_pad
+            # Render the per-row icon: a Discord custom emoji when
+            # supplied, otherwise the bullet character used previously.
+            icon_img: Image.Image | None = None
+            if emoji_bytes:
+                try:
+                    icon_img = Image.open(io.BytesIO(emoji_bytes))
+                    icon_img.load()
+                    icon_img = icon_img.convert("RGBA")
+                    icon_img = icon_img.resize(
+                        (icon_size, icon_size), Image.LANCZOS
+                    )
+                except Exception:
+                    logger.warning(
+                        "progress: emoji decode failed for row %r",
+                        label, exc_info=True,
+                    )
+                    icon_img = None
+
+            if icon_img is not None:
+                icon_y = row_y + (row_h - icon_size) // 2
+                canvas.alpha_composite(icon_img, (row_x, icon_y))
+                icon_img.close()
+                text_start_x = row_x + icon_size + icon_gap
+            else:
+                bullet = "\u2022 "
+                draw.text(
+                    (row_x, row_y),
+                    bullet,
+                    font=info_label_font,
+                    fill=_PROGRESS_MUTED,
+                )
+                bullet_w = draw.textlength(bullet, font=info_label_font)
+                text_start_x = row_x + int(bullet_w)
+
+            label_text = f"{label}: "
             draw.text(
-                (pad, row_y),
+                (text_start_x, row_y),
                 label_text,
                 font=info_label_font,
                 fill=_PROGRESS_MUTED,
             )
             label_w = draw.textlength(label_text, font=info_label_font)
             # Trim value if it would overflow the card width.
-            max_value_w = _PROGRESS_CARD_W - pad - (pad + label_w)
+            value_x = text_start_x + label_w
+            max_value_w = _PROGRESS_CARD_W - pad - value_x
             v = value or ""
             if draw.textlength(v, font=info_value_font) > max_value_w:
                 while v and draw.textlength(
@@ -3048,7 +3161,7 @@ def _render_progress_card_png(
                     v = v[:-1]
                 v = v + "\u2026"
             draw.text(
-                (pad + label_w, row_y - 1),
+                (value_x, row_y - 1),
                 v,
                 font=info_value_font,
                 fill=_PROGRESS_TEXT,
@@ -3060,35 +3173,57 @@ def _render_progress_card_png(
     return buf.getvalue()
 
 
-async def _fetch_avatar_bytes(url: str) -> bytes | None:
-    """Best-effort fetch of an avatar URL; returns None on any failure.
+async def _fetch_cdn_bytes(
+    url: str, *, accept: str = "image/png,image/*;q=0.8"
+) -> bytes | None:
+    """GET ``url`` via the shared session; return the body or None on failure.
 
-    Discord's CDN occasionally 403s requests that lack a recognisable
-    User-Agent, so we send one explicitly. Returns the full response body
-    (avatars are <512 KiB; aiohttp's resp.read() handles transfer-encoded
-    chunks correctly where resp.content.read(n) can return short reads).
+    Discord's CDN 403s requests without a recognisable User-Agent, so we
+    always send one. Shared by the avatar and emoji fetchers.
     """
     try:
         headers = {
             "User-Agent": "DiscordBot (https://github.com/aidenlong04/Golden-Pagoda-Image-Reader, 1.0)",
-            "Accept": "image/png,image/webp,image/*;q=0.8",
+            "Accept": accept,
         }
-        import aiohttp
-
         timeout = aiohttp.ClientTimeout(total=8)
         session = await _get_http_session()
         async with session.get(url, headers=headers, timeout=timeout) as resp:
             if resp.status != 200:
-                logger.warning(
-                    "progress: avatar fetch returned HTTP %s for %s",
-                    resp.status, url,
-                )
+                logger.warning("cdn fetch returned HTTP %s for %s", resp.status, url)
                 return None
             data = await resp.read()
             return data or None
     except Exception:
-        logger.warning("progress: avatar fetch failed", exc_info=True)
+        logger.warning("cdn fetch failed for %s", url, exc_info=True)
         return None
+
+
+async def _fetch_avatar_bytes(url: str) -> bytes | None:
+    """Best-effort avatar fetch (avatars are <512 KiB); None on any failure."""
+    return await _fetch_cdn_bytes(url, accept="image/png,image/webp,image/*;q=0.8")
+
+
+# Decoded emoji PNG bytes keyed by Discord emoji ID. Emojis are immutable
+# for the life of the process, so a simple dict cache is enough — avoids
+# refetching the same clan/platform icons on every verification.
+_EMOJI_BYTES_CACHE: dict[int, bytes | None] = {}
+
+
+async def _fetch_emoji_bytes(literal: str | None) -> bytes | None:
+    """Fetch a custom Discord emoji as PNG bytes from the CDN.
+
+    ``literal`` is the raw ``<:Name:id>`` / ``<a:Name:id>`` form used in
+    the env. Returns ``None`` for unicode/empty input or any network
+    failure. Results are cached per emoji ID for the process lifetime.
+    """
+    eid = _emoji_id_from_literal(literal)
+    if eid is None:
+        return None
+    if eid not in _EMOJI_BYTES_CACHE:
+        url = f"https://cdn.discordapp.com/emojis/{eid}.png?size=64&quality=lossless"
+        _EMOJI_BYTES_CACHE[eid] = await _fetch_cdn_bytes(url)
+    return _EMOJI_BYTES_CACHE[eid]
 
 
 def _progress_components(

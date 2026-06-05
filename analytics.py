@@ -103,7 +103,7 @@ def _init() -> None:
                 """
             )
             conn.commit()
-            
+
             columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
             if "platform_scores" not in columns:
                 try:

@@ -1,8 +1,8 @@
 discord.py>=2.7,<3
+aiohttp>=3.9,<4
 numpy>=1.26,<3
 Pillow>=11.0,<13
 pytesseract>=0.3.13
-scikit-image>=0.22,<1
 python-dotenv>=1.0
 requests>=2.32,<3
 uvloop>=0.19; sys_platform != "win32" and platform_python_implementation == "CPython"
