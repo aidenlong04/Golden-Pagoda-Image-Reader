@@ -33,7 +33,7 @@ Discord bot ("**Oda Helper**") that OCRs Warframe profile screenshots, verifies 
 - `PLATFORM_ROLE_<PC|XBOX|PLAYSTATION|SWITCH|MOBILE>_ID` — auto-resolved from role name on connect, written back.
 - `CLAN_ROLE_{1..7}_NAME/_ID/_EMOJI` — 7 clan slots; names auto-resolve to IDs on connect.
 - `PLATFORM_EMOJI_<PC|XBOX|PLAYSTATION|SWITCH|MOBILE>` — custom Discord emojis (`<:name:id>` format).
-- `INCOMPLETE_ROLE_ID`, `VERIFY_REMOVE_ROLE_ID`, `OUTREACH_ROLE_IDS` — verification flow roles.
+- `INCOMPLETE_ROLE_ID`, `VERIFY_REMOVE_ROLE_ID` — verification flow roles.
 - `PASS_REACTION_ID/_NAME`, `FAIL_REACTION`, `PENDING_REACTION_ID/_NAME` — reactions on the original screenshot.
 - `REPLY_TTL_SECONDS` — auto-delete bot replies after N seconds.
 - `CATCHUP_LOOKBACK_HOURS` (default `24`) — how many hours of message history to scan on startup for missed screenshots.

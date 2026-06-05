@@ -173,16 +173,6 @@ ACCENT_INCOMPLETE = _int_env("ACCENT_INCOMPLETE", 0x99AAB5)  # grey
 # A staff member then manually completes verification.
 INCOMPLETE_ROLE_ID = _int_env("INCOMPLETE_ROLE_ID", 1361846841905381632)
 
-# Roles mentioned in the "Verification Incomplete" message so staff is pinged
-# to follow up. Comma-separated list of role IDs.
-OUTREACH_ROLE_IDS: list[int] = [
-    int(x)
-    for x in (
-        os.getenv("OUTREACH_ROLE_IDS", "1361846841934610565,1361846841934610563")
-    ).split(",")
-    if x.strip().isdigit()
-]
-
 # Auto-delete bot replies after this many seconds (0 = keep forever).
 REPLY_TTL_SECONDS = _int_env("REPLY_TTL_SECONDS", 180)
 
@@ -863,20 +853,16 @@ def _ocr_via_tesseract(
     return text, []
 
 
-# Tracks which OCR backend serviced the most recent _ocr() call so the
-# caller can record an accurate engine label in analytics.
-_LAST_OCR_ENGINE: str = "ocr.space"
-
-
+# Engine label returned alongside (text, words) so the caller can record
+# an accurate analytics tag without relying on shared mutable state
+# (concurrent _ocr() invocations would otherwise race).
 def _ocr(
     image_bytes: bytes, filename: str, content_type: str
-) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]]:
-    global _LAST_OCR_ENGINE
+) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]], str]:
     if OCR_API_KEY:
         try:
-            result = _ocr_via_api(image_bytes, filename, content_type)
-            _LAST_OCR_ENGINE = "ocr.space"
-            return result
+            text, words = _ocr_via_api(image_bytes, filename, content_type)
+            return text, words, "ocr.space"
         except Exception as api_err:
             logger.warning(
                 "OCR.space engine %s failed (%s); trying engine 2",
@@ -888,11 +874,10 @@ def _ocr(
             # configured for engine 2.
             if OCR_ENGINE != "2":
                 try:
-                    result = _ocr_via_api(
+                    text, words = _ocr_via_api(
                         image_bytes, filename, content_type, engine="2"
                     )
-                    _LAST_OCR_ENGINE = "ocr.space:e2"
-                    return result
+                    return text, words, "ocr.space:e2"
                 except Exception as api_err2:
                     logger.warning(
                         "OCR.space engine 2 also failed (%s); falling back to local Tesseract",
@@ -900,14 +885,14 @@ def _ocr(
                     )
             if pytesseract is None:
                 raise
-            _LAST_OCR_ENGINE = "tesseract"
-            return _ocr_via_tesseract(image_bytes)
+            text, words = _ocr_via_tesseract(image_bytes)
+            return text, words, "tesseract"
     if pytesseract is None:
         raise RuntimeError(
             "No OCR backend available: set OCR_API_KEY or install pytesseract."
         )
-    _LAST_OCR_ENGINE = "tesseract"
-    return _ocr_via_tesseract(image_bytes)
+    text, words = _ocr_via_tesseract(image_bytes)
+    return text, words, "tesseract"
 
 
 _PROFILE_TOKEN_RE = re.compile(r"#\d{2,4}")
@@ -1085,14 +1070,13 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
         # OCR involves blocking HTTP (up to 60s) and subprocess work — run it
         # in a worker thread so the event loop keeps servicing heartbeats and
         # other messages while a single screenshot is being verified.
-        ocr_text_raw, ocr_words = await asyncio.to_thread(
+        ocr_text_raw, ocr_words, ocr_engine = await asyncio.to_thread(
             _ocr,
             image_bytes,
             attachment.filename,
             attachment.content_type or "image/png",
         )
         ocr_text = ocr_text_raw.strip()
-        ocr_engine = _LAST_OCR_ENGINE
     except Exception:
         logger.exception("OCR failed for uploaded image")
         analytics.record_verification(
@@ -1508,20 +1492,6 @@ async def _add_incomplete_role(member: discord.Member) -> None:
 # ---------- Components V2 reply -------------------------------------------
 
 
-def _container(accent: int, text: str) -> dict:
-    """Minimal v2 container: one TextDisplay inside an accent-coloured container."""
-    return {
-        "type": 17,
-        "accent_color": accent,
-        "components": [{"type": 10, "content": text}],
-    }
-
-
-def _quote(text: str) -> str:
-    """Render multi-line text as a Discord blockquote."""
-    return "\n".join(f"> {line}" if line else ">" for line in text.splitlines() or [text])
-
-
 CLAN_EMOJI = os.getenv("CLAN_EMOJI", "").strip() or "\U0001F6E1\ufe0f"  # 🛡️
 OPERATOR_EMOJI_RAW = os.getenv(
     "OPERATOR_EMOJI", "<:operator:1467922510908494098>"
@@ -1910,10 +1880,6 @@ def _role_categories_for(role_ids: set[int]) -> list[tuple[str, bool]]:
             continue
         out.append((name, any(rid in role_ids for rid in ids)))
     return out
-
-
-def _missing_categories(role_ids: set[int]) -> list[str]:
-    return [name for name, has in _role_categories_for(role_ids) if not has]
 
 
 def _help_link_buttons(guild: "discord.Guild | None") -> list[tuple[str, str]]:
