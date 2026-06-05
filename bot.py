@@ -2928,6 +2928,10 @@ _PROGRESS_ACCENT = (212, 168, 87)      # gold accent (footer / pct)
 _PROGRESS_MISSING = (236, 170, 92)     # amber — 'missing data' callout
 _PROGRESS_AVATAR_SIZE = 112
 _PROGRESS_AVATAR_RING = (212, 168, 87)
+# Featured "stat tile" gradient — the profile card's headline Clan /
+# Mastery Rank fields sit in the band where the progress bar lives.
+_PROGRESS_STAT_TOP = (49, 52, 59)      # lighter slate (tile top edge)
+_PROGRESS_STAT_BOTTOM = (34, 36, 41)   # darker slate (tile bottom edge)
 # Supersample factor: the card is laid out in logical units then rendered
 # at this multiple so text, icons, and the bar stay crisp on Discord's
 # HiDPI clients (the previous 1x output looked soft when scaled).
@@ -3528,6 +3532,76 @@ def _render_progress_card_png(
     return buf.getvalue()
 
 
+def _draw_stat_tile(
+    canvas: Image.Image, *, x: int, y: int, w: int, h: int,
+    label: str, value: str, emoji_bytes: bytes | None, scale: int,
+) -> None:
+    """Render one featured "stat tile" for the profile card's headline
+    Clan / Mastery Rank fields.
+
+    A rounded slate tile (subtle vertical gradient + hairline border) with
+    a gold accent strip down the left edge, the category emoji
+    (aspect-preserved, bullet-free) at the left, a small muted uppercase
+    label and the value in large bold beneath it. ``x``/``y``/``w``/``h``
+    are supersampled pixels; ``scale`` keeps radii and strokes
+    proportional.
+    """
+    s = scale
+
+    def sc(v: float) -> int:
+        return int(round(v * s))
+
+    radius = sc(14)
+    tile = _vertical_gradient(w, h, _PROGRESS_STAT_TOP, _PROGRESS_STAT_BOTTOM)
+    mask = _rounded_mask(w, h, radius)
+    canvas.paste(tile, (x, y), mask)
+
+    # Gold accent strip down the left edge, clipped to the rounded corner
+    # so it follows the tile's top/bottom-left radius.
+    strip = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    ImageDraw.Draw(strip).rectangle(
+        (0, 0, sc(5), h - 1), fill=_PROGRESS_ACCENT + (255,)
+    )
+    clipped = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    clipped.paste(strip, (0, 0), mask)
+    canvas.alpha_composite(clipped, (x, y))
+
+    draw = ImageDraw.Draw(canvas)
+    draw.rounded_rectangle(
+        (x, y, x + w - 1, y + h - 1), radius=radius,
+        outline=_PROGRESS_BORDER + (255,), width=max(1, sc(1)),
+    )
+
+    icon_px = sc(30)
+    inner_x = x + sc(20)
+    cy = y + h // 2
+    if _paste_emoji_icon(
+        canvas, emoji_bytes, inner_x, cy, icon_px, label=label
+    ):
+        text_x = inner_x + icon_px + sc(13)
+    else:
+        text_x = inner_x
+
+    label_font = _load_font(sc(13), bold=True)
+    value_font = _load_font(sc(22), bold=True)
+    draw.text(
+        (text_x, y + sc(22)), label.upper(), font=label_font,
+        fill=_PROGRESS_MUTED, anchor="lm",
+    )
+    right_edge = x + w - sc(14)
+    v = value or ""
+    if draw.textlength(v, font=value_font) > right_edge - text_x:
+        while v and draw.textlength(
+            v + "\u2026", font=value_font
+        ) > right_edge - text_x:
+            v = v[:-1]
+        v = v + "\u2026"
+    draw.text(
+        (text_x, y + sc(44)), v, font=value_font,
+        fill=_PROGRESS_TEXT, anchor="lm",
+    )
+
+
 def _render_profile_card_png(
     *,
     avatar_bytes: bytes | None,
@@ -3559,15 +3633,29 @@ def _render_profile_card_png(
 
     pad = 22
     row_h = 30
-    # Header zone holds only the avatar + eyebrow + name now that the bar
-    # is gone, so it can be tighter than the progress card's.
+    # Header zone holds the avatar + eyebrow + name.
     header_h = 118
-    base_h = header_h + 12
-    info_block_h = 0
-    n_grid_rows = (len(norm_rows) + 1) // 2
-    if norm_rows:
+
+    # Promote the headline Clan / Mastery Rank fields into featured "stat
+    # tiles" laid out in the full-width band where the progress bar sits on
+    # the sibling /progress card. Everything else (Platform, Syndicate)
+    # flows into the reference grid at the bottom.
+    _FEATURED = ("Clan", "Mastery Rank")
+    featured = [r for r in norm_rows if r[0] in _FEATURED]
+    featured.sort(key=lambda r: _FEATURED.index(r[0]))
+    remaining = [r for r in norm_rows if r[0] not in _FEATURED]
+
+    feat_h = 66
+    feat_bottom = header_h + ((6 + feat_h) if featured else 0)
+
+    n_grid_rows = (len(remaining) + 1) // 2
+    if remaining:
+        divider_logical = feat_bottom + (18 if featured else 12)
         info_block_h = 14 + n_grid_rows * row_h + 16
-    card_h = base_h + info_block_h
+        card_h = divider_logical + info_block_h
+    else:
+        divider_logical = None
+        card_h = feat_bottom + 16
 
     W, H = sc(_PROGRESS_CARD_W), sc(card_h)
     canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -3625,10 +3713,31 @@ def _render_profile_card_png(
         fill=_PROGRESS_TEXT, anchor="lm",
     )
 
-    if norm_rows:
+    # Featured Clan / Mastery Rank tiles in the band beneath the header
+    # (where the progress bar lives on the /progress card).
+    if featured:
+        feat_left = sc(pad)
+        feat_right = W - sc(pad)
+        feat_top = sc(header_h + 6)
+        feat_h_px = sc(feat_h)
+        if len(featured) == 2:
+            gap = sc(16)
+            tile_w = (feat_right - feat_left - gap) // 2
+            second_x = feat_left + tile_w + gap
+            slots = [(feat_left, tile_w), (second_x, feat_right - second_x)]
+        else:
+            slots = [(feat_left, feat_right - feat_left)]
+        for (lbl, val, emj), (tx, tw) in zip(featured, slots, strict=True):
+            _draw_stat_tile(
+                canvas, x=tx, y=feat_top, w=tw, h=feat_h_px,
+                label=lbl, value=val, emoji_bytes=emj, scale=s,
+            )
+
+    # Remaining fields (Platform, Syndicate) in the shared reference grid.
+    if remaining and divider_logical is not None:
         _draw_info_grid(
-            canvas, norm_rows=norm_rows, width=W, divider_y=sc(base_h),
-            pad=pad, row_h=row_h, scale=s,
+            canvas, norm_rows=remaining, width=W,
+            divider_y=sc(divider_logical), pad=pad, row_h=row_h, scale=s,
         )
 
     buf = io.BytesIO()
