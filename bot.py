@@ -14,7 +14,7 @@ import warnings
 from collections import deque
 from collections.abc import Callable
 from datetime import timedelta
-from importlib import metadata as importlib_metadata
+
 from pathlib import Path
 
 # Suppress discord.py's audioop DeprecationWarning on Python 3.12. The bot
@@ -2452,13 +2452,6 @@ def _status_page_bot(interaction: discord.Interaction) -> str:
     members = sum(g.member_count or 0 for g in client.guilds)
     py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
 
-    # Event loop in use — surfaces whether uvloop is active.
-    try:
-        loop_cls = type(asyncio.get_running_loop()).__module__.split(".")[0]
-        loop_label = "uvloop" if loop_cls == "uvloop" else "asyncio"
-    except RuntimeError:
-        loop_label = "?"
-
     # Resident set size from /proc/self/status (no psutil dep).
     rss_kb: int | None = None
     try:
@@ -2471,27 +2464,13 @@ def _status_page_bot(interaction: discord.Interaction) -> str:
         pass
     rss_label = f"`{rss_kb // 1024} MiB`" if rss_kb else "`?`"
 
-    # Pooled aiohttp session state — surfaces the perf optimisation.
-    sess = _HTTP_SESSION
-    if sess is None:
-        http_label = "cold (lazy)"
-    elif getattr(sess, "closed", True):
-        http_label = "closed"
-    else:
-        http_label = "pooled"
-
-    bg = len(_BG_TASKS)
-
     return (
         f"**Bot**\n"
         f"-# User: `{user}` (`{getattr(user, 'id', '?')}`)\n"
-        f"-# Latency: `{latency_ms} ms`\n"
-        f"-# Uptime: `{uptime}`\n"
         f"-# Health: `{hb_line}`\n"
+        f"-# Uptime: `{uptime}` \u2022 Latency: `{latency_ms} ms`\n"
         f"-# Guilds: `{guilds}` \u2022 Members: `{members}`\n"
-        f"-# Python: `{py}` \u2022 discord.py: `{discord.__version__}`\n"
-        f"-# Loop: `{loop_label}` \u2022 RSS: {rss_label} \u2022 BG tasks: `{bg}`\n"
-        f"-# HTTP session: `{http_label}`"
+        f"-# Python: `{py}` \u2022 RSS: {rss_label}"
     )
 
 
@@ -2546,85 +2525,40 @@ def _status_page_channels(interaction: discord.Interaction) -> str:
         if not cid:
             return "*(unset)*"
         return f"<#{cid}> `{cid}`"
+
+    last_seen = _load_catchup_state()
+    if last_seen:
+        catchup = (
+            f"`{CATCHUP_LOOKBACK_HOURS}h` lookback \u2022 last id: "
+            f"`{last_seen}`"
+        )
+    else:
+        catchup = (
+            f"`{CATCHUP_LOOKBACK_HOURS}h` lookback \u2022 last id: *(none)*"
+        )
+
     return (
         f"**Channels**\n"
         f"-# Target: {fmt(TARGET_CHANNEL_ID)}\n"
-        f"-# Pass info button: {fmt(PASS_INFO_CHANNEL_ID)}\n"
-        f"-# Preview channel: {fmt(PREVIEW_CHANNEL_ID)}\n"
-        f"-# Guild ID: `{GUILD_ID}`"
-    )
-
-
-def _status_page_misc(interaction: discord.Interaction) -> str:
-    ocr = "OCR.space (engine 3)" if OCR_API_KEY else (
-        "Tesseract (local)" if pytesseract else "*(none configured)*"
-    )
-    try:
-        pillow_ver = importlib_metadata.version("Pillow")
-    except importlib_metadata.PackageNotFoundError:
-        pillow_ver = "?"
-    try:
-        numpy_ver = importlib_metadata.version("numpy")
-    except importlib_metadata.PackageNotFoundError:
-        numpy_ver = "?"
-    last_seen = _load_catchup_state()
-    catchup = (
-        f"`{CATCHUP_LOOKBACK_HOURS}h` lookback \u2022 last id: "
-        f"`{last_seen}`" if last_seen else
-        f"`{CATCHUP_LOOKBACK_HOURS}h` lookback \u2022 last id: *(none)*"
-    )
-
-    # Analytics SQLite state — reflects the persistent-connection + WAL
-    # change from the recent perf pass.
-    try:
-        analytics_conn = getattr(analytics, "_conn", None)
-        if analytics_conn is None:
-            sqlite_label = "`lazy (not yet opened)`"
-        else:
-            try:
-                mode_row = analytics_conn.execute(
-                    "PRAGMA journal_mode"
-                ).fetchone()
-                journal = (mode_row[0] if mode_row else "?") or "?"
-            except Exception:
-                journal = "?"
-            sqlite_label = f"`persistent` \u2022 journal=`{journal}`"
-    except Exception:
-        sqlite_label = "`?`"
-
-    # Font cache hit/miss counters — reflects the lru_cache around
-    # _load_font_cached().
-    try:
-        info = _load_font_cached.cache_info()
-        font_label = (
-            f"hits=`{info.hits}` misses=`{info.misses}` size=`{info.currsize}`"
-        )
-    except Exception:
-        font_label = "`?`"
-
-    return (
-        f"**OCR / Misc**\n"
-        f"-# OCR: `{ocr}`\n"
+        f"-# Pass info: {fmt(PASS_INFO_CHANNEL_ID)}\n"
+        f"-# Preview: {fmt(PREVIEW_CHANNEL_ID)}\n"
+        f"\n**Reactions**\n"
+        f"-# Pass: `:{PASS_REACTION_NAME}:`\n"
+        f"-# Pending: `:{PENDING_REACTION_NAME}:`\n"
+        f"-# Fail: {FAIL_REACTION}\n"
+        f"\n**Messaging**\n"
         f"-# Reply TTL: `{REPLY_TTL_SECONDS}s`\n"
-        f"-# OCR max upload: `{OCR_MAX_UPLOAD_BYTES} bytes`\n"
-        f"-# Pass reaction: `:{PASS_REACTION_NAME}:` ({PASS_REACTION_ID or '-'})\n"
-        f"-# Pending reaction: `:{PENDING_REACTION_NAME}:` ({PENDING_REACTION_ID or '-'})\n"
-        f"-# Fail reaction: {FAIL_REACTION}\n"
-        f"-# Catch-up: {catchup}\n"
-        f"-# Analytics SQLite: {sqlite_label}\n"
-        f"-# Font cache: {font_label}\n"
-        f"-# Pillow: `{pillow_ver}` \u2022 NumPy: `{numpy_ver}`"
+        f"-# Catch-up: {catchup}"
     )
 
 
 _STATUS_PAGES: list[tuple[str, str, str, Callable]] = [
     ("bot",       "\U0001F916 Bot",          "Bot identity, latency, uptime.",  lambda i, _s: _status_page_bot(i)),
     ("roles",     "\U0001F6E1\ufe0f Roles",  "Configured roles + slot map.",    lambda i, _s: _status_page_roles(i)),
-    ("channels",  "\U0001F4FA Channels",     "Target/info/preview channels.",   lambda i, _s: _status_page_channels(i)),
-    ("misc",      "\U0001F527 OCR / Misc",   "OCR backend, TTL, reactions.",    lambda i, _s: _status_page_misc(i)),
+    ("channels",  "\U0001F4FA Channels",     "Channels, reactions, messaging.", lambda i, _s: _status_page_channels(i)),
+    ("ocr",       "\U0001F50D OCR",          "OCR backend + latency stats.",    lambda _i, s: _status_page_ocr(s)),
     ("stats",     "\U0001F4C8 Stats",        "Verification totals + windows.",  lambda _i, s: _stats_page_overview(s)),
     ("clans",     "\U0001F3F0 Clans",        "Configured clans + member counts.", lambda i, _s: _status_page_clans(i)),
-    ("ocr",       "\u23f1\ufe0f OCR Latency","OCR latency p50/p95/avg.",        lambda _i, s: _stats_page_ocr(s)),
 ]
 _STATUS_PAGE_INDEX: dict[str, int] = {key: idx for idx, (key, *_rest) in enumerate(_STATUS_PAGES)}
 
@@ -2727,8 +2661,8 @@ async def _send_status_page(interaction: discord.Interaction, page: int) -> None
 
 
 # /status — single ephemeral command. The Components V2 message paginates
-# through every page (bot, roles, channels, misc, stats, platforms, clans,
-# ocr) via the Prev/Next buttons, so subcommands are unnecessary.
+# through every page (bot, roles, channels, ocr, stats, clans) via the
+# Prev/Next buttons, so subcommands are unnecessary.
 @tree.command(
     name="status",
     description="Bot status & verification analytics (paginated, ephemeral).",
@@ -3377,27 +3311,6 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         logger.exception("pagination failed")
 
 
-def _fmt_age(ts: int | None) -> str:
-    if not ts:
-        return "*(none)*"
-    delta = max(0, int(time.time()) - int(ts))
-    if delta < 60:
-        return f"{delta}s ago"
-    if delta < 3600:
-        return f"{delta // 60}m ago"
-    if delta < 86400:
-        return f"{delta // 3600}h ago"
-    return f"{delta // 86400}d ago"
-
-
-def _fmt_bytes(n: int) -> str:
-    if n < 1024:
-        return f"{n} B"
-    if n < 1024 ** 2:
-        return f"{n / 1024:.1f} KiB"
-    return f"{n / 1024 ** 2:.1f} MiB"
-
-
 def _stats_page_overview(s: dict) -> str:
     if not s.get("available"):
         return (
@@ -3427,10 +3340,7 @@ def _stats_page_overview(s: dict) -> str:
         f"\n**Windows**\n"
         f"-# Last 24h: `{win.get('24h', 0)}`\n"
         f"-# Last 7d: `{win.get('7d', 0)}`\n"
-        f"-# Last 30d: `{win.get('30d', 0)}`\n"
-        f"-# First seen: {_fmt_age(s.get('first_ts'))}\n"
-        f"-# Last seen: {_fmt_age(s.get('last_ts'))}\n"
-        f"-# DB size: `{_fmt_bytes(s.get('db_size_bytes', 0))}`"
+        f"-# Last 30d: `{win.get('30d', 0)}`"
     )
 
 
@@ -3458,24 +3368,23 @@ def _status_page_clans(interaction: discord.Interaction | None) -> str:
     return "\n".join(lines)
 
 
-def _stats_page_ocr(s: dict) -> str:
+def _status_page_ocr(s: dict) -> str:
+    backend = "OCR.space (engine 3)" if OCR_API_KEY else (
+        "Tesseract (local)" if pytesseract else "*(none configured)*"
+    )
+    lines = [
+        "**OCR**",
+        f"-# Backend: `{backend}`",
+        "",
+        "**Latency** (last 500 events)",
+    ]
     ocr = s.get("ocr") or {}
-    engines = ocr.get("engines") or []
-    lines = ["**OCR latency** (last 500 events)"]
     if ocr.get("samples"):
         lines.append(f"-# Samples: `{ocr['samples']}`")
         lines.append(f"-# Avg: `{ocr['avg_ms']} ms`")
-        lines.append(f"-# p50: `{ocr['p50_ms']} ms`")
-        lines.append(f"-# p95: `{ocr['p95_ms']} ms`")
+        lines.append(f"-# p50: `{ocr['p50_ms']} ms` \u2022 p95: `{ocr['p95_ms']} ms`")
     else:
         lines.append("-# No samples yet.")
-    lines.append("")
-    lines.append("**Engines**")
-    if engines:
-        for name, count in engines:
-            lines.append(f"-# `{name}` \u2014 `{count}`")
-    else:
-        lines.append("-# No data.")
     return "\n".join(lines)
 
 
