@@ -334,8 +334,8 @@ class MasteryEditorHelperTests(unittest.TestCase):
         )
         # Reserved attribute untouched so dispatch doesn't recurse.
         self.assertIsNone(btn._parent)
-        self.assertEqual(btn.label, "Submit Profile Screenshot")
-        self.assertEqual(btn.style, discord.ButtonStyle.primary)
+        self.assertEqual(btn.label, "Verify Profile Data")
+        self.assertEqual(btn.style, discord.ButtonStyle.danger)
 
         modal = b._ScreenshotVerifyModal(
             member=Mock(), owner_id=123, avatar_bytes=None,

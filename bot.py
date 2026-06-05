@@ -4383,7 +4383,7 @@ class _MasteryEditorView(discord.ui.View):
         if interaction.user.id != self.owner_id:
             with contextlib.suppress(discord.HTTPException):
                 await interaction.response.send_message(
-                    "These controls aren't yours.", ephemeral=True
+                    "Operator, you can't use this.", ephemeral=True
                 )
             return False
         return True
@@ -4580,8 +4580,13 @@ class _ScreenshotVerifyButton(discord.ui.Button):
         avatar_bytes: bytes | None, display_name: str,
     ) -> None:
         super().__init__(
-            style=discord.ButtonStyle.primary,
-            label="Submit Profile Screenshot",
+            style=discord.ButtonStyle.danger,
+            label="Verify Profile Data",
+            emoji=(
+                discord.PartialEmoji(name="verify", id=ASSIGN_ROLE_EMOJI_ID)
+                if ASSIGN_ROLE_EMOJI_ID
+                else None
+            ),
         )
         # Non-reserved names: discord.py's Item._run_checks recurses through
         # ``_parent``; clobbering it (or ``_view``) breaks dispatch.
@@ -4594,7 +4599,7 @@ class _ScreenshotVerifyButton(discord.ui.Button):
         if interaction.user.id != self._gp_owner_id:
             with contextlib.suppress(discord.HTTPException):
                 await interaction.response.send_message(
-                    "These controls aren't yours.", ephemeral=True
+                    "Operator, you can't use this.", ephemeral=True
                 )
             return
         modal = _ScreenshotVerifyModal(
@@ -4811,7 +4816,7 @@ async def profile_cmd(
             )
         # Own profile only: add the self-service action items — "Assign
         # <category>" link buttons for unearned Platform / Mastery Rank /
-        # Syndicate, plus a "Submit Profile Screenshot" button to OCR-fill
+        # Syndicate, plus a "Verify Profile Data" button to OCR-fill
         # everything when no in-game name was ever pulled.
         if target.id == interaction.user.id:
             if view is None:
