@@ -3694,7 +3694,7 @@ def _render_profile_card_png(
     # subtitle) + platform/syndicate icon row. It grows a touch when a
     # subtitle is shown so the small nick line has breathing room.
     header_h = 152 if subtitle else 140
-    clan_pill_h = 28
+    clan_pill_h = 20
     mr_pill_h = 32
 
     # The card is a two-column composition: a wide left content column
@@ -3754,10 +3754,10 @@ def _render_profile_card_png(
         return lines
 
     hero_lines: list[str] = []
-    hero_fs = 16
-    hero_lh = 19
+    hero_fs = 14
+    hero_lh = 16
     if hero_title:
-        for fs in (22, 20, 18, 16):
+        for fs in (18, 16, 15, 14):
             f = _load_font(sc(fs), bold=True)
             wrapped = _t_wrap(hero_title, f, _t_inner_w, 2)
             if len(wrapped) <= 2 and all(
@@ -3767,8 +3767,8 @@ def _render_profile_card_png(
                 hero_lines, hero_fs = wrapped, fs
                 break
         else:
-            f = _load_font(sc(16), bold=True)
-            hero_lines, hero_fs = _t_wrap(hero_title, f, _t_inner_w, 2), 16
+            f = _load_font(sc(14), bold=True)
+            hero_lines, hero_fs = _t_wrap(hero_title, f, _t_inner_w, 2), 14
         hero_lh = int(round(hero_fs * 1.16))
 
     if hero_title:
@@ -3783,7 +3783,7 @@ def _render_profile_card_png(
     # Left column: the Clan + Mastery rows sit just beneath the header's
     # platform/syndicate icon row (close to it) and stack downward.
     icon_row_cy = header_h // 2 + (42 if subtitle else 34)
-    stack_top = icon_row_cy + 16
+    stack_top = icon_row_cy + 12
     left_bottom = header_h
     clan_pill_top = None
     if clan_row is not None:
@@ -3966,18 +3966,18 @@ def _render_profile_card_png(
 
     # Clan (left column, beneath the header): a plain text row — just the
     # clan icon + name (no "CLAN:" label) with the name in the clan role's
-    # own colour, no pill. Left-aligns with the Mastery badge text below,
-    # nudged up a touch so a thin gray→gold gradient underline (tapered at
-    # both ends) can sit beneath the icon + name for a refined accent.
+    # own colour, no pill. The icon's left edge aligns with the Mastery
+    # badge's left edge below it so the under-avatar stack shares one clean
+    # left margin.
     if clan_row is not None and clan_pill_top is not None:
-        clan_value_font = _load_font(sc(10), bold=True)
-        clan_icon_px = sc(14)
-        clan_icon_gap = sc(6)
+        clan_value_font = _load_font(sc(11), bold=True)
+        clan_icon_px = sc(15)
+        clan_icon_gap = sc(7)
         clan_val = clan_row[1] or "\u2014"
         clan_emoji = clan_row[2]
         clan_name_fill = clan_color or _PROGRESS_ACCENT
         has_clan_icon = bool(clan_emoji)
-        cx0 = sc(pad) + sc(8) + sc(14)
+        cx0 = sc(pad) + sc(8)
         max_clan_w = sc(col_divider_x) - cx0 - sc(14)
         icon_w = (clan_icon_px + clan_icon_gap) if has_clan_icon else 0
         max_val_w = max_clan_w - icon_w
@@ -3997,25 +3997,6 @@ def _render_profile_card_png(
             (cx, ccy), clan_val, font=clan_value_font,
             fill=clan_name_fill, anchor="lm",
         )
-        # Thin gray→gold gradient underline beneath the clan icon + name,
-        # alpha-tapered at both ends so it reads as a refined hairline.
-        und_x0 = cx0
-        und_x1 = int(cx + draw.textlength(clan_val, font=clan_value_font))
-        und_w = max(1, und_x1 - und_x0)
-        und_h = max(1, sc(2))
-        und_y = ccy + sc(11)
-        g0 = np.array((150, 153, 158), dtype=np.float32)
-        g1 = np.array(_PROGRESS_ACCENT, dtype=np.float32)
-        tx = np.linspace(0.0, 1.0, und_w, dtype=np.float32)
-        rgb = g0[None, :] + (g1 - g0)[None, :] * tx[:, None]
-        alpha = np.full(und_w, 205.0, dtype=np.float32)
-        edge = max(1, und_w // 7)
-        alpha[:edge] *= np.linspace(0.18, 1.0, edge, dtype=np.float32)
-        alpha[-edge:] *= np.linspace(1.0, 0.35, edge, dtype=np.float32)
-        strip = np.empty((und_h, und_w, 4), dtype=np.uint8)
-        strip[..., :3] = rgb.astype(np.uint8)[None, :, :]
-        strip[..., 3] = alpha.astype(np.uint8)[None, :]
-        canvas.alpha_composite(Image.fromarray(strip, "RGBA"), (und_x0, und_y))
 
     # Mastery Rank capsule badge beneath the header (gold-tinted fill +
     # hairline gold border), sized to its content.
