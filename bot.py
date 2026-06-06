@@ -3628,8 +3628,9 @@ def _render_profile_card_png(
     muted subtitle when the two differ — a row of icons (platform with a
     soft gold glow, trailed by syndicate flags), then a plain-text Clan
     row and a Mastery Rank pill (a gold capsule badge). The right column
-    is a top-aligned "TITLES" header over a capped vertical list of the
-    member's cosmetic titles hung off a gold spine line, split from the
+    is a top-aligned "TITLES" header over a capped, right-indented vertical
+    list of the member's cosmetic titles, each gold diamond bullet + name
+    underlined by a perforated golden dotted separator, split from the
     left column by a gold divider. ``info_lines`` come from
     :func:`_member_profile_info_lines`. Rendered at ``_PROGRESS_SS``x for
     crisp HiDPI output.
@@ -3896,15 +3897,13 @@ def _render_profile_card_png(
                 )
             row_cx += syn_icon_px + syn_gap
 
-    # Clan (left column, beneath the header): a plain text row — icon +
-    # "CLAN: <name>" with the name in the clan role's own colour, no pill.
-    # Its content left-aligns with the Mastery badge's inner text below.
+    # Clan (left column, beneath the header): a plain text row — just the
+    # clan icon + name (no "CLAN:" label) with the name in the clan role's
+    # own colour, no pill. Left-aligns with the Mastery badge text below.
     if clan_row is not None and clan_pill_top is not None:
-        clan_label_font = _load_font(sc(10), bold=True)
-        clan_value_font = _load_font(sc(11), bold=True)
+        clan_value_font = _load_font(sc(10), bold=True)
         clan_icon_px = sc(14)
         clan_icon_gap = sc(6)
-        clan_label_txt = "CLAN: "
         clan_val = clan_row[1] or "\u2014"
         clan_emoji = clan_row[2]
         clan_name_fill = clan_color or _PROGRESS_ACCENT
@@ -3912,8 +3911,7 @@ def _render_profile_card_png(
         cx0 = sc(pad) + sc(8) + sc(14)
         max_clan_w = sc(col_divider_x) - cx0 - sc(14)
         icon_w = (clan_icon_px + clan_icon_gap) if has_clan_icon else 0
-        lbl_w = draw.textlength(clan_label_txt, font=clan_label_font)
-        max_val_w = max_clan_w - icon_w - lbl_w
+        max_val_w = max_clan_w - icon_w
         if draw.textlength(clan_val, font=clan_value_font) > max_val_w:
             while clan_val and draw.textlength(
                 clan_val + "\u2026", font=clan_value_font
@@ -3927,11 +3925,7 @@ def _render_profile_card_png(
         ):
             cx += clan_icon_px + clan_icon_gap
         draw.text(
-            (cx, ccy), clan_label_txt, font=clan_label_font,
-            fill=_PROGRESS_ACCENT, anchor="lm",
-        )
-        draw.text(
-            (cx + lbl_w, ccy), clan_val, font=clan_value_font,
+            (cx, ccy), clan_val, font=clan_value_font,
             fill=clan_name_fill, anchor="lm",
         )
 
@@ -3977,10 +3971,10 @@ def _render_profile_card_png(
 
     # ---- Right column: the Titles list -----------------------------------
     # A gold vertical divider splits the card; the right column holds a
-    # top-aligned "TITLES" header over a capped vertical list whose rows
-    # hang off a gold spine line (gold diamond bullet + name). Overflow
-    # beyond the cap shows as a muted "+N" beside the header, and an empty
-    # list reads "None yet".
+    # top-aligned "TITLES" header over a capped, right-indented vertical
+    # list. Each row is a gold diamond bullet + name with a perforated
+    # golden dotted separator beneath it. Overflow beyond the cap shows as
+    # a muted "+N" beside the header, and an empty list reads "None yet".
     div_x = sc(col_divider_x)
     draw.rounded_rectangle(
         (div_x, sc(pad + 10), div_x + sc(2), sc(card_h - pad - 10)),
@@ -3993,8 +3987,8 @@ def _render_profile_card_png(
     titles_inner_right = sc(panel_x1) - sc(16)
 
     # Top-align the titles block: the "TITLES" header sits at the top of
-    # the panel (no horizontal underline). The list hangs below it off a
-    # vertical gold accent line (spine), title text indented to its right.
+    # the panel (no horizontal underline). The list is indented to the
+    # right, each title underlined by a perforated dotted golden rule.
     titles_block_top = panel_top + 8
 
     th_cy = sc(titles_block_top + 12)
@@ -4009,24 +4003,17 @@ def _render_profile_card_png(
         )
 
     rows_y0 = titles_block_top + title_header_band + 12
-    spine_x = titles_inner_left + sc(4)
+    list_indent = sc(22)
     if title_list:
-        n_rows = len(title_list)
-        rows_top = sc(rows_y0)
-        rows_bot = sc(rows_y0 + (n_rows - 1) * title_row_h) + sc(title_row_h)
-        draw.rounded_rectangle(
-            (spine_x, rows_top, spine_x + sc(2), rows_bot),
-            radius=sc(1), fill=_PROGRESS_ACCENT + (255,),
-        )
         for ri, t in enumerate(title_list):
             ry = sc(rows_y0 + ri * title_row_h) + sc(title_row_h) // 2
-            bx = spine_x + sc(1)
+            bx = titles_inner_left + list_indent
             br = sc(4)
             draw.polygon(
                 [(bx, ry - br), (bx + br, ry), (bx, ry + br), (bx - br, ry)],
                 fill=_PROGRESS_FILL_GOLD_END + (255,),
             )
-            tx = spine_x + sc(16)
+            tx = bx + sc(14)
             tt = str(t)
             max_tt_w = titles_inner_right - tx
             if draw.textlength(tt, font=titles_row_font) > max_tt_w:
@@ -4039,6 +4026,18 @@ def _render_profile_card_png(
                 (tx, ry), tt, font=titles_row_font,
                 fill=_PROGRESS_TEXT, anchor="lm",
             )
+            # Perforated golden dotted separator beneath the title.
+            dot_y = ry + sc(12)
+            dot_r = max(1, sc(1))
+            dot_gap = sc(7)
+            dot_x = tx + dot_r
+            while dot_x <= titles_inner_right:
+                draw.ellipse(
+                    (dot_x - dot_r, dot_y - dot_r,
+                     dot_x + dot_r, dot_y + dot_r),
+                    fill=_PROGRESS_ACCENT + (170,),
+                )
+                dot_x += dot_gap
     else:
         ry = sc(rows_y0) + sc(title_row_h) // 2
         draw.text(
