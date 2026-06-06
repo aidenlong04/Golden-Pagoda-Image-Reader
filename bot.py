@@ -4006,25 +4006,26 @@ def _render_profile_card_png(
         radius=sc(1), fill=_PROGRESS_ACCENT + (140,),
     )
 
-    titles_header_font = _load_font(sc(13), bold=True)
+    titles_header_font = _load_font(sc(16), bold=True)
     titles_row_font = _load_font(sc(13), bold=True)
     titles_inner_left = sc(panel_x0) + sc(16)
     titles_inner_right = sc(panel_x1) - sc(16)
 
-    # Top-align the titles block: the "TITLES" header sits at the top of
-    # the panel (no horizontal underline). The list is indented to the
-    # right, each title underlined by a perforated dotted golden rule.
+    # Top-align the titles block: the "TITLES" header sits at the top-right
+    # corner of the panel (right-aligned to the card edge). The list is
+    # indented to the right, each title underlined by a perforated dotted
+    # golden rule.
     titles_block_top = panel_top + 8
 
     th_cy = sc(titles_block_top + 12)
     draw.text(
-        (titles_inner_left, th_cy), "TITLES", font=titles_header_font,
-        fill=_PROGRESS_ACCENT, anchor="lm",
+        (titles_inner_right, th_cy), "TITLES", font=titles_header_font,
+        fill=_PROGRESS_ACCENT, anchor="rm",
     )
     if title_overflow > 0:
         draw.text(
-            (titles_inner_right, th_cy), f"+{title_overflow}",
-            font=titles_row_font, fill=_PROGRESS_MUTED, anchor="rm",
+            (titles_inner_left, th_cy), f"+{title_overflow}",
+            font=titles_row_font, fill=_PROGRESS_MUTED, anchor="lm",
         )
 
     rows_y0 = titles_block_top + title_header_band + 12
