@@ -262,6 +262,11 @@ ASSIGN_ROLE_EMOJI_ID = _int_env("ASSIGN_ROLE_EMOJI_ID", 1416857287166918827)
 # When unset (0), /profile stays open to everyone.
 PROFILE_ACCESS_ROLE_ID = _int_env("PROFILE_ACCESS_ROLE_ID", 1392585653971062815)
 
+# Channel where /event award posts event-winner announcements (the "hall of
+# fame"). Defaults to the configured winners channel; when unset (0) /event
+# award refuses.
+WINNERS_CHANNEL_ID = _int_env("WINNERS_CHANNEL_ID", 1511663782705762416)
+
 
 def _format_mastery_display(value: str | None) -> str:
     """Normalize a stored/OCR'd mastery rank to a card-ready value.
@@ -2195,6 +2200,14 @@ async def _member_profile_info_lines(
             ))
         rows.append(("Syndicate", factions))
 
+    # Titles — cosmetic achievement labels awarded via /event award, newest
+    # first. Surfaced as compact gold chips on the profile card.
+    title_rows = await asyncio.to_thread(
+        analytics.list_member_titles, member.guild.id, member.id
+    )
+    if title_rows:
+        rows.append(("Titles", [r["title"] for r in title_rows]))
+
     return rows
 
 
@@ -3127,6 +3140,9 @@ _PROGRESS_AVATAR_RING = (212, 168, 87)
 # at this multiple so text, icons, and the bar stay crisp on Discord's
 # HiDPI clients (the previous 1x output looked soft when scaled).
 _PROGRESS_SS = 2
+# Max title chips drawn on the /profile card before the remainder folds
+# into a trailing "+N" chip (keeps the card height bounded).
+_PROFILE_MAX_TITLE_CHIPS = 6
 
 
 def _load_font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
@@ -3760,6 +3776,7 @@ def _render_profile_card_png(
     platform_row: tuple[str, str, bytes | None] | None = None
     mastery_row: tuple[str, str, bytes | None] | None = None
     syndicate_factions: list[tuple[str, tuple[int, int, int] | None, bytes | None]] = []
+    titles: list[str] = []
     for entry in info_lines or []:
         label = entry[0]
         if label == "Clan":
@@ -3781,6 +3798,10 @@ def _render_profile_card_png(
                  f[2] if len(f) >= 3 else None)
                 for f in entry[1]
             ]
+        elif label == "Titles" and len(entry) >= 2 and isinstance(
+            entry[1], list
+        ):
+            titles = [str(t).strip() for t in entry[1] if str(t).strip()]
 
     pad = 22
     # Identity: headline with the scanned in-game handle when we have it,
@@ -3802,14 +3823,67 @@ def _render_profile_card_png(
     header_h = 152 if subtitle else 140
     mr_pill_h = 32
 
+    # Titles — pre-measure the gold chips so the canvas height can include
+    # however many rows they wrap to. The card width is fixed, so chip
+    # wrapping is fully determined before the canvas exists. The visible
+    # chips are capped and any remainder folds into a trailing "+N" chip.
+    title_chip_h = 26
+    title_row_gap = 7
+    title_chip_gap = 7
+    title_eyebrow_band = 20
+    title_section_gap = 12
+    title_chip_font = _load_font(sc(13), bold=True)
+    title_chip_rows: list[list[tuple[str, int]]] = []
+    if titles:
+        measure = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        chip_pad_x = sc(11)
+        chip_gap = sc(title_chip_gap)
+        area_left = sc(pad) + sc(8)
+        area_w = sc(_PROGRESS_CARD_W) - sc(pad) - area_left
+        max_text_w = int(area_w * 0.44)
+        shown = titles[:_PROFILE_MAX_TITLE_CHIPS]
+        chips = list(shown)
+        hidden = len(titles) - len(shown)
+        if hidden > 0:
+            chips.append(f"+{hidden}")
+        cur: list[tuple[str, int]] = []
+        cur_w = 0
+        for chip_label in chips:
+            txt = chip_label
+            if measure.textlength(txt, font=title_chip_font) > max_text_w:
+                while txt and measure.textlength(
+                    txt + "\u2026", font=title_chip_font
+                ) > max_text_w:
+                    txt = txt[:-1]
+                txt = (txt + "\u2026") if txt else "\u2026"
+            cw = int(
+                measure.textlength(txt, font=title_chip_font)
+            ) + chip_pad_x * 2
+            add_w = cw if not cur else cw + chip_gap
+            if cur and cur_w + add_w > area_w:
+                title_chip_rows.append(cur)
+                cur = [(txt, cw)]
+                cur_w = cw
+            else:
+                cur.append((txt, cw))
+                cur_w += add_w
+        if cur:
+            title_chip_rows.append(cur)
+
     # Lay out the stacked sections so the canvas height is known before we
     # draw: the header (which now also carries the platform + syndicate
-    # flag icons) then the optional Mastery capsule.
+    # flag icons), the optional Mastery capsule, then the optional Titles.
     content_bottom = header_h
     mr_pill_top = None
     if mastery_row is not None:
         mr_pill_top = header_h + 10
         content_bottom = mr_pill_top + mr_pill_h
+    titles_top = None
+    if title_chip_rows:
+        titles_top = content_bottom + title_section_gap
+        n_rows = len(title_chip_rows)
+        rows_h = n_rows * title_chip_h + (n_rows - 1) * title_row_gap
+        content_bottom = titles_top + title_eyebrow_band + rows_h
     card_h = content_bottom + 16
 
     W, H = sc(_PROGRESS_CARD_W), sc(card_h)
@@ -4054,6 +4128,43 @@ def _render_profile_card_png(
             (mx + lbl_w, mcy), value_txt, font=mr_value_font,
             fill=_PROGRESS_FILL_GOLD_END, anchor="lm",
         )
+
+    # Titles — the pre-measured gold chips beneath the Mastery badge: a
+    # "TITLES" eyebrow over rounded chips that share the mastery capsule's
+    # gold-tinted fill + hairline border, wrapping across as many rows as
+    # were laid out above.
+    if title_chip_rows and titles_top is not None:
+        titles_eyebrow_font = _load_font(sc(13), bold=True)
+        chip_area_left = sc(pad) + sc(8)
+        chip_gap = sc(title_chip_gap)
+        draw.text(
+            (chip_area_left, sc(titles_top + title_eyebrow_band // 2)),
+            "TITLES", font=titles_eyebrow_font, fill=_PROGRESS_ACCENT,
+            anchor="lm",
+        )
+        chip_overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        chip_draw = ImageDraw.Draw(chip_overlay)
+        chip_top = titles_top + title_eyebrow_band
+        chip_text_pos: list[tuple[int, int, str]] = []
+        for ri, row in enumerate(title_chip_rows):
+            ry0 = sc(chip_top + ri * (title_chip_h + title_row_gap))
+            ry1 = ry0 + sc(title_chip_h)
+            cx = chip_area_left
+            for txt, cw in row:
+                chip_draw.rounded_rectangle(
+                    (cx, ry0, cx + cw, ry1),
+                    radius=sc(title_chip_h) // 2,
+                    fill=_PROGRESS_ACCENT + (14,),
+                    outline=_PROGRESS_ACCENT + (105,), width=max(1, sc(1)),
+                )
+                chip_text_pos.append((cx + cw // 2, (ry0 + ry1) // 2, txt))
+                cx += cw + chip_gap
+        canvas.alpha_composite(chip_overlay)
+        for tx, tcy, txt in chip_text_pos:
+            draw.text(
+                (tx, tcy), txt, font=title_chip_font,
+                fill=_PROGRESS_FILL_GOLD_END, anchor="mm",
+            )
 
     buf = io.BytesIO()
     canvas.save(buf, format="PNG", optimize=True)
@@ -4839,6 +4950,202 @@ async def profile_cmd(
             await interaction.response.send_message(
                 "\u274C Failed to render profile.", ephemeral=True
             )
+
+
+def _winner_announcement_components(
+    *,
+    winner_mention: str,
+    event_name: str,
+    event_url: str | None,
+    title: str | None = None,
+    reason: str | None = None,
+) -> list[dict]:
+    """Build the Components V2 payload for an event-winner announcement.
+
+    A single gold container holds the winner + event lines (and, when a
+    title was granted, the title + its citation), trailed by a "View
+    event" Link button when an ``event_url`` is supplied.
+    """
+    lines = [
+        "## \U0001F3C6 Event Winner",
+        f"**Winner:** {winner_mention}",
+        f"**Event:** {event_name}",
+    ]
+    if title:
+        award_line = f"**Title awarded:** {title}"
+        if reason:
+            award_line += f" \u2014 {reason}"
+        lines.append(award_line)
+    children: list[dict] = [{"type": 10, "content": "\n".join(lines)}]
+    row = _link_button_row([("View event", event_url)] if event_url else None)
+    if row:
+        children.append(row)
+    return [{"type": 17, "accent_color": ACCENT_PASS, "components": children}]
+
+
+# /event — admin command group bundling the event-winner announcement and
+# the cosmetic-title management under one top-level command. Manage Server
+# perm is set once on the group and inherited by every subcommand.
+event_group = app_commands.Group(
+    name="event",
+    description="Event winner announcements & profile titles.",
+    default_permissions=discord.Permissions(manage_guild=True),
+)
+
+
+@event_group.command(
+    name="award",
+    description="Announce an event winner and optionally grant a profile title.",
+)
+@app_commands.describe(
+    winner="The member who won the event.",
+    event_name="The event name shown in the announcement.",
+    event_channel="The event's channel/forum/thread, linked in the announcement.",
+    title="Optional profile title to grant (e.g. \"boot licker\").",
+    reason="Optional citation for the title (e.g. \"Submitted 10 boots\").",
+)
+async def event_award(
+    interaction: discord.Interaction,
+    winner: discord.Member,
+    event_name: str,
+    event_channel: (
+        discord.TextChannel | discord.ForumChannel | discord.Thread | None
+    ) = None,
+    title: str | None = None,
+    reason: str | None = None,
+) -> None:
+    from discord.http import Route
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "\u274C /event award can only be used in a server.", ephemeral=True
+        )
+        return
+    if not WINNERS_CHANNEL_ID:
+        await interaction.response.send_message(
+            "\u274C No winners channel is configured (set WINNERS_CHANNEL_ID).",
+            ephemeral=True,
+        )
+        return
+
+    event_name = (event_name or "").strip()
+    if not event_name:
+        await interaction.response.send_message(
+            "\u274C An event name is required.", ephemeral=True
+        )
+        return
+    title = (title or "").strip() or None
+    reason = (reason or "").strip() or None
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Persist the cosmetic title (newest-first on the profile card) before
+    # announcing, so the chip is live the moment the post lands.
+    if title:
+        await asyncio.to_thread(
+            analytics.award_title,
+            guild_id=guild.id,
+            user_id=winner.id,
+            title=title,
+            reason=reason,
+            event_name=event_name,
+        )
+
+    event_url = (
+        f"https://discord.com/channels/{guild.id}/{event_channel.id}"
+        if event_channel is not None else None
+    )
+    components = _winner_announcement_components(
+        winner_mention=winner.mention,
+        event_name=event_name,
+        event_url=event_url,
+        title=title,
+        reason=reason,
+    )
+    payload = {
+        "flags": COMPONENTS_V2_FLAG,
+        "components": components,
+        "allowed_mentions": {"parse": []},
+    }
+    route = Route(
+        "POST",
+        "/channels/{channel_id}/messages",
+        channel_id=WINNERS_CHANNEL_ID,
+    )
+    try:
+        await client.http.request(route, json=payload)
+    except Exception:
+        logger.exception("/event award: failed to post announcement")
+        await interaction.followup.send(
+            "\u274C Couldn't post to the winners channel "
+            f"<#{WINNERS_CHANNEL_ID}>. Check the bot's permissions there.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    confirm = (
+        f"\u2705 Announced **{winner.display_name}** as a winner of "
+        f"**{event_name}** in <#{WINNERS_CHANNEL_ID}>."
+    )
+    if title:
+        confirm += f"\nGranted the title **{title}**."
+    await interaction.followup.send(
+        confirm, ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@event_group.command(
+    name="revoke-title",
+    description="Remove a cosmetic profile title from a member.",
+)
+@app_commands.describe(
+    member="The member to remove the title from.",
+    title="The exact title to remove (case-insensitive).",
+)
+async def event_revoke_title(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    title: str,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "\u274C /event revoke-title can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+    title = (title or "").strip()
+    if not title:
+        await interaction.response.send_message(
+            "\u274C A title is required.", ephemeral=True
+        )
+        return
+    removed = await asyncio.to_thread(
+        analytics.revoke_title,
+        guild_id=guild.id,
+        user_id=member.id,
+        title=title,
+    )
+    if removed:
+        msg = (
+            f"\u2705 Removed the title **{title}** from "
+            f"**{member.display_name}**."
+        )
+    else:
+        msg = (
+            f"\u2139\uFE0F **{member.display_name}** has no title matching "
+            f"**{title}**."
+        )
+    await interaction.response.send_message(
+        msg, ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+tree.add_command(event_group)
 
 
 async def _handle_nick_interaction(

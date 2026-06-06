@@ -162,6 +162,42 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
         # accepted but silently dropped from the rendered message).
         self.assertIn("Not readable", str(result))
 
+    def test_winner_announcement_components_signature(self):
+        """_winner_announcement_components builds a single gold container,
+        surfaces the winner/event/title text, and appends a Link button row
+        only when an event URL is supplied."""
+        # With a title + event URL: one container, a View-event link button.
+        result = self.bot_module._winner_announcement_components(
+            winner_mention="<@4242>",
+            event_name="Fishing Derby",
+            event_url="https://discord.com/channels/1/2",
+            title="boot licker",
+            reason="Submitted 10 boots",
+        )
+        self.assertIsInstance(result, list)
+        containers = [c for c in result if c.get("type") == 17]
+        self.assertEqual(len(containers), 1)
+        blob = str(result)
+        for needle in ("Fishing Derby", "boot licker", "Submitted 10 boots"):
+            self.assertIn(needle, blob)
+        rows = [
+            ch for ch in (containers[0].get("components") or [])
+            if ch.get("type") == 1
+        ]
+        self.assertTrue(rows, "expected a Link button row when URL is set")
+        self.assertLessEqual(len(rows[0].get("components") or []), 5)
+        # Without an event URL (and no title): still one container, no row.
+        bare = self.bot_module._winner_announcement_components(
+            winner_mention="<@4242>",
+            event_name="Mystery Event",
+            event_url=None,
+        )
+        bare_container = [c for c in bare if c.get("type") == 17][0]
+        self.assertFalse(
+            any(ch.get("type") == 1
+                for ch in (bare_container.get("components") or [])),
+            "no Link button row expected without an event URL",
+        )
 
     def test_send_v2_signature(self):
         """_send_v2 helper can be called with all production kwargs."""
@@ -250,6 +286,38 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
                 avatar_bytes=None,
                 display_name="Tenno",
                 info_lines=info,
+            )
+            self.assertIsInstance(png, bytes)
+            self.assertTrue(
+                png.startswith(b"\x89PNG\r\n\x1a\n"),
+                "expected PNG magic bytes",
+            )
+
+    def test_render_profile_card_png_with_titles(self):
+        """Title chips render across empty / few / over-cap lists (the
+        overflow folds into a "+N" chip) and a very long title is
+        ellipsized rather than overflowing — all without raising."""
+        base = [
+            ("Clan", "Golden Tenno", None, (212, 168, 87)),
+            ("Platform", "PlayStation", None),
+            ("Mastery Rank", "28", None),
+        ]
+        title_cases = [
+            [],
+            ["boot licker"],
+            ["boot licker", "Sharpshooter", "Fisher King"],
+            # More than the visible cap exercises the "+N" overflow chip.
+            [f"Title {i}" for i in range(10)],
+            # A very long title must be ellipsized, not overflow the card.
+            ["A ridiculously long achievement title " * 3],
+        ]
+        for titles in title_cases:
+            info = base + [("Titles", titles)]
+            png = self.bot_module._render_profile_card_png(
+                avatar_bytes=None,
+                display_name="Tenno",
+                info_lines=info,
+                in_game_name="Tenno#1234",
             )
             self.assertIsInstance(png, bytes)
             self.assertTrue(

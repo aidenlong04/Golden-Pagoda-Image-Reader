@@ -112,6 +112,19 @@ def _init() -> None:
                     updated_ts INTEGER NOT NULL,
                     PRIMARY KEY (guild_id, user_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS member_titles (
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    title_key TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    reason TEXT,
+                    event_name TEXT,
+                    awarded_ts INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, user_id, title_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_member_titles_user
+                    ON member_titles(guild_id, user_id);
                 """
             )
             conn.commit()
@@ -241,6 +254,113 @@ def get_member_profile(guild_id: int, user_id: int) -> dict | None:
         except Exception:
             logger.exception("analytics: get_member_profile failed")
             return None
+
+
+def award_title(
+    *,
+    guild_id: int,
+    user_id: int,
+    title: str,
+    reason: str | None = None,
+    event_name: str | None = None,
+    awarded_ts: int | None = None,
+) -> None:
+    """Award a cosmetic profile title to a member (idempotent per title).
+
+    The stored ``title_key`` is the case-folded title, so re-awarding the
+    same title refreshes its reason / event / timestamp instead of
+    inserting a duplicate. Fail-soft like :func:`record_verification`.
+    """
+    title = (title or "").strip()
+    if not title:
+        return
+    key = title.casefold()
+    if _disabled:
+        return
+    with _lock:
+        _init()
+        if _disabled:
+            return
+        try:
+            with _connect() as conn:
+                conn.execute(
+                    "INSERT INTO member_titles"
+                    " (guild_id, user_id, title_key, title, reason,"
+                    "  event_name, awarded_ts)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(guild_id, user_id, title_key) DO UPDATE SET"
+                    "  title=excluded.title,"
+                    "  reason=COALESCE(excluded.reason, reason),"
+                    "  event_name=COALESCE(excluded.event_name, event_name),"
+                    "  awarded_ts=excluded.awarded_ts",
+                    (
+                        guild_id,
+                        user_id,
+                        key,
+                        title,
+                        reason,
+                        event_name,
+                        int(awarded_ts if awarded_ts is not None else time.time()),
+                    ),
+                )
+                conn.commit()
+        except Exception:
+            logger.exception("analytics: award_title failed")
+
+
+def list_member_titles(guild_id: int, user_id: int) -> list[dict]:
+    """Return a member's awarded titles as dicts, newest first.
+
+    Fail-soft: returns an empty list when analytics is disabled or errors.
+    """
+    if _disabled:
+        return []
+    with _lock:
+        _init()
+        if _disabled:
+            return []
+        try:
+            with _connect() as conn:
+                rows = conn.execute(
+                    "SELECT title_key, title, reason, event_name, awarded_ts"
+                    " FROM member_titles WHERE guild_id=? AND user_id=?"
+                    " ORDER BY awarded_ts DESC, title ASC",
+                    (guild_id, user_id),
+                ).fetchall()
+                return [dict(r) for r in rows]
+        except Exception:
+            logger.exception("analytics: list_member_titles failed")
+            return []
+
+
+def revoke_title(*, guild_id: int, user_id: int, title: str) -> bool:
+    """Remove an awarded title, matched case-insensitively by ``title``.
+
+    Returns True when a row was deleted. Fail-soft: returns False when
+    disabled or on error.
+    """
+    title = (title or "").strip()
+    if not title:
+        return False
+    key = title.casefold()
+    if _disabled:
+        return False
+    with _lock:
+        _init()
+        if _disabled:
+            return False
+        try:
+            with _connect() as conn:
+                cur = conn.execute(
+                    "DELETE FROM member_titles"
+                    " WHERE guild_id=? AND user_id=? AND title_key=?",
+                    (guild_id, user_id, key),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+        except Exception:
+            logger.exception("analytics: revoke_title failed")
+            return False
 
 
 def _percentile(values: list[int], pct: float) -> int:

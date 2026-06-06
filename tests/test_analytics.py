@@ -116,3 +116,97 @@ def test_member_profile_isolated_by_guild(analytics_module):
     a.upsert_member_profile(guild_id=3, user_id=5, mastery_rank="MR 30")
     assert a.get_member_profile(2, 5)["mastery_rank"] == "MR 12"
     assert a.get_member_profile(3, 5)["mastery_rank"] == "MR 30"
+
+
+def test_award_and_list_titles_roundtrip(analytics_module):
+    a = analytics_module
+    a.award_title(
+        guild_id=2, user_id=5, title="boot licker",
+        reason="Submitted 10 boots during fishing derby",
+        event_name="Fishing Derby", awarded_ts=1000,
+    )
+    a.award_title(
+        guild_id=2, user_id=5, title="Sharpshooter",
+        reason="Won the shooting gallery", awarded_ts=2000,
+    )
+    titles = a.list_member_titles(2, 5)
+    assert [t["title"] for t in titles] == ["Sharpshooter", "boot licker"]
+    boot = next(t for t in titles if t["title"] == "boot licker")
+    assert boot["reason"] == "Submitted 10 boots during fishing derby"
+    assert boot["event_name"] == "Fishing Derby"
+    assert boot["awarded_ts"] == 1000
+
+
+def test_award_title_idempotent_refreshes(analytics_module):
+    a = analytics_module
+    a.award_title(
+        guild_id=2, user_id=5, title="Boot Licker",
+        reason="old reason", awarded_ts=1000,
+    )
+    # Re-awarding the same title (case-insensitive) must not duplicate;
+    # it refreshes the reason + timestamp instead.
+    a.award_title(
+        guild_id=2, user_id=5, title="boot licker",
+        reason="new reason", awarded_ts=3000,
+    )
+    titles = a.list_member_titles(2, 5)
+    assert len(titles) == 1
+    assert titles[0]["title"] == "boot licker"
+    assert titles[0]["reason"] == "new reason"
+    assert titles[0]["awarded_ts"] == 3000
+
+
+def test_award_title_preserves_reason_when_omitted(analytics_module):
+    a = analytics_module
+    a.award_title(
+        guild_id=2, user_id=5, title="boot licker",
+        reason="keep me", event_name="Derby", awarded_ts=1000,
+    )
+    # A re-award with no reason/event keeps the previous values (COALESCE).
+    a.award_title(guild_id=2, user_id=5, title="boot licker", awarded_ts=2000)
+    t = a.list_member_titles(2, 5)[0]
+    assert t["reason"] == "keep me"
+    assert t["event_name"] == "Derby"
+    assert t["awarded_ts"] == 2000
+
+
+def test_award_title_blank_is_ignored(analytics_module):
+    a = analytics_module
+    a.award_title(guild_id=2, user_id=5, title="   ")
+    assert a.list_member_titles(2, 5) == []
+
+
+def test_revoke_title(analytics_module):
+    a = analytics_module
+    a.award_title(guild_id=2, user_id=5, title="boot licker")
+    a.award_title(guild_id=2, user_id=5, title="Sharpshooter")
+    # Case-insensitive match; returns True when a row is deleted.
+    assert a.revoke_title(guild_id=2, user_id=5, title="BOOT LICKER") is True
+    remaining = [t["title"] for t in a.list_member_titles(2, 5)]
+    assert remaining == ["Sharpshooter"]
+    # Revoking something that isn't there returns False.
+    assert a.revoke_title(guild_id=2, user_id=5, title="nope") is False
+
+
+def test_titles_isolated_by_member_and_guild(analytics_module):
+    a = analytics_module
+    a.award_title(guild_id=2, user_id=5, title="boot licker")
+    a.award_title(guild_id=2, user_id=6, title="Sharpshooter")
+    a.award_title(guild_id=3, user_id=5, title="Champion")
+    assert [t["title"] for t in a.list_member_titles(2, 5)] == ["boot licker"]
+    assert [t["title"] for t in a.list_member_titles(2, 6)] == ["Sharpshooter"]
+    assert [t["title"] for t in a.list_member_titles(3, 5)] == ["Champion"]
+
+
+def test_titles_missing_returns_empty(analytics_module):
+    assert analytics_module.list_member_titles(2, 999) == []
+
+
+def test_titles_fail_soft_when_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANALYTICS_DB_PATH", "/proc/forbidden/x.db")
+    import analytics
+    importlib.reload(analytics)
+    # None of these should raise even though the store is disabled.
+    analytics.award_title(guild_id=2, user_id=5, title="boot licker")
+    assert analytics.list_member_titles(2, 5) == []
+    assert analytics.revoke_title(guild_id=2, user_id=5, title="boot licker") is False
