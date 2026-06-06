@@ -3012,9 +3012,9 @@ _PROGRESS_AVATAR_RING = (212, 168, 87)
 # at this multiple so text, icons, and the bar stay crisp on Discord's
 # HiDPI clients (the previous 1x output looked soft when scaled).
 _PROGRESS_SS = 2
-# Max title chips drawn on the /profile card before the remainder folds
-# into a trailing "+N" chip (keeps the card height bounded).
-_PROFILE_MAX_TITLE_CHIPS = 6
+# Max title rows drawn in the /profile Titles panel before the remainder
+# folds into a "+N" overflow indicator (keeps the panel dimensions fixed).
+_PROFILE_MAX_TITLE_CHIPS = 3
 
 
 def _load_font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
@@ -3621,18 +3621,17 @@ def _render_profile_card_png(
     """Render the "user profile" card and return PNG bytes.
 
     A sibling of :func:`_render_progress_card_png` with the progress bar
-    removed. The header stacks a gold "USER PROFILE" eyebrow, the member's
-    in-game handle (``in_game_name``, e.g. ``PlayerName#123`` pulled from
-    the original profile scan) as the headline — with the Discord server
-    nickname (``display_name``) demoted to a small muted subtitle beneath
-    it when the two differ — and a row of icons beneath that (the platform
-    icon with a soft gold glow, trailed by the syndicate flags — a lone
-    syndicate shows its icon + faction-coloured name, two or more collapse
-    to icon-only) on the left of the circular avatar, with the Clan as a
-    gold callout on the right. Beneath the header the Mastery Rank sits in
-    a gold capsule badge. ``info_lines`` come from
-    :func:`_member_profile_info_lines`. Rendered at ``_PROGRESS_SS``x for
-    crisp HiDPI output.
+    removed, laid out as two columns split by a gold divider. The left
+    column stacks a gold "USER PROFILE" eyebrow, the member's in-game
+    handle (``in_game_name``, e.g. ``PlayerName#123``) as the headline —
+    with the Discord server nickname (``display_name``) demoted to a small
+    muted subtitle when the two differ — a row of icons (platform with a
+    soft gold glow, trailed by syndicate flags), then a Clan pill and a
+    Mastery Rank pill (both gold capsule badges). The right column is a
+    framed, gold-tinted Titles panel: an underlined "TITLES" header over a
+    capped vertical list of the member's cosmetic titles. ``info_lines``
+    come from :func:`_member_profile_info_lines`. Rendered at
+    ``_PROGRESS_SS``x for crisp HiDPI output.
     """
     s = _PROGRESS_SS
 
@@ -3690,72 +3689,42 @@ def _render_profile_card_png(
     )
 
     # Header zone holds the avatar + eyebrow + headline + (optional
-    # subtitle) + platform icon. It grows a touch when a subtitle is shown
-    # so the small nick line has breathing room above the icon row.
+    # subtitle) + platform/syndicate icon row. It grows a touch when a
+    # subtitle is shown so the small nick line has breathing room.
     header_h = 152 if subtitle else 140
+    clan_pill_h = 28
     mr_pill_h = 32
 
-    # Titles — pre-measure the gold chips so the canvas height can include
-    # however many rows they wrap to. The card width is fixed, so chip
-    # wrapping is fully determined before the canvas exists. The visible
-    # chips are capped and any remainder folds into a trailing "+N" chip.
-    title_chip_h = 26
-    title_row_gap = 7
-    title_chip_gap = 7
-    title_eyebrow_band = 20
-    title_section_gap = 12
-    title_chip_font = _load_font(sc(13), bold=True)
-    title_chip_rows: list[list[tuple[str, int]]] = []
-    if titles:
-        measure = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
-        chip_pad_x = sc(11)
-        chip_gap = sc(title_chip_gap)
-        area_left = sc(pad) + sc(8)
-        area_w = sc(_PROGRESS_CARD_W) - sc(pad) - area_left
-        max_text_w = int(area_w * 0.44)
-        shown = titles[:_PROFILE_MAX_TITLE_CHIPS]
-        chips = list(shown)
-        hidden = len(titles) - len(shown)
-        if hidden > 0:
-            chips.append(f"+{hidden}")
-        cur: list[tuple[str, int]] = []
-        cur_w = 0
-        for chip_label in chips:
-            txt = chip_label
-            if measure.textlength(txt, font=title_chip_font) > max_text_w:
-                while txt and measure.textlength(
-                    txt + "\u2026", font=title_chip_font
-                ) > max_text_w:
-                    txt = txt[:-1]
-                txt = (txt + "\u2026") if txt else "\u2026"
-            cw = int(
-                measure.textlength(txt, font=title_chip_font)
-            ) + chip_pad_x * 2
-            add_w = cw if not cur else cw + chip_gap
-            if cur and cur_w + add_w > area_w:
-                title_chip_rows.append(cur)
-                cur = [(txt, cw)]
-                cur_w = cw
-            else:
-                cur.append((txt, cw))
-                cur_w += add_w
-        if cur:
-            title_chip_rows.append(cur)
+    # The card is a two-column composition: a left content column
+    # (identity + Clan/Mastery pills) and a right Titles panel, split by a
+    # gold divider. Lay both out so the canvas height is known up front.
+    right_panel_w = 250
+    panel_x1 = _PROGRESS_CARD_W - pad
+    panel_x0 = panel_x1 - right_panel_w
+    col_divider_x = panel_x0 - 16
+    panel_top = pad
+    title_header_band = 22
+    title_row_h = 30
+    title_list = titles[:_PROFILE_MAX_TITLE_CHIPS]
+    title_overflow = len(titles) - len(title_list)
 
-    # Lay out the stacked sections so the canvas height is known before we
-    # draw: the header (which now also carries the platform + syndicate
-    # flag icons), the optional Mastery capsule, then the optional Titles.
-    content_bottom = header_h
+    # Left column: header → optional Clan pill → optional Mastery pill.
+    left_bottom = header_h
+    clan_pill_top = None
+    if clan_row is not None:
+        clan_pill_top = header_h + 8
+        left_bottom = clan_pill_top + clan_pill_h
     mr_pill_top = None
     if mastery_row is not None:
-        mr_pill_top = header_h + 10
-        content_bottom = mr_pill_top + mr_pill_h
-    titles_top = None
-    if title_chip_rows:
-        titles_top = content_bottom + title_section_gap
-        n_rows = len(title_chip_rows)
-        rows_h = n_rows * title_chip_h + (n_rows - 1) * title_row_gap
-        content_bottom = titles_top + title_eyebrow_band + rows_h
+        mr_pill_top = left_bottom + 8
+        left_bottom = mr_pill_top + mr_pill_h
+
+    # Right column: the panel shares the card height for symmetry, but
+    # must be tall enough for its own header + visible title rows.
+    display_rows = max(1, len(title_list))
+    panel_content_h = title_header_band + 14 + display_rows * title_row_h
+    panel_needed_bottom = panel_top + panel_content_h + 16
+    content_bottom = max(left_bottom, panel_needed_bottom)
     card_h = content_bottom + 16
 
     W, H = sc(_PROGRESS_CARD_W), sc(card_h)
@@ -3786,7 +3755,6 @@ def _render_profile_card_png(
     canvas.alpha_composite(avatar, (sc(pad), avatar_y))
 
     text_x = sc(pad) + avatar_px + sc(22)
-    right_x = W - sc(pad)
     draw = ImageDraw.Draw(canvas)
 
     eyebrow_font = _load_font(sc(14), bold=True)
@@ -3794,8 +3762,8 @@ def _render_profile_card_png(
 
     # Header rows anchored around the avatar's midline: eyebrow, headline,
     # an optional small subtitle (server nick), then the platform/syndicate
-    # icon row. The headline baseline stays fixed whether or not a subtitle
-    # is present so the right-hand Clan callout always lines up with it.
+    # icon row. The identity block's right edge is bounded by the Titles-
+    # panel divider so nothing crowds into the right column.
     cy = sc(header_h) // 2
     eyebrow_cy = cy - sc(32 if subtitle else 28)
     name_cy = cy - sc(8 if subtitle else 2)
@@ -3810,48 +3778,10 @@ def _render_profile_card_png(
         radius=sc(2), fill=_PROGRESS_ACCENT + (235,),
     )
 
-    # Clan callout on the right of the header: "CLAN" eyebrow over the
-    # clan emoji + name, aligned to the same two rows as the name block.
-    name_right_bound = right_x
-    if clan_row is not None:
-        clan_label_font = _load_font(sc(12), bold=True)
-        clan_value_font = _load_font(sc(16), bold=True)
-        c_icon_px = sc(22)
-        c_gap = sc(9)
-        clan_val = clan_row[1] or "\u2014"
-        clan_emoji = clan_row[2]
-        # Budget the callout to the right ~45% of the header so a long
-        # clan name can't crowd the member name; ellipsize to fit.
-        clan_budget = int((right_x - text_x) * 0.45)
-        icon_w = c_icon_px + c_gap if clan_emoji else 0
-        max_clan_w = clan_budget - icon_w
-        if draw.textlength(clan_val, font=clan_value_font) > max_clan_w:
-            while clan_val and draw.textlength(
-                clan_val + "\u2026", font=clan_value_font
-            ) > max_clan_w:
-                clan_val = clan_val[:-1]
-            clan_val = clan_val + "\u2026"
-        clan_text_w = draw.textlength(clan_val, font=clan_value_font)
-        block_left = int(right_x - icon_w - clan_text_w)
-        clan_name_fill = clan_color or _PROGRESS_ACCENT
-        draw.text(
-            (right_x, eyebrow_cy), "CLAN", font=clan_label_font,
-            fill=_PROGRESS_ACCENT, anchor="rm",
-        )
-        if clan_emoji and _paste_emoji_icon(
-            canvas, clan_emoji, block_left, name_cy, c_icon_px,
-            label="Clan",
-        ):
-            draw.text(
-                (block_left + c_icon_px + c_gap, name_cy), clan_val,
-                font=clan_value_font, fill=clan_name_fill, anchor="lm",
-            )
-        else:
-            draw.text(
-                (right_x, name_cy), clan_val, font=clan_value_font,
-                fill=clan_name_fill, anchor="rm",
-            )
-        name_right_bound = block_left - sc(20)
+    # The identity block (name, subtitle, icon row) is bounded on the
+    # right by the Titles-panel divider. Clan now lives in its own pill in
+    # the left column beneath the header (drawn further below).
+    name_right_bound = sc(col_divider_x) - sc(14)
 
     draw.text(
         (text_x, eyebrow_cy), "USER PROFILE", font=eyebrow_font,
@@ -3961,6 +3891,57 @@ def _render_profile_card_png(
                 )
             row_cx += syn_icon_px + syn_gap
 
+    # Clan pill (left column, beneath the header): the same capsule styling
+    # as the Mastery badge but a touch shorter with smaller text so a long
+    # clan name fits. The name renders in the clan role's own colour.
+    if clan_row is not None and clan_pill_top is not None:
+        clan_label_font = _load_font(sc(11), bold=True)
+        clan_value_font = _load_font(sc(13), bold=True)
+        clan_icon_px = sc(16)
+        clan_icon_gap = sc(7)
+        clan_pad_x = sc(13)
+        clan_label_txt = "CLAN: "
+        clan_val = clan_row[1] or "\u2014"
+        clan_emoji = clan_row[2]
+        clan_name_fill = clan_color or _PROGRESS_ACCENT
+        has_clan_icon = bool(clan_emoji)
+        pill_x0 = sc(pad) + sc(8)
+        max_pill_w = sc(col_divider_x) - pill_x0 - sc(14)
+        icon_w = (clan_icon_px + clan_icon_gap) if has_clan_icon else 0
+        lbl_w = draw.textlength(clan_label_txt, font=clan_label_font)
+        max_val_w = max_pill_w - icon_w - lbl_w - clan_pad_x * 2
+        if draw.textlength(clan_val, font=clan_value_font) > max_val_w:
+            while clan_val and draw.textlength(
+                clan_val + "\u2026", font=clan_value_font
+            ) > max_val_w:
+                clan_val = clan_val[:-1]
+            clan_val = clan_val + "\u2026"
+        val_w = draw.textlength(clan_val, font=clan_value_font)
+        pill_w = int(icon_w + lbl_w + val_w + clan_pad_x * 2)
+        pill_h = sc(clan_pill_h)
+        pill_y0 = sc(clan_pill_top)
+        clan_overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        ImageDraw.Draw(clan_overlay).rounded_rectangle(
+            (pill_x0, pill_y0, pill_x0 + pill_w, pill_y0 + pill_h),
+            radius=pill_h // 2, fill=_PROGRESS_ACCENT + (14,),
+            outline=_PROGRESS_ACCENT + (105,), width=max(1, sc(1)),
+        )
+        canvas.alpha_composite(clan_overlay)
+        ccy = pill_y0 + pill_h // 2
+        cx = pill_x0 + clan_pad_x
+        if has_clan_icon and _paste_emoji_icon(
+            canvas, clan_emoji, cx, ccy, clan_icon_px, label="Clan"
+        ):
+            cx += clan_icon_px + clan_icon_gap
+        draw.text(
+            (cx, ccy), clan_label_txt, font=clan_label_font,
+            fill=_PROGRESS_ACCENT, anchor="lm",
+        )
+        draw.text(
+            (cx + lbl_w, ccy), clan_val, font=clan_value_font,
+            fill=clan_name_fill, anchor="lm",
+        )
+
     # Mastery Rank capsule badge beneath the header (gold-tinted fill +
     # hairline gold border), sized to its content.
     if mastery_row is not None and mr_pill_top is not None:
@@ -4001,42 +3982,82 @@ def _render_profile_card_png(
             fill=_PROGRESS_FILL_GOLD_END, anchor="lm",
         )
 
-    # Titles — the pre-measured gold chips beneath the Mastery badge: a
-    # "TITLES" eyebrow over rounded chips that share the mastery capsule's
-    # gold-tinted fill + hairline border, wrapping across as many rows as
-    # were laid out above.
-    if title_chip_rows and titles_top is not None:
-        titles_eyebrow_font = _load_font(sc(13), bold=True)
-        chip_area_left = sc(pad) + sc(8)
-        chip_gap = sc(title_chip_gap)
+    # ---- Right column: the Titles panel ----------------------------------
+    # A gold vertical divider splits the card; the right column is a faint
+    # gold-tinted, gold-bordered panel holding an underlined "TITLES"
+    # header over a capped vertical list (gold diamond bullet + name). The
+    # block is vertically centred in the panel; overflow beyond the cap
+    # shows as a muted "+N" beside the header, and an empty list reads
+    # "None yet".
+    div_x = sc(col_divider_x)
+    draw.rounded_rectangle(
+        (div_x, sc(pad + 10), div_x + sc(2), sc(card_h - pad - 10)),
+        radius=sc(1), fill=_PROGRESS_ACCENT + (140,),
+    )
+    panel_overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    ImageDraw.Draw(panel_overlay).rounded_rectangle(
+        (sc(panel_x0), sc(panel_top), sc(panel_x1), sc(card_h - pad)),
+        radius=sc(14), fill=_PROGRESS_ACCENT + (12,),
+        outline=_PROGRESS_ACCENT + (85,), width=max(1, sc(1)),
+    )
+    canvas.alpha_composite(panel_overlay)
+
+    titles_header_font = _load_font(sc(13), bold=True)
+    titles_row_font = _load_font(sc(13), bold=True)
+    titles_inner_left = sc(panel_x0) + sc(16)
+    titles_inner_right = sc(panel_x1) - sc(16)
+
+    # Vertically centre the titles block within the panel's inner height.
+    panel_inner_h = (card_h - pad) - panel_top
+    titles_block_h = title_header_band + 14 + display_rows * title_row_h
+    titles_block_top = panel_top + max(0, (panel_inner_h - titles_block_h) // 2)
+
+    th_cy = sc(titles_block_top + 14)
+    draw.text(
+        (titles_inner_left, th_cy), "TITLES", font=titles_header_font,
+        fill=_PROGRESS_ACCENT, anchor="lm",
+    )
+    th_w = int(draw.textlength("TITLES", font=titles_header_font))
+    draw.line(
+        (titles_inner_left, th_cy + sc(11),
+         titles_inner_left + th_w, th_cy + sc(11)),
+        fill=_PROGRESS_ACCENT + (255,), width=max(1, sc(2)),
+    )
+    if title_overflow > 0:
         draw.text(
-            (chip_area_left, sc(titles_top + title_eyebrow_band // 2)),
-            "TITLES", font=titles_eyebrow_font, fill=_PROGRESS_ACCENT,
-            anchor="lm",
+            (titles_inner_right, th_cy), f"+{title_overflow}",
+            font=titles_row_font, fill=_PROGRESS_MUTED, anchor="rm",
         )
-        chip_overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-        chip_draw = ImageDraw.Draw(chip_overlay)
-        chip_top = titles_top + title_eyebrow_band
-        chip_text_pos: list[tuple[int, int, str]] = []
-        for ri, row in enumerate(title_chip_rows):
-            ry0 = sc(chip_top + ri * (title_chip_h + title_row_gap))
-            ry1 = ry0 + sc(title_chip_h)
-            cx = chip_area_left
-            for txt, cw in row:
-                chip_draw.rounded_rectangle(
-                    (cx, ry0, cx + cw, ry1),
-                    radius=sc(title_chip_h) // 2,
-                    fill=_PROGRESS_ACCENT + (14,),
-                    outline=_PROGRESS_ACCENT + (105,), width=max(1, sc(1)),
-                )
-                chip_text_pos.append((cx + cw // 2, (ry0 + ry1) // 2, txt))
-                cx += cw + chip_gap
-        canvas.alpha_composite(chip_overlay)
-        for tx, tcy, txt in chip_text_pos:
-            draw.text(
-                (tx, tcy), txt, font=title_chip_font,
-                fill=_PROGRESS_FILL_GOLD_END, anchor="mm",
+
+    rows_y0 = titles_block_top + title_header_band + 14
+    if title_list:
+        for ri, t in enumerate(title_list):
+            ry = sc(rows_y0 + ri * title_row_h) + sc(title_row_h) // 2
+            bx = titles_inner_left + sc(5)
+            br = sc(4)
+            draw.polygon(
+                [(bx, ry - br), (bx + br, ry), (bx, ry + br), (bx - br, ry)],
+                fill=_PROGRESS_FILL_GOLD_END + (255,),
             )
+            tx = bx + br + sc(10)
+            tt = str(t)
+            max_tt_w = titles_inner_right - tx
+            if draw.textlength(tt, font=titles_row_font) > max_tt_w:
+                while tt and draw.textlength(
+                    tt + "\u2026", font=titles_row_font
+                ) > max_tt_w:
+                    tt = tt[:-1]
+                tt = tt + "\u2026"
+            draw.text(
+                (tx, ry), tt, font=titles_row_font,
+                fill=_PROGRESS_TEXT, anchor="lm",
+            )
+    else:
+        ry = sc(rows_y0) + sc(title_row_h) // 2
+        draw.text(
+            (titles_inner_left + sc(2), ry), "None yet",
+            font=titles_row_font, fill=_PROGRESS_MUTED, anchor="lm",
+        )
 
     buf = io.BytesIO()
     canvas.save(buf, format="PNG", optimize=True)
