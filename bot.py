@@ -3717,7 +3717,7 @@ def _render_profile_card_png(
     _T_EB_GAP = 9       # eyebrow -> top flourish
     _T_FL_H = 2         # flourish line thickness
     _T_FL_GAP = 12      # flourish <-> title (both sides)
-    _T_MORE_GAP = 9     # bottom flourish -> "+N more"
+    _T_MORE_GAP = 9     # title -> "+N more"
     _T_MORE_H = 16      # "+N more" band
 
     # Pick the largest font that wraps the hero title into <=2 lines within
@@ -3774,7 +3774,7 @@ def _render_profile_card_png(
     if hero_title:
         title_group_h = (
             _T_EB_H + _T_EB_GAP + _T_FL_H + _T_FL_GAP
-            + len(hero_lines) * hero_lh + _T_FL_GAP + _T_FL_H
+            + len(hero_lines) * hero_lh
             + (_T_MORE_GAP + _T_MORE_H if hero_more else 0)
         )
     else:
@@ -4058,11 +4058,11 @@ def _render_profile_card_png(
         )
 
     # ---- Right column: the single "hero" title emblem --------------------
-    # An ornate centred crest (Honoria-style — one chosen title): a gold
-    # "TITLE" eyebrow, the title in large glowing gradient-gold framed above
-    # and below by tapered gold flourishes with a centre gem, and a muted
-    # "+N more" when the member holds others. The whole group is vertically
-    # centred in the column so it reads as a self-contained medallion.
+    # An ornate crest near the top of the column (Honoria-style — one chosen
+    # title): a gold "TITLE" eyebrow, a single tapered gold flourish with a
+    # centre gem, then the title in large glowing gradient-gold, and a muted
+    # "+N more" when the member holds others. Anchored high so the eyebrow
+    # sits level with the identity header.
     cxc = sc((panel_x0 + panel_x1) // 2)
     title_eyebrow_font = _load_font(sc(13), bold=True)
     flourish_half_w = sc(right_panel_w // 2 - 26)
@@ -4087,10 +4087,9 @@ def _render_profile_card_png(
             fill=_PROGRESS_FILL_GOLD_END + (255,),
         )
 
-    # Vertically centre the whole emblem within the right column.
-    zone_top = panel_top + 10
-    zone_bot = card_h - 12
-    yl = zone_top + max(0, (zone_bot - zone_top - title_group_h) // 2)
+    # Anchor the emblem near the top of the right column so it sits high,
+    # roughly level with the identity header rather than mid-card.
+    yl = panel_top + 10
 
     draw.text(
         (cxc, sc(yl + _T_EB_H // 2)), "TITLE", font=title_eyebrow_font,
@@ -4142,10 +4141,6 @@ def _render_profile_card_png(
                 canvas.paste(grad, (gx, gyy), tmask)
             gy += hero_lh
         yl = title_top + len(hero_lines) * hero_lh
-
-        yl += _T_FL_GAP
-        _title_flourish(sc(yl))
-        yl += _T_FL_H
 
         if hero_more:
             yl += _T_MORE_GAP
