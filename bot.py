@@ -3810,7 +3810,10 @@ def _render_profile_card_png(
 
     W, H = sc(_PROGRESS_CARD_W), sc(card_h)
     canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    panel = _vertical_gradient(W, H, _PROGRESS_BG_TOP, _PROGRESS_BG_BOTTOM)
+    # TEMP: flat #393a41 profile-card background (overrides the shared slate
+    # gradient just for this card; revert to _PROGRESS_BG_TOP/BOTTOM to undo).
+    _TEMP_PROFILE_BG = (0x39, 0x3A, 0x41)
+    panel = _vertical_gradient(W, H, _TEMP_PROFILE_BG, _TEMP_PROFILE_BG)
     panel_mask = _rounded_mask(W, H, sc(_PROGRESS_RADIUS))
     canvas.paste(panel, (0, 0), panel_mask)
     ImageDraw.Draw(canvas).rounded_rectangle(
@@ -4793,8 +4796,14 @@ async def profile_cmd(
             info_lines=info,
             in_game_name=in_game_name,
         )
+        # TEMP: present the profile card inside an embed (color matches the
+        # temp #393a41 background so the card blends into the embed body).
+        # Revert by dropping embed= and sending the file on its own.
+        _temp_embed = discord.Embed(color=0x393A41)
+        _temp_embed.set_image(url="attachment://profile.png")
         send_kwargs: dict = dict(
             file=discord.File(io.BytesIO(png), filename="profile.png"),
+            embed=_temp_embed,
             ephemeral=ephemeral,
             allowed_mentions=discord.AllowedMentions.none(),
         )
