@@ -3700,16 +3700,23 @@ def _render_profile_card_png(
     # The card is a two-column composition: a wide left content column
     # (identity + Clan/Mastery pills) and a narrow right Titles column
     # consolidated against the card's right edge. The right column mirrors
-    # the card's capsule-badge language: a gold "TITLES" eyebrow over a
-    # right-aligned stack of gold-tinted title chips. Lay both out so the
-    # canvas height is known up front.
-    right_panel_w = 170
+    # the card's capsule-badge language with a two-tier title showcase:
+    # one prominent gold gradient "featured" chip (the newest title) over
+    # smaller outlined "ghost" chips. Lay both out so the canvas height is
+    # known up front.
+    right_panel_w = 178
     panel_x1 = _PROGRESS_CARD_W - pad
     panel_x0 = panel_x1 - right_panel_w
     col_divider_x = panel_x0 - 16
     panel_top = pad
     title_header_band = 22
-    title_row_h = 36
+    # Title chips use a two-tier hierarchy: a taller filled "featured" chip
+    # for the newest title, then shorter outlined secondary chips. Metrics
+    # (logical units) are shared with the drawing pass below so the panel
+    # height matches the rendered stack exactly.
+    title_feat_h = 34
+    title_sec_h = 26
+    title_chip_gap = 10
     title_list = titles[:_PROFILE_MAX_TITLE_CHIPS]
     title_overflow = len(titles) - len(title_list)
 
@@ -3729,9 +3736,15 @@ def _render_profile_card_png(
         left_bottom = mr_pill_top + mr_pill_h
 
     # Right column: the panel shares the card height for symmetry, but
-    # must be tall enough for its own header + visible title rows.
-    display_rows = max(1, len(title_list))
-    panel_content_h = title_header_band + 14 + display_rows * title_row_h
+    # must be tall enough for its own eyebrow + visible title chips (a
+    # taller featured chip plus shorter secondary chips).
+    if title_list:
+        stack_h = title_feat_h + sum(
+            title_chip_gap + title_sec_h for _ in title_list[1:]
+        )
+    else:
+        stack_h = title_sec_h
+    panel_content_h = title_header_band + 14 + stack_h
     panel_needed_bottom = panel_top + panel_content_h + 16
     content_bottom = max(left_bottom, panel_needed_bottom)
     card_h = content_bottom + 16
@@ -3993,13 +4006,14 @@ def _render_profile_card_png(
             fill=_PROGRESS_FILL_GOLD_END, anchor="lm",
         )
 
-    # ---- Right column: the Titles "achievement" chips --------------------
-    # Echoes the card's capsule-badge language (cf. the Mastery Rank
-    # badge): a gold "TITLES" eyebrow with a tapered hairline beneath it,
-    # over a right-aligned stack of gold-tinted capsule chips — one per
-    # cosmetic title, each with a small gold diamond marker. Overflow folds
-    # into a muted "+N" tucked beside the eyebrow; an empty list reads
-    # "None yet".
+    # ---- Right column: the Titles "achievement showcase" -----------------
+    # A two-tier composition in the card's gold/slate vocabulary: a gold
+    # "TITLES" eyebrow with a tapered hairline, then the newest title as a
+    # prominent FILLED gold-gradient capsule (soft glow + dark sparkle
+    # marker, echoing the completed progress bar + platform glow), with the
+    # remaining titles as smaller OUTLINED ghost chips (gold hairline +
+    # diamond marker, echoing the Mastery badge). Overflow folds into a
+    # muted "+N" beside the eyebrow; an empty list reads "None yet".
     titles_eyebrow_font = _load_font(sc(14), bold=True)
     titles_chip_font = _load_font(sc(12), bold=True)
     titles_inner_left = sc(panel_x0) + sc(16)
@@ -4035,53 +4049,117 @@ def _render_profile_card_png(
         Image.fromarray(strip, "RGBA"), (titles_inner_right - und_w, und_y)
     )
 
-    # Title chips: gold-tinted capsules (subtle fill + hairline border,
-    # matching the Mastery Rank badge) with a small gold diamond marker,
-    # right-aligned and stacked beneath the eyebrow.
     chips_y0 = panel_top + title_header_band + 14
-    chip_h = sc(27)
-    chip_pad_x = sc(11)
-    chip_gap = sc(9)
-    dia_r = sc(3)
-    dia_gap = sc(8)
+
+    def _fit(text: str, font, max_w: int) -> str:
+        """Ellipsize ``text`` to fit ``max_w`` px under ``font``."""
+        if draw.textlength(text, font=font) <= max_w:
+            return text
+        while text and draw.textlength(
+            text + "\u2026", font=font
+        ) > max_w:
+            text = text[:-1]
+        return text + "\u2026"
+
     if title_list:
+        # ----- Featured (newest) title: filled gold gradient capsule ------
+        feat_font = _load_font(sc(13), bold=True)
+        feat_pad_x = sc(12)
+        star_r = sc(5)
+        star_gap = sc(9)
+        feat_glyph_w = star_r * 2 + star_gap
+        feat_h_px = sc(title_feat_h)
+        max_feat_w = (
+            titles_inner_right - titles_inner_left
+            - feat_pad_x * 2 - feat_glyph_w
+        )
+        ft = _fit(str(title_list[0]), feat_font, max_feat_w)
+        ftw = int(draw.textlength(ft, font=feat_font))
+        feat_w = feat_pad_x * 2 + feat_glyph_w + ftw
+        fx1 = titles_inner_right
+        fx0 = fx1 - feat_w
+        fy0 = sc(chips_y0)
+        fy1 = fy0 + feat_h_px
+        fcy = (fy0 + fy1) // 2
+        # Soft gold glow behind the featured chip.
+        glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        ImageDraw.Draw(glow).rounded_rectangle(
+            (fx0 - sc(1), fy0 - sc(1), fx1 + sc(1), fy1 + sc(1)),
+            radius=feat_h_px // 2, fill=_PROGRESS_ACCENT + (95,),
+        )
+        glow = glow.filter(ImageFilter.GaussianBlur(sc(6)))
+        canvas.alpha_composite(glow)
+        # Gold gradient fill (warm highlight top → richer gold bottom).
+        grad = _vertical_gradient(
+            feat_w, feat_h_px, _PROGRESS_FILL_GOLD_END, _PROGRESS_FILL_GOLD
+        )
+        gmask = _rounded_mask(feat_w, feat_h_px, feat_h_px // 2)
+        canvas.paste(grad, (fx0, fy0), gmask)
+        draw.rounded_rectangle(
+            (fx0, fy0, fx1, fy1), radius=feat_h_px // 2,
+            outline=_PROGRESS_ACCENT + (255,), width=max(1, sc(1)),
+        )
+        # Dark sparkle marker + dark text for contrast against the gold.
+        dark = (43, 33, 12)
+        scx = fx0 + feat_pad_x + star_r
+        si = max(1, int(star_r * 0.42))
+        draw.polygon(
+            [
+                (scx, fcy - star_r), (scx + si, fcy - si),
+                (scx + star_r, fcy), (scx + si, fcy + si),
+                (scx, fcy + star_r), (scx - si, fcy + si),
+                (scx - star_r, fcy), (scx - si, fcy - si),
+            ],
+            fill=dark + (255,),
+        )
+        draw.text(
+            (scx + star_r + star_gap, fcy), ft, font=feat_font,
+            fill=dark + (255,), anchor="lm",
+        )
+
+        # ----- Secondary titles: outlined ghost chips ---------------------
+        sec_font = _load_font(sc(12), bold=True)
+        sec_pad_x = sc(11)
+        dia_r = sc(3)
+        dia_gap = sc(8)
+        sec_glyph_w = dia_r * 2 + dia_gap
+        sec_h_px = sc(title_sec_h)
+        max_sec_w = (
+            titles_inner_right - titles_inner_left
+            - sec_pad_x * 2 - sec_glyph_w
+        )
+        y = fy1 + sc(title_chip_gap)
+        rects: list[tuple[int, int, str]] = []
         overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
         odraw = ImageDraw.Draw(overlay)
-        glyph_w = dia_r * 2 + dia_gap
-        max_tt_w = (
-            titles_inner_right - titles_inner_left - chip_pad_x * 2 - glyph_w
-        )
-        for ri, t in enumerate(title_list):
-            ccy = sc(chips_y0) + ri * (chip_h + chip_gap) + chip_h // 2
-            tt = str(t)
-            if draw.textlength(tt, font=titles_chip_font) > max_tt_w:
-                while tt and draw.textlength(
-                    tt + "\u2026", font=titles_chip_font
-                ) > max_tt_w:
-                    tt = tt[:-1]
-                tt = tt + "\u2026"
-            tw = int(draw.textlength(tt, font=titles_chip_font))
-            chip_w = chip_pad_x * 2 + glyph_w + tw
-            x1 = titles_inner_right
-            x0 = x1 - chip_w
+        for t in title_list[1:]:
+            st = _fit(str(t), sec_font, max_sec_w)
+            stw = int(draw.textlength(st, font=sec_font))
+            sw = sec_pad_x * 2 + sec_glyph_w + stw
+            sx1 = titles_inner_right
+            sx0 = sx1 - sw
+            scy = y + sec_h_px // 2
             odraw.rounded_rectangle(
-                (x0, ccy - chip_h // 2, x1, ccy + chip_h // 2),
-                radius=chip_h // 2, fill=_PROGRESS_ACCENT + (14,),
-                outline=_PROGRESS_ACCENT + (105,), width=max(1, sc(1)),
+                (sx0, y, sx1, y + sec_h_px), radius=sec_h_px // 2,
+                fill=_PROGRESS_ACCENT + (12,),
+                outline=_PROGRESS_ACCENT + (90,), width=max(1, sc(1)),
             )
-            dx = x0 + chip_pad_x + dia_r
-            odraw.polygon(
-                [(dx, ccy - dia_r), (dx + dia_r, ccy),
-                 (dx, ccy + dia_r), (dx - dia_r, ccy)],
+            rects.append((sx0, scy, st))
+            y += sec_h_px + sc(title_chip_gap)
+        canvas.alpha_composite(overlay)
+        for sx0, scy, st in rects:
+            dx = sx0 + sec_pad_x + dia_r
+            draw.polygon(
+                [(dx, scy - dia_r), (dx + dia_r, scy),
+                 (dx, scy + dia_r), (dx - dia_r, scy)],
                 fill=_PROGRESS_FILL_GOLD_END + (255,),
             )
-            odraw.text(
-                (dx + dia_r + dia_gap, ccy), tt, font=titles_chip_font,
+            draw.text(
+                (dx + dia_r + dia_gap, scy), st, font=sec_font,
                 fill=_PROGRESS_FILL_GOLD_END, anchor="lm",
             )
-        canvas.alpha_composite(overlay)
     else:
-        ry = sc(chips_y0) + chip_h // 2
+        ry = sc(chips_y0) + sc(title_sec_h) // 2
         draw.text(
             (titles_inner_right, ry), "None yet",
             font=titles_chip_font, fill=_PROGRESS_MUTED, anchor="rm",
