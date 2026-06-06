@@ -10,7 +10,6 @@ __pycache__
 .env.*
 !.env.example
 tests
-scripts/preview_responses.py
 README.md
 *.md
 .vscode

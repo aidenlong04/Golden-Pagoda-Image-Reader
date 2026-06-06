@@ -1,6 +1,11 @@
 __pycache__/
 *.pyc
 
+# Python tooling caches (local build artifacts)
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
 .env
 .env.*
 !.env.example

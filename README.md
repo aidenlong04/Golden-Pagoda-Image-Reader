@@ -44,8 +44,8 @@ full env reference.
 - `/clan-emblems role:<role> emoji:<:name:id>` — set the per-clan emoji at
   runtime. Updates in-memory state, `os.environ`, and rewrites the server's
   `.env`. Requires **Manage Server**.
-- `/preview-responses` — post sample pass / fail / incomplete V2 messages
-  to the preview channel.
+- `/titles action:<add|remove> member:<member> title:<text> [reason]` — grant
+  or remove a member's cosmetic profile title. Requires **Manage Server**.
 - `/status` — paginated ephemeral status panel (bot, roles, channels, OCR,
   stats, clans, latency). Surfaces uvloop, RSS, BG tasks, the pooled HTTP
   session and the analytics SQLite WAL state. Requires **Manage Server**.

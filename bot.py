@@ -219,7 +219,7 @@ CATCHUP_STATE_PATH = Path(os.getenv("CATCHUP_STATE_PATH", "/app/data/catchup_sta
 CATCHUP_DELAY_SECONDS = _float_env("CATCHUP_DELAY_SECONDS", 1.0)
 
 # Role IDs that count as "has MR verified" / "has joined a syndicate" for
-# the /progress completion check. Both accept a comma-separated list — a
+# the progress completion check. Both accept a comma-separated list — a
 # member counts as having the category if they hold ANY of the listed roles.
 # Empty list disables the category (it stays at 0/0 and doesn't drag the
 # completion percentage down).
@@ -261,11 +261,6 @@ ASSIGN_ROLE_EMOJI_ID = _int_env("ASSIGN_ROLE_EMOJI_ID", 1416857287166918827)
 # Role permitted to run /profile (server managers are always allowed too).
 # When unset (0), /profile stays open to everyone.
 PROFILE_ACCESS_ROLE_ID = _int_env("PROFILE_ACCESS_ROLE_ID", 1392585653971062815)
-
-# Channel where /event award posts event-winner announcements (the "hall of
-# fame"). Defaults to the configured winners channel; when unset (0) /event
-# award refuses.
-WINNERS_CHANNEL_ID = _int_env("WINNERS_CHANNEL_ID", 1511663782705762416)
 
 
 def _format_mastery_display(value: str | None) -> str:
@@ -2095,8 +2090,8 @@ def _role_categories_for(role_ids: set[int]) -> list[tuple[str, bool]]:
     """Return (name, has) for each *enabled* category given a member's roles.
 
     A category is enabled when its role-id list is non-empty. Disabled
-    categories don't appear in /progress totals, so an unconfigured server
-    won't show 0% forever.
+    categories don't appear in the progress-card totals, so an unconfigured
+    server won't show 0% forever.
     """
     out: list[tuple[str, bool]] = []
     for name, ids in _role_categories():
@@ -2200,7 +2195,7 @@ async def _member_profile_info_lines(
             ))
         rows.append(("Syndicate", factions))
 
-    # Titles — cosmetic achievement labels awarded via /event award, newest
+    # Titles — cosmetic achievement labels awarded via /titles, newest
     # first. Surfaced as compact gold chips on the profile card.
     title_rows = await asyncio.to_thread(
         analytics.list_member_titles, member.guild.id, member.id
@@ -2653,128 +2648,6 @@ async def clan_emblems(
     )
 
 
-PREVIEW_CHANNEL_ID = 1378199771428163765
-
-
-@tree.command(
-    name="preview-responses",
-    description="(temp) Post pass/fail/incomplete sample responses to the test channel.",
-)
-@app_commands.default_permissions(manage_guild=True)
-async def preview_responses(interaction: discord.Interaction) -> None:
-    from discord.http import Route
-
-    sample_clan = (
-        CLAN_SLOTS[0].clan_name
-        if CLAN_SLOTS and CLAN_SLOTS[0].clan_name
-        else "Golden Tenno"
-    )
-    sample_emoji = (CLAN_SLOTS[0].emoji if CLAN_SLOTS else None) or CLAN_EMOJI
-    sample_uid = interaction.user.id
-
-    samples: list[tuple[str, list[dict]]] = [
-        (
-            "PASS — mastery + missing categories",
-            _pass_components(
-                "GoldenTenno#200",
-                sample_clan,
-                clan_emoji=sample_emoji,
-                mastery_rank="MR 28",
-                missing_categories=["Platform", "Syndicate"],
-            ),
-        ),
-        (
-            "PASS — mastery only, fully verified",
-            _pass_components(
-                "MonguPrime002#661",
-                sample_clan,
-                clan_emoji=sample_emoji,
-                mastery_rank="MR 30",
-            ),
-        ),
-        (
-            "FAIL — Not an image",
-            _fail_components(
-                "Not an image",
-                "Upload a PNG/JPG screenshot of your Warframe profile.",
-            ),
-        ),
-        (
-            "FAIL — Invalid image",
-            _fail_components(
-                "Invalid image",
-                "Image could not be opened. Re-upload a valid PNG/JPG.",
-            ),
-        ),
-        (
-            "FAIL — Not readable",
-            _fail_components(
-                "Not readable",
-                "No text could be read. Upload a clearer screenshot.",
-            ),
-        ),
-        (
-            "FAIL — Profile not found",
-            _fail_components(
-                "Profile not found",
-                "Make sure your title bar (PlayerName#NNN) and platform "
-                "icon are visible at the top.",
-            ),
-        ),
-        (
-            "INCOMPLETE — unknown clan",
-            _incomplete_components(
-                f"No role for clan **{sample_clan}**.",
-            ),
-        ),
-        (
-            "NICKNAME PROMPT (standalone)",
-            _nickname_prompt_components(
-                "GoldenTenno",
-                sample_uid,
-                current_nick=(
-                    interaction.user.display_name
-                    if isinstance(interaction.user, discord.Member)
-                    else "OldNick"
-                ),
-            ),
-        ),
-    ]
-
-    route = Route(
-        "POST",
-        "/channels/{channel_id}/messages",
-        channel_id=PREVIEW_CHANNEL_ID,
-    )
-    # Defer first so we don't hit the 3s interaction timeout while
-    # posting 8 messages sequentially. Sequential keeps the channel
-    # ordering deterministic (pass → fail → incomplete → nick prompt).
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    sent = 0
-    errors: list[str] = []
-    for label, components in samples:
-        payload = {
-            "flags": COMPONENTS_V2_FLAG,
-            "components": components,
-            "allowed_mentions": {"parse": []},
-        }
-        try:
-            await client.http.request(route, json=payload)
-            sent += 1
-        except Exception as exc:
-            errors.append(f"{label}: {exc}")
-            logger.exception("preview-responses: failed sending %s", label)
-        await asyncio.sleep(0.3)
-
-    msg = (
-        f"\u2705 Posted {sent}/{len(samples)} samples to "
-        f"<#{PREVIEW_CHANNEL_ID}>."
-    )
-    if errors:
-        msg += "\n" + "\n".join(f"\u274C {e}" for e in errors)
-    await interaction.followup.send(msg, ephemeral=True)
-
-
 # ---------- /status (paginated, ephemeral, V2) ------------------------------
 
 
@@ -2892,7 +2765,6 @@ def _status_page_channels(
     return (
         f"**Channels**\n"
         f"-# Target: {fmt(TARGET_CHANNEL_ID)}\n"
-        f"-# Preview: {fmt(PREVIEW_CHANNEL_ID)}\n"
         f"\n**Reactions**\n"
         f"-# Pass: {fmt_reaction(PASS_REACTION_ID)}\n"
         f"-# Pending: {fmt_reaction(PENDING_REACTION_ID)}\n"
@@ -3111,7 +2983,7 @@ async def status_cmd(interaction: discord.Interaction) -> None:
     await _send_status_page(interaction, 0)
 
 
-# ---------- /progress (submission tracker, V2 with attached PNG) ------------
+# ---------- Progress card (rendered PNG, shared by the verify flow) ---------
 
 # Visual styling for the rendered progress card. The card composites the
 # member's avatar (circular, left) with a rounded gradient progress bar
@@ -4224,110 +4096,6 @@ async def _fetch_emoji_bytes(literal: str | None) -> bytes | None:
     return _EMOJI_BYTES_CACHE[eid]
 
 
-def _progress_components(
-    *, display_name: str, have: int, total: int, missing: list[str],
-    link_buttons: list[tuple[str, str]] | None = None,
-) -> list[dict]:
-    """Mirror the _pass_components shape so /progress feels identical to the
-    verification reply: header with the member's name + status icon, then a
-    container with the completion summary and an optional help-link button.
-    """
-    complete = have >= total and total > 0
-    if complete:
-        icon = "\u2705"
-        body = "\u2605 Verification complete \u2014 all roles assigned."
-        accent = ACCENT_PASS
-    elif total == 0:
-        icon = "\u26a0\ufe0f"
-        body = "-# No verification categories are configured for this server."
-        accent = ACCENT_INCOMPLETE
-    else:
-        icon = "\u26a0\ufe0f"
-        bullets = ", ".join(f"**{m}**" for m in missing)
-        body = f"-# Missing: {bullets}"
-        accent = ACCENT_INCOMPLETE
-
-    safe_name = _strip_clan_tag(display_name) or display_name
-    header = {"type": 10, "content": f"### {icon}  `{safe_name}`"}
-    container_children: list[dict] = [
-        {"type": 10, "content": body},
-        {"type": 10, "content": f"-# Progress: {have}/{total}"},
-    ]
-    if not complete:
-        button_row = _link_button_row(link_buttons)
-        if button_row:
-            container_children.append(button_row)
-    return [header, {
-        "type": 17, "accent_color": accent,
-        "components": container_children,
-    }]
-
-
-@tree.command(
-    name="progress",
-    description="Show your verification role progress (0-100% complete).",
-)
-@app_commands.describe(
-    user="View another member's progress (defaults to yourself).",
-    ephemeral="Only you can see the reply when true (default: false).",
-)
-async def progress_cmd(
-    interaction: discord.Interaction,
-    user: discord.Member | None = None,
-    ephemeral: bool = False,
-) -> None:
-    target = user or interaction.user
-    if not isinstance(target, discord.Member):
-        await interaction.response.send_message(
-            "\u274C /progress can only be used in a server.", ephemeral=True
-        )
-        return
-
-    display_name = target.display_name
-    avatar_asset = target.display_avatar or target.default_avatar
-    avatar_url = avatar_asset.replace(size=256, format="png").url
-
-    role_ids = {r.id for r in target.roles}
-    cats = _role_categories_for(role_ids)
-    total = len(cats)
-    have = sum(1 for _, ok in cats if ok)
-    missing = [name for name, ok in cats if not ok]
-
-    avatar_bytes = await _fetch_avatar_bytes(avatar_url)
-    png = await asyncio.to_thread(
-        _render_progress_card_png,
-        avatar_bytes=avatar_bytes,
-        display_name=display_name,
-        count=have,
-        target=total,
-    )
-
-    components = _progress_components(
-        display_name=display_name, have=have, total=total, missing=missing,
-        link_buttons=_help_link_buttons(interaction.guild),
-    )
-
-    # Mirror the verification flow exactly:
-    # 1. V2 card as the initial response (same shape as _pass_components).
-    # 2. The progress card PNG as a separate plain followup message — its
-    #    own attachment bubble, no media-gallery wrapper.
-    try:
-        await _interaction_callback(
-            interaction, 4, components, ephemeral=ephemeral,
-        )
-        await interaction.followup.send(
-            file=discord.File(io.BytesIO(png), filename="progress.png"),
-            ephemeral=ephemeral,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-    except Exception:
-        logger.exception("/progress failed")
-        if not interaction.response.is_done():
-            await interaction.response.send_message(
-                "\u274C Failed to render progress.", ephemeral=True
-            )
-
-
 # ---------- /profile mastery-rank editor ------------------------------------
 #
 # The /profile card can carry an opt-in dropdown that lets a member set
@@ -4895,8 +4663,8 @@ async def profile_cmd(
     avatar_url = avatar_asset.replace(size=256, format="png").url
 
     # Gather role-derived data first, then render off the event loop. The
-    # card carries the same reference grid as /progress (Clan / Platform /
-    # Mastery / Syndicate) without the progress bar.
+    # card carries the same reference grid as the progress card (Clan /
+    # Platform / Mastery / Syndicate) without the progress bar.
     try:
         await interaction.response.defer(ephemeral=ephemeral)
         info = await _member_profile_info_lines(target)
@@ -4952,169 +4720,34 @@ async def profile_cmd(
             )
 
 
-def _winner_announcement_components(
-    *,
-    winner_mention: str,
-    event_name: str,
-    event_url: str | None,
-    title: str | None = None,
-    reason: str | None = None,
-) -> list[dict]:
-    """Build the Components V2 payload for an event-winner announcement.
-
-    A single gold container holds the winner + event lines (and, when a
-    title was granted, the title + its citation), trailed by a "View
-    event" Link button when an ``event_url`` is supplied.
-    """
-    lines = [
-        "## \U0001F3C6 Event Winner",
-        f"**Winner:** {winner_mention}",
-        f"**Event:** {event_name}",
-    ]
-    if title:
-        award_line = f"**Title awarded:** {title}"
-        if reason:
-            award_line += f" \u2014 {reason}"
-        lines.append(award_line)
-    children: list[dict] = [{"type": 10, "content": "\n".join(lines)}]
-    row = _link_button_row([("View event", event_url)] if event_url else None)
-    if row:
-        children.append(row)
-    return [{"type": 17, "accent_color": ACCENT_PASS, "components": children}]
-
-
-# /event — admin command group bundling the event-winner announcement and
-# the cosmetic-title management under one top-level command. Manage Server
-# perm is set once on the group and inherited by every subcommand.
-event_group = app_commands.Group(
-    name="event",
-    description="Event winner announcements & profile titles.",
-    default_permissions=discord.Permissions(manage_guild=True),
+# /titles — admin command to grant or remove a member's cosmetic profile
+# title via a single add/remove action choice. Requires Manage Server.
+@tree.command(
+    name="titles",
+    description="Add or remove a member's cosmetic profile title.",
 )
-
-
-@event_group.command(
-    name="award",
-    description="Announce an event winner and optionally grant a profile title.",
-)
+@app_commands.default_permissions(manage_guild=True)
 @app_commands.describe(
-    winner="The member who won the event.",
-    event_name="The event name shown in the announcement.",
-    event_channel="The event's channel/forum/thread, linked in the announcement.",
-    title="Optional profile title to grant (e.g. \"boot licker\").",
-    reason="Optional citation for the title (e.g. \"Submitted 10 boots\").",
+    action="Whether to add or remove the title.",
+    member="The member whose title to change.",
+    title="The title text (case-insensitive when removing).",
+    reason="Optional citation shown when adding (ignored on remove).",
 )
-async def event_award(
+@app_commands.choices(action=[
+    app_commands.Choice(name="add", value="add"),
+    app_commands.Choice(name="remove", value="remove"),
+])
+async def titles_cmd(
     interaction: discord.Interaction,
-    winner: discord.Member,
-    event_name: str,
-    event_channel: (
-        discord.TextChannel | discord.ForumChannel | discord.Thread | None
-    ) = None,
-    title: str | None = None,
-    reason: str | None = None,
-) -> None:
-    from discord.http import Route
-
-    guild = interaction.guild
-    if guild is None:
-        await interaction.response.send_message(
-            "\u274C /event award can only be used in a server.", ephemeral=True
-        )
-        return
-    if not WINNERS_CHANNEL_ID:
-        await interaction.response.send_message(
-            "\u274C No winners channel is configured (set WINNERS_CHANNEL_ID).",
-            ephemeral=True,
-        )
-        return
-
-    event_name = (event_name or "").strip()
-    if not event_name:
-        await interaction.response.send_message(
-            "\u274C An event name is required.", ephemeral=True
-        )
-        return
-    title = (title or "").strip() or None
-    reason = (reason or "").strip() or None
-
-    await interaction.response.defer(ephemeral=True)
-
-    # Persist the cosmetic title (newest-first on the profile card) before
-    # announcing, so the chip is live the moment the post lands.
-    if title:
-        await asyncio.to_thread(
-            analytics.award_title,
-            guild_id=guild.id,
-            user_id=winner.id,
-            title=title,
-            reason=reason,
-            event_name=event_name,
-        )
-
-    event_url = (
-        f"https://discord.com/channels/{guild.id}/{event_channel.id}"
-        if event_channel is not None else None
-    )
-    components = _winner_announcement_components(
-        winner_mention=winner.mention,
-        event_name=event_name,
-        event_url=event_url,
-        title=title,
-        reason=reason,
-    )
-    payload = {
-        "flags": COMPONENTS_V2_FLAG,
-        "components": components,
-        "allowed_mentions": {"parse": []},
-    }
-    route = Route(
-        "POST",
-        "/channels/{channel_id}/messages",
-        channel_id=WINNERS_CHANNEL_ID,
-    )
-    try:
-        await client.http.request(route, json=payload)
-    except Exception:
-        logger.exception("/event award: failed to post announcement")
-        await interaction.followup.send(
-            "\u274C Couldn't post to the winners channel "
-            f"<#{WINNERS_CHANNEL_ID}>. Check the bot's permissions there.",
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        return
-
-    confirm = (
-        f"\u2705 Announced **{winner.display_name}** as a winner of "
-        f"**{event_name}** in <#{WINNERS_CHANNEL_ID}>."
-    )
-    if title:
-        confirm += f"\nGranted the title **{title}**."
-    await interaction.followup.send(
-        confirm, ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-
-
-@event_group.command(
-    name="revoke-title",
-    description="Remove a cosmetic profile title from a member.",
-)
-@app_commands.describe(
-    member="The member to remove the title from.",
-    title="The exact title to remove (case-insensitive).",
-)
-async def event_revoke_title(
-    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
     member: discord.Member,
     title: str,
+    reason: str | None = None,
 ) -> None:
     guild = interaction.guild
     if guild is None:
         await interaction.response.send_message(
-            "\u274C /event revoke-title can only be used in a server.",
-            ephemeral=True,
+            "\u274C /titles can only be used in a server.", ephemeral=True
         )
         return
     title = (title or "").strip()
@@ -5123,29 +4756,40 @@ async def event_revoke_title(
             "\u274C A title is required.", ephemeral=True
         )
         return
-    removed = await asyncio.to_thread(
-        analytics.revoke_title,
-        guild_id=guild.id,
-        user_id=member.id,
-        title=title,
-    )
-    if removed:
-        msg = (
-            f"\u2705 Removed the title **{title}** from "
-            f"**{member.display_name}**."
+
+    if action.value == "add":
+        reason = (reason or "").strip() or None
+        await asyncio.to_thread(
+            analytics.award_title,
+            guild_id=guild.id,
+            user_id=member.id,
+            title=title,
+            reason=reason,
         )
+        msg = f"\u2705 Gave **{member.display_name}** the title **{title}**."
+        if reason:
+            msg += f"\n-# {reason}"
     else:
-        msg = (
-            f"\u2139\uFE0F **{member.display_name}** has no title matching "
-            f"**{title}**."
+        removed = await asyncio.to_thread(
+            analytics.revoke_title,
+            guild_id=guild.id,
+            user_id=member.id,
+            title=title,
         )
+        if removed:
+            msg = (
+                f"\u2705 Removed the title **{title}** from "
+                f"**{member.display_name}**."
+            )
+        else:
+            msg = (
+                f"\u2139\uFE0F **{member.display_name}** has no title matching "
+                f"**{title}**."
+            )
     await interaction.response.send_message(
         msg, ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
-
-
-tree.add_command(event_group)
 
 
 async def _handle_nick_interaction(

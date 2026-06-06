@@ -372,7 +372,7 @@ def _percentile(values: list[int], pct: float) -> int:
 
 
 def summary() -> dict:
-    """Return a snapshot summary used by /stats."""
+    """Return a snapshot summary used by the /status stats page."""
     out: dict = {
         "available": False,
         "total": 0,
