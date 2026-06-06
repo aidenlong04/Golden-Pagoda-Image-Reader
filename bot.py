@@ -3626,12 +3626,13 @@ def _render_profile_card_png(
     handle (``in_game_name``, e.g. ``PlayerName#123``) as the headline —
     with the Discord server nickname (``display_name``) demoted to a small
     muted subtitle when the two differ — a row of icons (platform with a
-    soft gold glow, trailed by syndicate flags), then a Clan pill and a
-    Mastery Rank pill (both gold capsule badges). The right column is a
-    framed, gold-tinted Titles panel: an underlined "TITLES" header over a
-    capped vertical list of the member's cosmetic titles. ``info_lines``
-    come from :func:`_member_profile_info_lines`. Rendered at
-    ``_PROGRESS_SS``x for crisp HiDPI output.
+    soft gold glow, trailed by syndicate flags), then a plain-text Clan
+    row and a Mastery Rank pill (a gold capsule badge). The right column
+    is a top-aligned "TITLES" header over a capped vertical list of the
+    member's cosmetic titles hung off a gold spine line, split from the
+    left column by a gold divider. ``info_lines`` come from
+    :func:`_member_profile_info_lines`. Rendered at ``_PROGRESS_SS``x for
+    crisp HiDPI output.
     """
     s = _PROGRESS_SS
 
@@ -3708,15 +3709,19 @@ def _render_profile_card_png(
     title_list = titles[:_PROFILE_MAX_TITLE_CHIPS]
     title_overflow = len(titles) - len(title_list)
 
-    # Left column: header → optional Clan pill → optional Mastery pill.
+    # Left column: the Clan + Mastery rows sit just beneath the header's
+    # platform/syndicate icon row (close to it) and stack downward.
+    icon_row_cy = header_h // 2 + (42 if subtitle else 34)
+    stack_top = icon_row_cy + 16
     left_bottom = header_h
     clan_pill_top = None
     if clan_row is not None:
-        clan_pill_top = header_h + 8
+        clan_pill_top = stack_top
+        stack_top = clan_pill_top + clan_pill_h + 8
         left_bottom = clan_pill_top + clan_pill_h
     mr_pill_top = None
     if mastery_row is not None:
-        mr_pill_top = left_bottom + 8
+        mr_pill_top = stack_top
         left_bottom = mr_pill_top + mr_pill_h
 
     # Right column: the panel shares the card height for symmetry, but
@@ -3891,44 +3896,32 @@ def _render_profile_card_png(
                 )
             row_cx += syn_icon_px + syn_gap
 
-    # Clan pill (left column, beneath the header): the same capsule styling
-    # as the Mastery badge but a touch shorter with smaller text so a long
-    # clan name fits. The name renders in the clan role's own colour.
+    # Clan (left column, beneath the header): a plain text row — icon +
+    # "CLAN: <name>" with the name in the clan role's own colour, no pill.
+    # Its content left-aligns with the Mastery badge's inner text below.
     if clan_row is not None and clan_pill_top is not None:
-        clan_label_font = _load_font(sc(11), bold=True)
-        clan_value_font = _load_font(sc(13), bold=True)
-        clan_icon_px = sc(16)
-        clan_icon_gap = sc(7)
-        clan_pad_x = sc(13)
+        clan_label_font = _load_font(sc(10), bold=True)
+        clan_value_font = _load_font(sc(11), bold=True)
+        clan_icon_px = sc(14)
+        clan_icon_gap = sc(6)
         clan_label_txt = "CLAN: "
         clan_val = clan_row[1] or "\u2014"
         clan_emoji = clan_row[2]
         clan_name_fill = clan_color or _PROGRESS_ACCENT
         has_clan_icon = bool(clan_emoji)
-        pill_x0 = sc(pad) + sc(8)
-        max_pill_w = sc(col_divider_x) - pill_x0 - sc(14)
+        cx0 = sc(pad) + sc(8) + sc(14)
+        max_clan_w = sc(col_divider_x) - cx0 - sc(14)
         icon_w = (clan_icon_px + clan_icon_gap) if has_clan_icon else 0
         lbl_w = draw.textlength(clan_label_txt, font=clan_label_font)
-        max_val_w = max_pill_w - icon_w - lbl_w - clan_pad_x * 2
+        max_val_w = max_clan_w - icon_w - lbl_w
         if draw.textlength(clan_val, font=clan_value_font) > max_val_w:
             while clan_val and draw.textlength(
                 clan_val + "\u2026", font=clan_value_font
             ) > max_val_w:
                 clan_val = clan_val[:-1]
             clan_val = clan_val + "\u2026"
-        val_w = draw.textlength(clan_val, font=clan_value_font)
-        pill_w = int(icon_w + lbl_w + val_w + clan_pad_x * 2)
-        pill_h = sc(clan_pill_h)
-        pill_y0 = sc(clan_pill_top)
-        clan_overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-        ImageDraw.Draw(clan_overlay).rounded_rectangle(
-            (pill_x0, pill_y0, pill_x0 + pill_w, pill_y0 + pill_h),
-            radius=pill_h // 2, fill=_PROGRESS_ACCENT + (14,),
-            outline=_PROGRESS_ACCENT + (105,), width=max(1, sc(1)),
-        )
-        canvas.alpha_composite(clan_overlay)
-        ccy = pill_y0 + pill_h // 2
-        cx = pill_x0 + clan_pad_x
+        ccy = sc(clan_pill_top) + sc(clan_pill_h) // 2
+        cx = cx0
         if has_clan_icon and _paste_emoji_icon(
             canvas, clan_emoji, cx, ccy, clan_icon_px, label="Clan"
         ):
@@ -3982,46 +3975,32 @@ def _render_profile_card_png(
             fill=_PROGRESS_FILL_GOLD_END, anchor="lm",
         )
 
-    # ---- Right column: the Titles panel ----------------------------------
-    # A gold vertical divider splits the card; the right column is a faint
-    # gold-tinted, gold-bordered panel holding an underlined "TITLES"
-    # header over a capped vertical list (gold diamond bullet + name). The
-    # block is vertically centred in the panel; overflow beyond the cap
-    # shows as a muted "+N" beside the header, and an empty list reads
-    # "None yet".
+    # ---- Right column: the Titles list -----------------------------------
+    # A gold vertical divider splits the card; the right column holds a
+    # top-aligned "TITLES" header over a capped vertical list whose rows
+    # hang off a gold spine line (gold diamond bullet + name). Overflow
+    # beyond the cap shows as a muted "+N" beside the header, and an empty
+    # list reads "None yet".
     div_x = sc(col_divider_x)
     draw.rounded_rectangle(
         (div_x, sc(pad + 10), div_x + sc(2), sc(card_h - pad - 10)),
         radius=sc(1), fill=_PROGRESS_ACCENT + (140,),
     )
-    panel_overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    ImageDraw.Draw(panel_overlay).rounded_rectangle(
-        (sc(panel_x0), sc(panel_top), sc(panel_x1), sc(card_h - pad)),
-        radius=sc(14), fill=_PROGRESS_ACCENT + (12,),
-        outline=_PROGRESS_ACCENT + (85,), width=max(1, sc(1)),
-    )
-    canvas.alpha_composite(panel_overlay)
 
     titles_header_font = _load_font(sc(13), bold=True)
     titles_row_font = _load_font(sc(13), bold=True)
     titles_inner_left = sc(panel_x0) + sc(16)
     titles_inner_right = sc(panel_x1) - sc(16)
 
-    # Vertically centre the titles block within the panel's inner height.
-    panel_inner_h = (card_h - pad) - panel_top
-    titles_block_h = title_header_band + 14 + display_rows * title_row_h
-    titles_block_top = panel_top + max(0, (panel_inner_h - titles_block_h) // 2)
+    # Top-align the titles block: the "TITLES" header sits at the top of
+    # the panel (no horizontal underline). The list hangs below it off a
+    # vertical gold accent line (spine), title text indented to its right.
+    titles_block_top = panel_top + 8
 
-    th_cy = sc(titles_block_top + 14)
+    th_cy = sc(titles_block_top + 12)
     draw.text(
         (titles_inner_left, th_cy), "TITLES", font=titles_header_font,
         fill=_PROGRESS_ACCENT, anchor="lm",
-    )
-    th_w = int(draw.textlength("TITLES", font=titles_header_font))
-    draw.line(
-        (titles_inner_left, th_cy + sc(11),
-         titles_inner_left + th_w, th_cy + sc(11)),
-        fill=_PROGRESS_ACCENT + (255,), width=max(1, sc(2)),
     )
     if title_overflow > 0:
         draw.text(
@@ -4029,17 +4008,25 @@ def _render_profile_card_png(
             font=titles_row_font, fill=_PROGRESS_MUTED, anchor="rm",
         )
 
-    rows_y0 = titles_block_top + title_header_band + 14
+    rows_y0 = titles_block_top + title_header_band + 12
+    spine_x = titles_inner_left + sc(4)
     if title_list:
+        n_rows = len(title_list)
+        rows_top = sc(rows_y0)
+        rows_bot = sc(rows_y0 + (n_rows - 1) * title_row_h) + sc(title_row_h)
+        draw.rounded_rectangle(
+            (spine_x, rows_top, spine_x + sc(2), rows_bot),
+            radius=sc(1), fill=_PROGRESS_ACCENT + (255,),
+        )
         for ri, t in enumerate(title_list):
             ry = sc(rows_y0 + ri * title_row_h) + sc(title_row_h) // 2
-            bx = titles_inner_left + sc(5)
+            bx = spine_x + sc(1)
             br = sc(4)
             draw.polygon(
                 [(bx, ry - br), (bx + br, ry), (bx, ry + br), (bx - br, ry)],
                 fill=_PROGRESS_FILL_GOLD_END + (255,),
             )
-            tx = bx + br + sc(10)
+            tx = spine_x + sc(16)
             tt = str(t)
             max_tt_w = titles_inner_right - tx
             if draw.textlength(tt, font=titles_row_font) > max_tt_w:
