@@ -3995,17 +3995,12 @@ def _render_profile_card_png(
         )
 
     # ---- Right column: the Titles list -----------------------------------
-    # A gold vertical divider splits the card; the right column holds a
-    # top-aligned "TITLES" header over a capped, right-indented vertical
-    # list. Each row is a gold diamond bullet + name with a perforated
-    # golden dotted separator beneath it. Overflow beyond the cap shows as
-    # a muted "+N" beside the header, and an empty list reads "None yet".
-    div_x = sc(col_divider_x)
-    draw.rounded_rectangle(
-        (div_x, sc(pad + 10), div_x + sc(2), sc(card_h - pad - 10)),
-        radius=sc(1), fill=_PROGRESS_ACCENT + (140,),
-    )
-
+    # No divider — the right column holds a top-aligned "TITLES" header
+    # (right-aligned to the card edge) with the title list stacked directly
+    # beneath it, right-aligned so each row sits under the header. Each row
+    # is a gold diamond bullet + name with a perforated golden dotted
+    # separator beneath it. Overflow beyond the cap shows as a muted "+N"
+    # beside the header, and an empty list reads "None yet".
     titles_header_font = _load_font(sc(16), bold=True)
     titles_row_font = _load_font(sc(13), bold=True)
     titles_inner_left = sc(panel_x0) + sc(16)
@@ -4029,34 +4024,36 @@ def _render_profile_card_png(
         )
 
     rows_y0 = titles_block_top + title_header_band + 12
-    list_indent = sc(22)
     if title_list:
         for ri, t in enumerate(title_list):
             ry = sc(rows_y0 + ri * title_row_h) + sc(title_row_h) // 2
-            bx = titles_inner_left + list_indent
-            br = sc(4)
-            draw.polygon(
-                [(bx, ry - br), (bx + br, ry), (bx, ry + br), (bx - br, ry)],
-                fill=_PROGRESS_FILL_GOLD_END + (255,),
-            )
-            tx = bx + sc(14)
             tt = str(t)
-            max_tt_w = titles_inner_right - tx
+            # Leave room for the leading diamond bullet (+ gap) on the left.
+            max_tt_w = titles_inner_right - titles_inner_left - sc(18)
             if draw.textlength(tt, font=titles_row_font) > max_tt_w:
                 while tt and draw.textlength(
                     tt + "\u2026", font=titles_row_font
                 ) > max_tt_w:
                     tt = tt[:-1]
                 tt = tt + "\u2026"
+            # Name right-aligned to the panel's right edge.
             draw.text(
-                (tx, ry), tt, font=titles_row_font,
-                fill=_PROGRESS_TEXT, anchor="lm",
+                (titles_inner_right, ry), tt, font=titles_row_font,
+                fill=_PROGRESS_TEXT, anchor="rm",
             )
-            # Perforated golden dotted separator beneath the title.
+            tw = draw.textlength(tt, font=titles_row_font)
+            bx = titles_inner_right - int(round(tw)) - sc(10)
+            br = sc(4)
+            draw.polygon(
+                [(bx, ry - br), (bx + br, ry), (bx, ry + br), (bx - br, ry)],
+                fill=_PROGRESS_FILL_GOLD_END + (255,),
+            )
+            # Perforated golden dotted separator beneath the title, spanning
+            # the panel width.
             dot_y = ry + sc(12)
             dot_r = max(1, sc(1))
             dot_gap = sc(7)
-            dot_x = tx + dot_r
+            dot_x = titles_inner_left + dot_r
             while dot_x <= titles_inner_right:
                 draw.ellipse(
                     (dot_x - dot_r, dot_y - dot_r,
@@ -4067,8 +4064,8 @@ def _render_profile_card_png(
     else:
         ry = sc(rows_y0) + sc(title_row_h) // 2
         draw.text(
-            (titles_inner_left + sc(2), ry), "None yet",
-            font=titles_row_font, fill=_PROGRESS_MUTED, anchor="lm",
+            (titles_inner_right, ry), "None yet",
+            font=titles_row_font, fill=_PROGRESS_MUTED, anchor="rm",
         )
 
     buf = io.BytesIO()
