@@ -4007,9 +4007,8 @@ def _render_profile_card_png(
     titles_inner_right = sc(panel_x1) - sc(16)
 
     # Top-align the titles block: the "TITLES" header sits at the top-right
-    # corner of the panel (right-aligned to the card edge). The list is
-    # indented to the right, each title underlined by a perforated dotted
-    # golden rule.
+    # corner of the panel (right-aligned to the card edge). The list stacks
+    # tightly beneath it, each row a gold diamond bullet + name.
     titles_block_top = panel_top + 8
 
     th_cy = sc(titles_block_top + 12)
@@ -4023,7 +4022,7 @@ def _render_profile_card_png(
             font=titles_row_font, fill=_PROGRESS_MUTED, anchor="lm",
         )
 
-    rows_y0 = titles_block_top + title_header_band + 12
+    rows_y0 = titles_block_top + title_header_band + 4
     if title_list:
         for ri, t in enumerate(title_list):
             ry = sc(rows_y0 + ri * title_row_h) + sc(title_row_h) // 2
@@ -4048,19 +4047,6 @@ def _render_profile_card_png(
                 [(bx, ry - br), (bx + br, ry), (bx, ry + br), (bx - br, ry)],
                 fill=_PROGRESS_FILL_GOLD_END + (255,),
             )
-            # Perforated golden dotted separator beneath the title, spanning
-            # the panel width.
-            dot_y = ry + sc(12)
-            dot_r = max(1, sc(1))
-            dot_gap = sc(7)
-            dot_x = titles_inner_left + dot_r
-            while dot_x <= titles_inner_right:
-                draw.ellipse(
-                    (dot_x - dot_r, dot_y - dot_r,
-                     dot_x + dot_r, dot_y + dot_r),
-                    fill=_PROGRESS_ACCENT + (170,),
-                )
-                dot_x += dot_gap
     else:
         ry = sc(rows_y0) + sc(title_row_h) // 2
         draw.text(
