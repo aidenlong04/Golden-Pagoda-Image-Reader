@@ -262,6 +262,19 @@ ASSIGN_ROLE_EMOJI_ID = _int_env("ASSIGN_ROLE_EMOJI_ID", 1416857287166918827)
 # When unset (0), /profile stays open to everyone.
 PROFILE_ACCESS_ROLE_ID = _int_env("PROFILE_ACCESS_ROLE_ID", 1392585653971062815)
 
+# Roles permitted to use the advanced /profile options — `user` (target
+# another member) and `ephemeral` (control reply visibility). Members without
+# one of these (and non-managers) get those two options coerced to their
+# defaults (their own profile, shown only to them), so the options effectively
+# surface only for these roles. The `edit_mastery` option is exempt (it only
+# ever acts on the caller's own profile). Comma-separated; falls back to the
+# baked-in IDs when unset.
+PROFILE_OPTIONS_ROLE_IDS: list[int] = _csv_ids("PROFILE_OPTIONS_ROLE_IDS") or [
+    1361846841934610563,
+    1361846841934610564,
+    1361846841934610565,
+]
+
 
 def _format_mastery_display(value: str | None) -> str:
     """Normalize a stored/OCR'd mastery rank to a card-ready value.
@@ -4701,6 +4714,21 @@ def _can_use_profile(member: discord.Member) -> bool:
     return any(r.id == PROFILE_ACCESS_ROLE_ID for r in member.roles)
 
 
+def _can_use_profile_options(member: discord.Member) -> bool:
+    """Return True when ``member`` may use the advanced /profile options.
+
+    Gates the ``user`` (target another member) and ``ephemeral`` options to
+    ``PROFILE_OPTIONS_ROLE_IDS`` (server managers are always allowed). Members
+    without one of those roles get both options coerced to their defaults, so
+    the options effectively surface only for these roles. The ``edit_mastery``
+    option is intentionally exempt.
+    """
+    if member.guild_permissions.manage_guild:
+        return True
+    allowed = set(PROFILE_OPTIONS_ROLE_IDS)
+    return any(r.id in allowed for r in member.roles)
+
+
 @tree.command(
     name="profile",
     description="Show a member's Warframe verification profile card.",
@@ -4737,6 +4765,14 @@ async def profile_cmd(
             "\u274C You don't have access to /profile.", ephemeral=True
         )
         return
+
+    # The `user` + `ephemeral` options are gated to PROFILE_OPTIONS_ROLE_IDS.
+    # Members without one of those roles get them coerced to their defaults
+    # (their own profile, shown only to them) so those options effectively
+    # surface only for these roles. `edit_mastery` is intentionally exempt.
+    if not _can_use_profile_options(interaction.user):
+        target = interaction.user
+        ephemeral = True
 
     display_name = target.display_name
     avatar_asset = target.display_avatar or target.default_avatar
