@@ -3708,20 +3708,22 @@ def _render_profile_card_png(
     col_divider_x = panel_x0 - 16
     panel_top = pad
     title_header_band = 22
-    hero_title = titles[0] if titles else None
-    hero_more = max(0, len(titles) - 1)
+    shown_titles = titles[:3]
+    more_count = max(0, len(titles) - len(shown_titles))
 
-    # Ornament metrics for the hero emblem (logical units, shared with the
+    # Ornament metrics for the titles crest (logical units, shared with the
     # drawing pass so the panel height matches the rendered crest exactly).
     _T_EB_H = 16        # eyebrow band
     _T_EB_GAP = 9       # eyebrow -> top flourish
     _T_FL_H = 2         # flourish line thickness
-    _T_FL_GAP = 12      # flourish <-> title (both sides)
-    _T_MORE_GAP = 9     # title -> "+N more"
+    _T_FL_GAP = 12      # flourish <-> first title
+    _T_MORE_GAP = 9     # titles -> "+N more"
     _T_MORE_H = 16      # "+N more" band
+    _T_NAME_FS = 11     # title text size (matches the clan name)
+    _T_NAME_LH = 17     # per-title row height
 
-    # Pick the largest font that wraps the hero title into <=2 lines within
-    # the column; fall back to ellipsizing the smallest size.
+    # Each shown title is laid out on a single line, ellipsized to fit the
+    # column at the clan-name text size.
     _t_inner_w = sc(right_panel_w - 36)
     _t_mdraw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
 
@@ -3753,29 +3755,16 @@ def _render_profile_card_png(
             lines[-1] = (last + "\u2026") if last else "\u2026"
         return lines
 
-    hero_lines: list[str] = []
-    hero_fs = 14
-    hero_lh = 16
-    if hero_title:
-        for fs in (18, 16, 15, 14):
-            f = _load_font(sc(fs), bold=True)
-            wrapped = _t_wrap(hero_title, f, _t_inner_w, 2)
-            if len(wrapped) <= 2 and all(
-                _t_mdraw.textlength(ln, font=f) <= _t_inner_w
-                for ln in wrapped
-            ):
-                hero_lines, hero_fs = wrapped, fs
-                break
-        else:
-            f = _load_font(sc(14), bold=True)
-            hero_lines, hero_fs = _t_wrap(hero_title, f, _t_inner_w, 2), 14
-        hero_lh = int(round(hero_fs * 1.16))
+    _t_name_font = _load_font(sc(_T_NAME_FS), bold=True)
+    title_lines = [
+        _t_wrap(t, _t_name_font, _t_inner_w, 1)[0] for t in shown_titles
+    ]
 
-    if hero_title:
+    if title_lines:
         title_group_h = (
             _T_EB_H + _T_EB_GAP + _T_FL_H + _T_FL_GAP
-            + len(hero_lines) * hero_lh
-            + (_T_MORE_GAP + _T_MORE_H if hero_more else 0)
+            + len(title_lines) * _T_NAME_LH
+            + (_T_MORE_GAP + _T_MORE_H if more_count else 0)
         )
     else:
         title_group_h = _T_EB_H + _T_EB_GAP + 20
@@ -4044,12 +4033,12 @@ def _render_profile_card_png(
             fill=_PROGRESS_FILL_GOLD_END, anchor="lm",
         )
 
-    # ---- Right column: the single "hero" title emblem --------------------
-    # An ornate crest near the top of the column (Honoria-style — one chosen
-    # title): a gold "TITLE" eyebrow, a single tapered gold flourish with a
-    # centre gem, then the title in large glowing gradient-gold, and a muted
-    # "+N more" when the member holds others. Anchored high so the eyebrow
-    # sits level with the identity header.
+    # ---- Right column: the titles crest ----------------------------------
+    # An ornate crest near the top of the column: a gold "TITLE(S)" eyebrow,
+    # a tapered gold flourish with a centre gem, then up to three titles in
+    # gradient-gold at the clan-name text size, and a muted "+N more" when
+    # the member holds others. Anchored high so the eyebrow sits level with
+    # the identity header.
     cxc = sc((panel_x0 + panel_x1) // 2)
     title_eyebrow_font = _load_font(sc(13), bold=True)
     flourish_half_w = sc(right_panel_w // 2 - 26)
@@ -4078,62 +4067,46 @@ def _render_profile_card_png(
     # roughly level with the identity header rather than mid-card.
     yl = panel_top + 10
 
+    eyebrow_label = "TITLE" if len(shown_titles) == 1 else "TITLES"
     draw.text(
-        (cxc, sc(yl + _T_EB_H // 2)), "TITLE", font=title_eyebrow_font,
+        (cxc, sc(yl + _T_EB_H // 2)), eyebrow_label, font=title_eyebrow_font,
         fill=_PROGRESS_ACCENT, anchor="mm",
     )
     yl += _T_EB_H
 
-    if hero_title:
+    if title_lines:
         yl += _T_EB_GAP
         _title_flourish(sc(yl))
         yl += _T_FL_H + _T_FL_GAP
 
-        hero_font = _load_font(sc(hero_fs), bold=True)
-        line_h = sc(hero_lh)
-        title_top = yl
+        name_font = _load_font(sc(_T_NAME_FS), bold=True)
+        line_h = sc(_T_NAME_LH)
 
-        # Soft gold glow behind the title for hero emphasis.
-        glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-        gdraw = ImageDraw.Draw(glow)
-        gy = title_top
-        for ln in hero_lines:
-            if ln:
-                gdraw.text(
-                    (cxc, sc(gy) + line_h // 2), ln, font=hero_font,
-                    fill=_PROGRESS_ACCENT + (165,), anchor="mm",
-                )
-            gy += hero_lh
-        glow = glow.filter(ImageFilter.GaussianBlur(sc(4)))
-        canvas.alpha_composite(glow)
-
-        # Crisp gradient-filled title (warm highlight → rich gold), drawn
+        # Each title in gradient-gold (warm highlight → rich gold), drawn
         # per line via a text mask so the gold flows vertically through it.
-        gy = title_top
-        for ln in hero_lines:
+        for ln in title_lines:
             if ln:
-                bbox = draw.textbbox((0, 0), ln, font=hero_font, anchor="lt")
+                bbox = draw.textbbox((0, 0), ln, font=name_font, anchor="lt")
                 tw = max(1, bbox[2] - bbox[0])
                 th = max(1, bbox[3] - bbox[1])
                 tmask = Image.new("L", (tw, th), 0)
                 ImageDraw.Draw(tmask).text(
-                    (-bbox[0], -bbox[1]), ln, font=hero_font, fill=255,
+                    (-bbox[0], -bbox[1]), ln, font=name_font, fill=255,
                     anchor="lt",
                 )
                 grad = _vertical_gradient(
                     tw, th, _PROGRESS_FILL_GOLD_END, _PROGRESS_FILL_GOLD
                 )
                 gx = cxc - tw // 2
-                gyy = sc(gy) + line_h // 2 - th // 2
+                gyy = sc(yl) + line_h // 2 - th // 2
                 canvas.paste(grad, (gx, gyy), tmask)
-            gy += hero_lh
-        yl = title_top + len(hero_lines) * hero_lh
+            yl += _T_NAME_LH
 
-        if hero_more:
+        if more_count:
             yl += _T_MORE_GAP
             draw.text(
-                (cxc, sc(yl + _T_MORE_H // 2)), f"+{hero_more} more",
-                font=_load_font(sc(11), bold=True),
+                (cxc, sc(yl + _T_MORE_H // 2)), f"+{more_count} more",
+                font=_load_font(sc(10), bold=True),
                 fill=_PROGRESS_MUTED, anchor="mm",
             )
             yl += _T_MORE_H
