@@ -3697,10 +3697,14 @@ def _render_profile_card_png(
     clan_pill_h = 28
     mr_pill_h = 32
 
-    # The card is a two-column composition: a left content column
-    # (identity + Clan/Mastery pills) and a right Titles panel, split by a
-    # gold divider. Lay both out so the canvas height is known up front.
-    right_panel_w = 250
+    # The card is a two-column composition: a wide left content column
+    # (identity + Clan/Mastery pills) and a narrow right Titles column
+    # consolidated against the card's right edge, split by a gold divider.
+    # The narrow right column keeps the whole Titles block (header, list,
+    # dotted separators) contained in the right-hand region rather than
+    # spreading across empty space. Lay both out so the canvas height is
+    # known up front.
+    right_panel_w = 170
     panel_x1 = _PROGRESS_CARD_W - pad
     panel_x0 = panel_x1 - right_panel_w
     col_divider_x = panel_x0 - 16
@@ -3899,7 +3903,9 @@ def _render_profile_card_png(
 
     # Clan (left column, beneath the header): a plain text row — just the
     # clan icon + name (no "CLAN:" label) with the name in the clan role's
-    # own colour, no pill. Left-aligns with the Mastery badge text below.
+    # own colour, no pill. Left-aligns with the Mastery badge text below,
+    # nudged up a touch so a thin gray→gold gradient underline (tapered at
+    # both ends) can sit beneath the icon + name for a refined accent.
     if clan_row is not None and clan_pill_top is not None:
         clan_value_font = _load_font(sc(10), bold=True)
         clan_icon_px = sc(14)
@@ -3918,7 +3924,7 @@ def _render_profile_card_png(
             ) > max_val_w:
                 clan_val = clan_val[:-1]
             clan_val = clan_val + "\u2026"
-        ccy = sc(clan_pill_top) + sc(clan_pill_h) // 2
+        ccy = sc(clan_pill_top) + sc(10)
         cx = cx0
         if has_clan_icon and _paste_emoji_icon(
             canvas, clan_emoji, cx, ccy, clan_icon_px, label="Clan"
@@ -3928,6 +3934,25 @@ def _render_profile_card_png(
             (cx, ccy), clan_val, font=clan_value_font,
             fill=clan_name_fill, anchor="lm",
         )
+        # Thin gray→gold gradient underline beneath the clan icon + name,
+        # alpha-tapered at both ends so it reads as a refined hairline.
+        und_x0 = cx0
+        und_x1 = int(cx + draw.textlength(clan_val, font=clan_value_font))
+        und_w = max(1, und_x1 - und_x0)
+        und_h = max(1, sc(2))
+        und_y = ccy + sc(11)
+        g0 = np.array((150, 153, 158), dtype=np.float32)
+        g1 = np.array(_PROGRESS_ACCENT, dtype=np.float32)
+        tx = np.linspace(0.0, 1.0, und_w, dtype=np.float32)
+        rgb = g0[None, :] + (g1 - g0)[None, :] * tx[:, None]
+        alpha = np.full(und_w, 205.0, dtype=np.float32)
+        edge = max(1, und_w // 7)
+        alpha[:edge] *= np.linspace(0.18, 1.0, edge, dtype=np.float32)
+        alpha[-edge:] *= np.linspace(1.0, 0.35, edge, dtype=np.float32)
+        strip = np.empty((und_h, und_w, 4), dtype=np.uint8)
+        strip[..., :3] = rgb.astype(np.uint8)[None, :, :]
+        strip[..., 3] = alpha.astype(np.uint8)[None, :]
+        canvas.alpha_composite(Image.fromarray(strip, "RGBA"), (und_x0, und_y))
 
     # Mastery Rank capsule badge beneath the header (gold-tinted fill +
     # hairline gold border), sized to its content.
