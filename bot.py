@@ -3781,9 +3781,15 @@ def _render_profile_card_png(
         title_group_h = _T_EB_H + _T_EB_GAP + 20
 
     # Left column: the Clan + Mastery rows sit just beneath the header's
-    # platform/syndicate icon row (close to it) and stack downward.
+    # platform/syndicate icon row (close to it) and stack downward. The
+    # stack must also clear the avatar's bottom — when there's no subtitle
+    # the icon row rides high enough that the clan row would otherwise
+    # collide with the circular avatar's lower edge.
     icon_row_cy = header_h // 2 + (42 if subtitle else 34)
-    stack_top = icon_row_cy + 12
+    avatar_bottom = (
+        (header_h - _PROGRESS_AVATAR_SIZE) // 2 + _PROGRESS_AVATAR_SIZE
+    )
+    stack_top = max(icon_row_cy + 12, avatar_bottom + 4)
     left_bottom = header_h
     clan_pill_top = None
     if clan_row is not None:
