@@ -4529,8 +4529,9 @@ class _ScreenshotVerifyModal(discord.ui.Modal):
             )
 
         if summary:
-            body = "Updated your profile from the screenshot:\n" + "\n".join(
-                f"\u2022 {line}" for line in summary
+            body = (
+                "> Operator, your personal data has been adjusted.\n"
+                + "\n".join(f"* -# {line}" for line in summary)
             )
         else:
             body = (
