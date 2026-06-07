@@ -304,6 +304,26 @@ class MasteryEditorHelperTests(unittest.TestCase):
         self.assertEqual(b._format_mastery_display(None), "")
         self.assertEqual(b._format_mastery_display(""), "")
 
+    def test_mastery_label_value(self):
+        b = self.bot_module
+        # Legendary ranks relabel and carry just the number/range.
+        self.assertEqual(
+            b._mastery_label_value("LR 3"), ("Legendary Rank", "3")
+        )
+        self.assertEqual(
+            b._mastery_label_value("LR 1-7"), ("Legendary Rank", "1-7")
+        )
+        self.assertEqual(
+            b._mastery_label_value("Legendary 3"), ("Legendary Rank", "3")
+        )
+        # Non-legendary ranks keep the Mastery Rank label.
+        self.assertEqual(b._mastery_label_value("MR 28"), ("Mastery Rank", "28"))
+        self.assertEqual(b._mastery_label_value("28"), ("Mastery Rank", "28"))
+        self.assertEqual(b._mastery_label_value(None), ("Mastery Rank", ""))
+        self.assertEqual(
+            b._mastery_label_value("\u2014"), ("Mastery Rank", "\u2014")
+        )
+
     def test_parse_mr_bucket_range(self):
         b = self.bot_module
         self.assertEqual(b._parse_mr_bucket_range("MR 1-10"), ("MR", 1, 10))

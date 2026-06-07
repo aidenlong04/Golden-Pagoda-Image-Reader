@@ -306,6 +306,22 @@ def _format_mastery_display(value: str | None) -> str:
     return value
 
 
+def _mastery_label_value(value: str | None) -> tuple[str, str]:
+    """Return the ``(label, display_value)`` for a member's mastery field.
+
+    Legendary ranks surface under a "Legendary Rank" label carrying just
+    the number/range (``"LR 3" -> ("Legendary Rank", "3")``,
+    ``"LR 1-7" -> ("Legendary Rank", "1-7")``); every other rank keeps the
+    "Mastery Rank" label (``"MR 28" -> ("Mastery Rank", "28")``). Accepts a
+    raw stored rank, a coarse bucket role name, or an already-formatted
+    display value, so every card labels the field consistently.
+    """
+    disp = _format_mastery_display(value)
+    if disp.startswith("Legendary"):
+        return "Legendary Rank", disp[len("Legendary"):].strip() or disp
+    return "Mastery Rank", disp
+
+
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is required")
 if TARGET_CHANNEL_ID <= 0:
@@ -1408,8 +1424,7 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
             )
         if mastery_rank:
             info_lines.append(
-                ("Mastery Rank", _format_mastery_display(mastery_rank),
-                 mastery_emoji_bytes)
+                (*_mastery_label_value(mastery_rank), mastery_emoji_bytes)
             )
         if profile_name:
             display_profile = (
@@ -1856,12 +1871,12 @@ def _pass_components(
         clan_part,
     ]
     if mastery_rank:
-        # The "Mastery Rank" label already names the field, so drop the
-        # redundant "MR "/"LR " prefix via the shared formatter (which also
-        # expands Legendary ranks, e.g. "LR 3" -> "Legendary 3").
-        mr_value = _format_mastery_display(mastery_rank)
+        # Legendary ranks relabel to "Legendary Rank" and drop the
+        # redundant "MR "/"LR " prefix via the shared helper (e.g.
+        # "LR 3" -> "Legendary Rank: 3", "MR 28" -> "Mastery Rank: 28").
+        mr_label, mr_value = _mastery_label_value(mastery_rank)
         mr_prefix = f"{MASTERY_RANK_EMOJI_RAW} " if MASTERY_RANK_EMOJI_RAW else ""
-        inner_lines.append(f"> * -# {mr_prefix}Mastery Rank: `{mr_value}`")
+        inner_lines.append(f"> * -# {mr_prefix}{mr_label}: `{mr_value}`")
     if missing_categories:
         joined = ", ".join(f"**`{c}`**" for c in missing_categories)
         warn_prefix = f"{WARNING_EMOJI_RAW} " if WARNING_EMOJI_RAW else ""
@@ -4025,8 +4040,9 @@ def _render_profile_card_png(
         mr_icon_px = sc(18)
         mr_icon_gap = sc(8)
         badge_pad_x = sc(14)
-        label_txt = "Mastery Rank: "
-        value_txt = mastery_row[1] or "\u2014"
+        mr_label, mr_value = _mastery_label_value(mastery_row[1])
+        label_txt = f"{mr_label}: "
+        value_txt = mr_value or "\u2014"
         has_icon = bool(mastery_row[2])
         lbl_w = draw.textlength(label_txt, font=mr_label_font)
         val_w = draw.textlength(value_txt, font=mr_value_font)
