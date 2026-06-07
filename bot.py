@@ -2202,12 +2202,28 @@ async def _member_profile_info_lines(
             rows.append(("Platform", "\u2014", None))
 
     # Mastery Rank — prefer the exact stored rank; otherwise fall back to
-    # the coarse role-bucket name(s) the member holds.
+    # the coarse role-bucket name(s) the member holds. Exception: if the
+    # member holds a Legendary (LR) bucket role, that wins even over a
+    # lower stored rank — the Legendary role is the source of truth for
+    # legendary status (a stale OCR'd "MR n" shouldn't hide it).
     if MR_ROLE_IDS or mastery_override:
-        if mastery_override:
+        mr_ids = set(MR_ROLE_IDS)
+        legendary_role_name = next(
+            (
+                r.name for r in member.roles
+                if r.id in mr_ids
+                and (_parse_mr_bucket_range(r.name) or ("", 0, 0))[0] == "LR"
+            ),
+            None,
+        )
+        override_is_legendary = bool(mastery_override) and (
+            _parse_mr_bucket_range(mastery_override) or ("", 0, 0)
+        )[0] == "LR"
+        if legendary_role_name and not override_is_legendary:
+            mr_value = legendary_role_name
+        elif mastery_override:
             mr_value = _format_mastery_display(mastery_override) or "\u2014"
         else:
-            mr_ids = set(MR_ROLE_IDS)
             mr_names = [r.name for r in member.roles if r.id in mr_ids]
             mr_value = ", ".join(mr_names) if mr_names else "\u2014"
         rows.append((
@@ -3746,8 +3762,7 @@ def _render_profile_card_png(
     panel_x0 = panel_x1 - right_panel_w
     col_divider_x = panel_x0 - 16
     panel_top = pad
-    title_header_band = 22
-    shown_titles = titles[:3]
+    shown_titles = titles[:_PROFILE_MAX_TITLE_CHIPS]
     more_count = max(0, len(titles) - len(shown_titles))
 
     # Ornament metrics for the titles crest (logical units, shared with the

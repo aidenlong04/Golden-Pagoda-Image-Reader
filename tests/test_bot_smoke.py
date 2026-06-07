@@ -435,5 +435,109 @@ class MasteryEditorHelperTests(unittest.TestCase):
             b.MR_ROLE_IDS = original
 
 
+class MemberProfileInfoLinesTests(unittest.TestCase):
+    """Mastery Rank row precedence in _member_profile_info_lines."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+
+    def _mastery_row(self, *, role_names, mr_role_ids, stored):
+        """Build a fake member holding ``role_names`` and run the gatherer
+        with analytics + emoji fetch patched, returning the Mastery Rank
+        ``(label, value)`` the card would render."""
+        import asyncio
+        b = self.b
+
+        class _Role:
+            def __init__(self, rid, name):
+                self.id = rid
+                self.name = name
+                self.color = Mock(value=0)
+
+        roles = [_Role(1000 + i, n) for i, n in enumerate(role_names)]
+
+        class _Guild:
+            id = 7
+
+            def get_role(self, rid):
+                return next((r for r in roles if r.id == rid), None)
+
+        member = Mock()
+        member.roles = roles
+        member.id = 5
+        member.guild = _Guild()
+
+        async def _fake_fetch(_literal):
+            return None
+
+        orig_mr = b.MR_ROLE_IDS
+        orig_clan = b.CLAN_SLOTS
+        orig_plat = b.PLATFORM_ROLE_IDS
+        orig_syn = b.SYNDICATE_ROLE_IDS
+        orig_fetch = b._fetch_emoji_bytes
+        orig_get = b.analytics.get_member_profile
+        orig_titles = b.analytics.list_member_titles
+        # Map the configured MR ids onto the fake roles by name order.
+        b.MR_ROLE_IDS = [
+            1000 + role_names.index(n) for n in role_names
+            if n in mr_role_ids
+        ]
+        b.CLAN_SLOTS = []
+        b.PLATFORM_ROLE_IDS = {}
+        b.SYNDICATE_ROLE_IDS = []
+        b._fetch_emoji_bytes = _fake_fetch
+        b.analytics.get_member_profile = lambda *a, **k: (
+            {"mastery_rank": stored} if stored else None
+        )
+        b.analytics.list_member_titles = lambda *a, **k: []
+        try:
+            rows = asyncio.run(b._member_profile_info_lines(member))
+        finally:
+            b.MR_ROLE_IDS = orig_mr
+            b.CLAN_SLOTS = orig_clan
+            b.PLATFORM_ROLE_IDS = orig_plat
+            b.SYNDICATE_ROLE_IDS = orig_syn
+            b._fetch_emoji_bytes = orig_fetch
+            b.analytics.get_member_profile = orig_get
+            b.analytics.list_member_titles = orig_titles
+
+        mr = next((r for r in rows if r[0] == "Mastery Rank"), None)
+        self.assertIsNotNone(mr, "Mastery Rank row missing")
+        return self.b._mastery_label_value(mr[1])
+
+    def test_legendary_role_overrides_lower_stored_rank(self):
+        # Member holds the "Legendary 1-7" bucket but stored rank is "MR 1"
+        # (stale OCR). The legendary role should win -> "Legendary Rank".
+        label, value = self._mastery_row(
+            role_names=["MR 1-10", "Legendary 1-7"],
+            mr_role_ids=["MR 1-10", "Legendary 1-7"],
+            stored="MR 1",
+        )
+        self.assertEqual(label, "Legendary Rank")
+        self.assertEqual(value, "1-7")
+
+    def test_legendary_stored_rank_kept_over_role(self):
+        # An exact stored LR rank stays precise rather than collapsing to
+        # the coarse bucket range.
+        label, value = self._mastery_row(
+            role_names=["Legendary 1-7"],
+            mr_role_ids=["Legendary 1-7"],
+            stored="LR 3",
+        )
+        self.assertEqual(label, "Legendary Rank")
+        self.assertEqual(value, "3")
+
+    def test_non_legendary_uses_stored_rank(self):
+        # No legendary role -> the exact stored MR wins as before.
+        label, value = self._mastery_row(
+            role_names=["MR 22-29"],
+            mr_role_ids=["MR 22-29"],
+            stored="MR 28",
+        )
+        self.assertEqual(label, "Mastery Rank")
+        self.assertEqual(value, "28")
+
+
 if __name__ == "__main__":
     unittest.main()
