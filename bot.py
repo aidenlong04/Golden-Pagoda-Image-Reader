@@ -3515,6 +3515,72 @@ def _rounded_mask(width: int, height: int, radius: int) -> Image.Image:
     return mask.resize((width, height), Image.LANCZOS)
 
 
+# Glyph mix scattered across the profile-card background. Diamonds are
+# weighted heavily so the Orokin motif dominates, leavened with rings,
+# tick crosses, and small pips for variety.
+_PROFILE_BG_GLYPHS = ("diamond", "diamond", "diamond", "ring", "cross", "pip")
+
+
+def _scatter_symbol_bg(
+    width: int, height: int, *,
+    accent: tuple[int, int, int] = _PROGRESS_ACCENT,
+    seed: int = 0, scale: int = 1,
+) -> Image.Image:
+    """Return a faint scattered-glyph overlay sized ``(width, height)``.
+
+    Lays Warframe-flavoured symbols (concentric Orokin diamonds, rings,
+    tick crosses, pips) on a jittered grid with varied size / opacity so
+    the profile card's slate panel carries subtle texture instead of a
+    flat fill. Kept at very low alpha so overlaid text/icons stay crisp.
+    Deterministic for a given ``seed`` (numpy ``RandomState``) so a
+    member's backdrop is stable across re-renders. The caller composites
+    this onto the gradient panel *before* the rounded-mask clip, so no
+    separate clipping is needed.
+    """
+    layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    rng = np.random.RandomState(seed & 0xFFFFFFFF)
+    cell = max(8, int(116 * scale))
+    jit = max(1, cell // 4)
+    lw = max(1, int(2 * scale))
+    base = tuple(int(c) for c in accent)
+
+    def _diamond(cx: int, cy: int, rr: int, a: int, *, fill: bool = False):
+        pts = [(cx, cy - rr), (cx + rr, cy), (cx, cy + rr), (cx - rr, cy)]
+        if fill:
+            d.polygon(pts, fill=base + (a,))
+        else:
+            d.polygon(pts, outline=base + (a,), width=lw)
+
+    cols = width // cell + 2
+    rows = height // cell + 2
+    for gy in range(-1, rows):
+        for gx in range(-1, cols):
+            cx = gx * cell + cell // 2 + int(rng.randint(-jit, jit + 1))
+            cy = gy * cell + cell // 2 + int(rng.randint(-jit, jit + 1))
+            r = int(cell * (0.20 + 0.22 * rng.rand()))
+            a = 7 + int(rng.randint(0, 8))  # 7..14 alpha — very faint
+            kind = _PROFILE_BG_GLYPHS[int(rng.randint(0, len(_PROFILE_BG_GLYPHS)))]
+            if kind == "diamond":
+                for frac in (1.0, 0.6, 0.28):
+                    _diamond(cx, cy, max(1, int(r * frac)), a)
+                _diamond(cx, cy, max(1, r // 8), min(255, a + 8), fill=True)
+            elif kind == "ring":
+                for frac in (1.0, 0.55):
+                    rr = max(1, int(r * frac))
+                    d.ellipse(
+                        (cx - rr, cy - rr, cx + rr, cy + rr),
+                        outline=base + (a,), width=lw,
+                    )
+            elif kind == "cross":
+                arm = max(2, r // 2)
+                d.line((cx - arm, cy, cx + arm, cy), fill=base + (a,), width=lw)
+                d.line((cx, cy - arm, cx, cy + arm), fill=base + (a,), width=lw)
+            else:  # pip — a tiny filled diamond
+                _diamond(cx, cy, max(1, r // 5), min(255, a + 4), fill=True)
+    return layer
+
+
 def _circular_avatar(
     avatar_bytes: bytes | None, size: int
 ) -> Image.Image:
@@ -4227,6 +4293,14 @@ def _render_profile_card_png(
     W, H = sc(_PROGRESS_CARD_W), sc(card_h)
     canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     panel = _vertical_gradient(W, H, _PROGRESS_BG_TOP, _PROGRESS_BG_BOTTOM)
+    # Scatter faint Orokin-style glyphs across the slate backdrop for
+    # texture. Seeded off the headline so each member's pattern is stable
+    # across re-renders but varies between members. Composited onto the
+    # gradient *before* the rounded-mask clip so the corners stay clean.
+    bg_seed = 0
+    for ch in (headline or "Member"):
+        bg_seed = (bg_seed * 131 + ord(ch)) & 0xFFFFFFFF
+    panel.alpha_composite(_scatter_symbol_bg(W, H, seed=bg_seed, scale=s))
     panel_mask = _rounded_mask(W, H, sc(_PROGRESS_RADIUS))
     canvas.paste(panel, (0, 0), panel_mask)
     ImageDraw.Draw(canvas).rounded_rectangle(
