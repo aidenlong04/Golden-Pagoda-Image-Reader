@@ -3740,6 +3740,90 @@ def _paste_emoji_icon(
         return False
 
 
+def _glass_chip(
+    canvas: Image.Image,
+    box: tuple[int, int, int, int],
+    *,
+    accent: tuple[int, int, int],
+    radius: int,
+    fill_alpha: int = 26,
+    border_alpha: int = 130,
+    width: int = 1,
+) -> None:
+    """Draw a rounded translucent "glass" chip with a hairline accent
+    border onto ``canvas``.
+
+    The modern badge/tag motif shared by the profile card's platform,
+    syndicate, and clan rows. A small bbox-sized layer is allocated (never
+    a full-canvas scratch buffer) so the chip stays cheap on the 512MB box.
+    """
+    x0, y0, x1, y1 = box
+    w, h = x1 - x0, y1 - y0
+    if w <= 0 or h <= 0:
+        return
+    layer = Image.new("RGBA", (w + 1, h + 1), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).rounded_rectangle(
+        (0, 0, w, h), radius=radius,
+        fill=tuple(accent) + (fill_alpha,),
+        outline=tuple(accent) + (border_alpha,), width=width,
+    )
+    canvas.alpha_composite(layer, (x0, y0))
+    layer.close()
+
+
+def _faded_v_divider(
+    canvas: Image.Image, x: int, y0: int, y1: int,
+    *, accent: tuple[int, int, int] = _PROGRESS_ACCENT,
+    alpha: int = 78, width: int = 2,
+) -> None:
+    """Composite a vertical hairline that fades to transparent at both
+    ends — a soft column rule that frames the card's right panel without
+    the hard edge of a solid line."""
+    h = y1 - y0
+    if h <= 1 or width < 1:
+        return
+    t = np.linspace(0.0, 1.0, h, dtype=np.float32)
+    fade = np.clip(np.minimum(t / 0.16, (1.0 - t) / 0.16), 0.0, 1.0)
+    strip = np.zeros((h, width, 4), dtype=np.uint8)
+    strip[..., 0], strip[..., 1], strip[..., 2] = accent
+    strip[..., 3] = (fade * alpha).astype(np.uint8)[:, None]
+    layer = Image.fromarray(strip, "RGBA")
+    canvas.alpha_composite(layer, (x, y0))
+    layer.close()
+
+
+def _orokin_watermark(
+    canvas: Image.Image, cx: int, cy: int, radius: int,
+    *, accent: tuple[int, int, int] = _PROGRESS_ACCENT,
+    alpha: int = 13, line_w: int = 2,
+) -> None:
+    """Draw a faint concentric-diamond Orokin glyph centred on (cx, cy).
+
+    A subtle background watermark used to fill otherwise-empty card space
+    with intentional texture (a recognised profile-card technique). Drawn
+    on a small bbox-sized layer so it stays cheap on the 512MB box.
+    """
+    if radius <= 0:
+        return
+    size = radius * 2 + line_w * 2
+    layer = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    c = size // 2
+    for frac in (1.0, 0.64, 0.30):
+        rr = int(radius * frac)
+        ld.polygon(
+            [(c, c - rr), (c + rr, c), (c, c + rr), (c - rr, c)],
+            outline=tuple(accent) + (alpha,), width=line_w,
+        )
+    g = max(2, radius // 12)
+    ld.polygon(
+        [(c, c - g), (c + g, c), (c, c + g), (c - g, c)],
+        fill=tuple(accent) + (min(255, alpha + 10),),
+    )
+    canvas.alpha_composite(layer, (cx - c, cy - c))
+    layer.close()
+
+
 def _draw_info_grid(
     canvas: Image.Image,
     *,
@@ -4124,7 +4208,7 @@ def _render_profile_card_png(
     # subtitle) + platform/syndicate icon row. It grows a touch when a
     # subtitle is shown so the small nick line has breathing room.
     header_h = 152 if subtitle else 140
-    clan_pill_h = 20
+    clan_pill_h = 28
     mr_pill_h = 32
 
     # The card is a two-column composition: a wide left content column
@@ -4207,7 +4291,9 @@ def _render_profile_card_png(
     avatar_bottom = (
         (header_h - _PROGRESS_AVATAR_SIZE) // 2 + _PROGRESS_AVATAR_SIZE
     )
-    stack_top = max(icon_row_cy + 12, avatar_bottom + 4)
+    # Clear the taller glass icon chips (centred on the icon row) and the
+    # avatar's lower edge before the Clan/Mastery stack begins.
+    stack_top = max(icon_row_cy + 22, avatar_bottom + 6)
     left_bottom = header_h
     clan_pill_top = None
     if clan_row is not None:
@@ -4253,6 +4339,22 @@ def _render_profile_card_png(
 
     text_x = sc(pad) + avatar_px + sc(22)
     draw = ImageDraw.Draw(canvas)
+
+    # Background structure drawn behind the content: a soft fading column
+    # rule frames the right-hand TITLES panel, and a faint Orokin watermark
+    # fills the centre/lower dead space so the card reads as intentional
+    # rather than sparse. Both sit under the chips/text drawn below.
+    div_x = sc(col_divider_x)
+    _faded_v_divider(canvas, div_x, sc(panel_top + 2), H - sc(panel_top + 2))
+    wm_top = sc(header_h // 2) + sc(56)
+    wm_bottom = H - sc(10)
+    wm_r = min(
+        sc(92), (wm_bottom - wm_top) // 2, (div_x - text_x) // 2 - sc(24),
+    )
+    if wm_r > sc(24):
+        _orokin_watermark(
+            canvas, (text_x + div_x) // 2, (wm_top + wm_bottom) // 2, wm_r,
+        )
 
     eyebrow_font = _load_font(sc(14), bold=True)
     name_font = _load_font(sc(28), bold=True)
@@ -4303,101 +4405,127 @@ def _render_profile_card_png(
             fill=_PROGRESS_MUTED, anchor="lm",
         )
 
-    # Platform + syndicate flags share one row beneath the name. The
-    # platform icon leads with a soft gold glow; a lone syndicate trails
-    # it as icon + faction-coloured name, while two or more collapse to
-    # icon-only flags (faction-coloured dot fallback when an emoji is
-    # unset).
+    # Platform + syndicate flags share one row of modern "glass" chips
+    # beneath the name — each icon (or faction-coloured dot fallback) sits
+    # in a rounded translucent pill with a hairline accent border. The
+    # platform leads in a gold chip; a lone syndicate becomes a wider
+    # labelled chip (icon + faction-coloured name), while several collapse
+    # to compact icon chips.
+    chip_h = sc(32)
+    chip_icon_px = sc(20)
+    chip_pad_x = sc(9)
+    chip_icon_gap = sc(7)
+    chip_gap = sc(8)
+    chip_radius = chip_h // 2
+    chip_top = plat_cy - chip_h // 2
+    chip_bottom = plat_cy + chip_h // 2
     row_cx = text_x
+
+    def _chip_icon_or_dot(ix: int, emoji_bytes, accent, label: str) -> None:
+        if not (emoji_bytes and _paste_emoji_icon(
+            canvas, emoji_bytes, ix, plat_cy, chip_icon_px, label=label
+        )):
+            r = chip_icon_px // 3
+            ImageDraw.Draw(canvas).ellipse(
+                (ix + chip_icon_px // 2 - r, plat_cy - r,
+                 ix + chip_icon_px // 2 + r, plat_cy + r),
+                fill=tuple(accent) + (255,),
+            )
+
+    def _icon_chip(x0: int, accent, emoji_bytes, label: str) -> int:
+        """Draw an icon-only glass chip; return its right edge."""
+        x1 = x0 + chip_icon_px + chip_pad_x * 2
+        _glass_chip(
+            canvas, (x0, chip_top, x1, chip_bottom),
+            accent=accent, radius=chip_radius,
+        )
+        _chip_icon_or_dot(x0 + chip_pad_x, emoji_bytes, accent, label)
+        return x1
+
     if platform_row is not None and platform_row[2]:
-        plat_icon_px = sc(26)
-        glow_d = plat_icon_px * 2
-        gcx = row_cx + plat_icon_px // 2
-        glow = Image.new("RGBA", (glow_d, glow_d), (0, 0, 0, 0))
-        ImageDraw.Draw(glow).ellipse(
-            (glow_d * 0.2, glow_d * 0.2, glow_d * 0.8, glow_d * 0.8),
-            fill=_PROGRESS_ACCENT + (55,),
-        )
-        glow = glow.filter(ImageFilter.GaussianBlur(sc(7)))
-        canvas.alpha_composite(
-            glow, (gcx - glow_d // 2, plat_cy - glow_d // 2)
-        )
-        _paste_emoji_icon(
-            canvas, platform_row[2], row_cx, plat_cy, plat_icon_px,
-            label="Platform",
-        )
-        row_cx += plat_icon_px + sc(10)
+        row_cx = _icon_chip(
+            row_cx, _PROGRESS_ACCENT, platform_row[2], "Platform"
+        ) + chip_gap
+
     if len(syndicate_factions) == 1:
         sname, scolor, sbytes = syndicate_factions[0]
-        syn_icon_px = sc(24)
-        if sbytes and _paste_emoji_icon(
-            canvas, sbytes, row_cx, plat_cy, syn_icon_px, label="Syndicate"
-        ):
-            row_cx += syn_icon_px + sc(9)
-        else:
-            r = syn_icon_px // 3
-            ImageDraw.Draw(canvas).ellipse(
-                (
-                    row_cx + syn_icon_px // 2 - r, plat_cy - r,
-                    row_cx + syn_icon_px // 2 + r, plat_cy + r,
-                ),
-                fill=(scolor or _PROGRESS_MUTED) + (255,),
-            )
-            row_cx += syn_icon_px + sc(9)
-        syn_font = _load_font(sc(15), bold=True)
-        max_w = name_right_bound - row_cx
-        nm = _ellipsize(draw, sname or "", syn_font, max_w)
-        draw.text(
-            (row_cx, plat_cy), nm, font=syn_font,
-            fill=scolor or _PROGRESS_TEXT, anchor="lm",
+        accent = scolor or _PROGRESS_ACCENT
+        syn_font = _load_font(sc(14), bold=True)
+        # Labelled chip: icon + faction-coloured name, budgeted to the
+        # identity block's right bound.
+        text_left = (row_cx + chip_pad_x + chip_icon_px + chip_icon_gap)
+        max_text_w = name_right_bound - text_left - chip_pad_x
+        nm = _ellipsize(draw, sname or "", syn_font, max_text_w)
+        text_w = int(draw.textlength(nm, font=syn_font)) if nm else 0
+        x1 = text_left + text_w + chip_pad_x
+        _glass_chip(
+            canvas, (row_cx, chip_top, x1, chip_bottom),
+            accent=accent, radius=chip_radius,
         )
+        _chip_icon_or_dot(row_cx + chip_pad_x, sbytes, accent, "Syndicate")
+        if nm:
+            draw.text(
+                (text_left, plat_cy), nm, font=syn_font,
+                fill=accent, anchor="lm",
+            )
     elif syndicate_factions:
-        syn_icon_px = sc(24)
-        syn_gap = sc(4)
+        chip_w = chip_icon_px + chip_pad_x * 2
         for _sname, scolor, sbytes in syndicate_factions:
-            if row_cx + syn_icon_px > name_right_bound:
+            if row_cx + chip_w > name_right_bound:
                 break
-            if not (sbytes and _paste_emoji_icon(
-                canvas, sbytes, row_cx, plat_cy, syn_icon_px,
-                label="Syndicate",
-            )):
-                r = syn_icon_px // 3
-                ImageDraw.Draw(canvas).ellipse(
-                    (
-                        row_cx + syn_icon_px // 2 - r, plat_cy - r,
-                        row_cx + syn_icon_px // 2 + r, plat_cy + r,
-                    ),
-                    fill=(scolor or _PROGRESS_MUTED) + (255,),
-                )
-            row_cx += syn_icon_px + syn_gap
+            row_cx = _icon_chip(
+                row_cx, scolor or _PROGRESS_ACCENT, sbytes, "Syndicate"
+            ) + chip_gap
 
-    # Clan (left column, beneath the header): a plain text row — just the
-    # clan icon + name (no "CLAN:" label) with the name in the clan role's
-    # own colour, no pill. The icon's left edge aligns with the Mastery
-    # badge's left edge below it so the under-avatar stack shares one clean
-    # left margin.
+    # Clan (left column, beneath the header): a "tag" chip — a translucent
+    # glass pill carrying a clan-coloured left accent bar, the clan crest,
+    # and the clan name in the clan role's own colour. Echoes the icon-row
+    # chips so the under-avatar stack reads as one cohesive set of badges.
     if clan_row is not None and clan_pill_top is not None:
-        clan_value_font = _load_font(sc(11), bold=True)
-        clan_icon_px = sc(15)
-        clan_icon_gap = sc(7)
+        clan_value_font = _load_font(sc(12), bold=True)
+        clan_icon_px = sc(16)
+        clan_icon_gap = sc(8)
         clan_val = clan_row[1] or "\u2014"
         clan_emoji = clan_row[2]
-        clan_name_fill = clan_color or _PROGRESS_ACCENT
+        accent = clan_color or _PROGRESS_ACCENT
         has_clan_icon = bool(clan_emoji)
         cx0 = sc(pad) + sc(8)
-        max_clan_w = sc(col_divider_x) - cx0 - sc(14)
+        chip_h2 = sc(clan_pill_h)
+        chip_y0 = sc(clan_pill_top)
+        chip_y1 = chip_y0 + chip_h2
+        ccy = chip_y0 + chip_h2 // 2
+        inner_pad = sc(10)
+        bar_w = sc(3)
+        bar_gap = sc(8)
         icon_w = (clan_icon_px + clan_icon_gap) if has_clan_icon else 0
-        max_val_w = max_clan_w - icon_w
+        max_val_w = (
+            sc(col_divider_x) - cx0 - inner_pad - bar_w - bar_gap
+            - icon_w - inner_pad
+        )
         clan_val = _ellipsize(draw, clan_val, clan_value_font, max_val_w)
-        ccy = sc(clan_pill_top) + sc(10)
-        cx = cx0
+        val_w = int(draw.textlength(clan_val, font=clan_value_font))
+        chip_x1 = (
+            cx0 + inner_pad + bar_w + bar_gap + icon_w + val_w + inner_pad
+        )
+        _glass_chip(
+            canvas, (cx0, chip_y0, chip_x1, chip_y1),
+            accent=accent, radius=sc(9),
+        )
+        # Clan-coloured left accent bar (a tag's signature mark).
+        bar_x0 = cx0 + inner_pad
+        draw.rounded_rectangle(
+            (bar_x0, ccy - chip_h2 // 2 + sc(5),
+             bar_x0 + bar_w, ccy + chip_h2 // 2 - sc(5)),
+            radius=bar_w // 2, fill=tuple(accent) + (255,),
+        )
+        cx = bar_x0 + bar_w + bar_gap
         if has_clan_icon and _paste_emoji_icon(
             canvas, clan_emoji, cx, ccy, clan_icon_px, label="Clan"
         ):
             cx += clan_icon_px + clan_icon_gap
         draw.text(
             (cx, ccy), clan_val, font=clan_value_font,
-            fill=clan_name_fill, anchor="lm",
+            fill=accent, anchor="lm",
         )
 
     # Mastery Rank capsule badge beneath the header (gold-tinted fill +
@@ -4419,13 +4547,13 @@ def _render_profile_card_png(
         pill_h = sc(mr_pill_h)
         pill_x0 = sc(pad) + sc(8)
         pill_y0 = sc(mr_pill_top)
-        overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-        ImageDraw.Draw(overlay).rounded_rectangle(
-            (pill_x0, pill_y0, pill_x0 + pill_w, pill_y0 + pill_h),
-            radius=pill_h // 2, fill=_PROGRESS_ACCENT + (14,),
-            outline=_PROGRESS_ACCENT + (105,), width=max(1, sc(1)),
+        # Same glass-chip motif as the icon/clan badges (bbox-sized layer,
+        # not a full-canvas scratch buffer) so the stack reads as one set.
+        _glass_chip(
+            canvas, (pill_x0, pill_y0, pill_x0 + pill_w, pill_y0 + pill_h),
+            accent=_PROGRESS_ACCENT, radius=pill_h // 2,
+            fill_alpha=22, border_alpha=120, width=max(1, sc(1)),
         )
-        canvas.alpha_composite(overlay)
         mcy = pill_y0 + pill_h // 2
         mx = pill_x0 + badge_pad_x
         if has_icon and _paste_emoji_icon(
