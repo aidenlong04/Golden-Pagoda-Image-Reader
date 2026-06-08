@@ -3581,6 +3581,71 @@ def _scatter_symbol_bg(
     return layer
 
 
+def _lotus_sigil(
+    size: int, *,
+    accent: tuple[int, int, int] = _PROGRESS_ACCENT,
+    alpha: int = 18, energy: tuple[int, int, int] = _PROGRESS_FILL_START,
+) -> Image.Image:
+    """Return an RGBA ``size``×``size`` faint line-art **Warframe "Lotus"
+    sigil** — the franchise's signature emblem: a central energy pod
+    flanked by symmetric upward petals over two short downward flanges.
+
+    Drawn in low-alpha Orokin gold with an energy-cyan pod so the
+    profile-card backdrop reads as distinctly Warframe. Kept faint enough
+    that overlaid text/icons stay crisp; the caller composites it onto the
+    gradient panel beneath the scattered glyphs and the rounded-mask clip.
+    """
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    base = tuple(int(c) for c in accent)
+    cx = size / 2.0
+    cy = size / 2.0 + size * 0.06   # nudge down so the upward fan centres
+    line_w = max(1, size // 130)
+    a = max(1, min(255, alpha))
+
+    def _petal(angle_deg: float, length: float, half_w: float, a_line: int):
+        ang = np.radians(angle_deg)
+        ca, sa = float(np.cos(ang)), float(np.sin(ang))
+        t = np.linspace(0.0, 1.0, 29)
+        w = (np.sin(np.pi * t) ** 0.8) * half_w
+        ax_y = -t * length                       # axis points up (-Y)
+        rX = cx + w * ca - ax_y * sa
+        rY = cy + w * sa + ax_y * ca
+        lX = cx - w * ca - ax_y * sa
+        lY = cy - w * sa + ax_y * ca
+        poly = (
+            list(zip(rX.tolist(), rY.tolist()))
+            + list(zip(lX[::-1].tolist(), lY[::-1].tolist()))
+        )
+        d.line(
+            poly + [poly[0]], fill=base + (a_line,),
+            width=line_w, joint="curve",
+        )
+
+    L = size * 0.46
+    # Central petal + two symmetric pairs fanning outward and shrinking.
+    _petal(0.0, L, size * 0.085, a)
+    for ang in (28.0, 58.0):
+        scale_l = 1.0 - ang / 150.0
+        _petal(ang, L * scale_l, size * 0.072, a)
+        _petal(-ang, L * scale_l, size * 0.072, a)
+    # Two short downward flanges to ground the sigil like the real emblem.
+    _petal(150.0, L * 0.32, size * 0.05, a)
+    _petal(-150.0, L * 0.32, size * 0.05, a)
+
+    # Central energy pod: a small filled vertical lens in Warframe cyan.
+    pod_h, pod_w = size * 0.17, size * 0.05
+    t = np.linspace(0.0, 1.0, 21)
+    pw = (np.sin(np.pi * t) ** 0.8) * pod_w
+    py = cy - t * pod_h
+    pod = (
+        list(zip((cx + pw).tolist(), py.tolist()))
+        + list(zip((cx - pw)[::-1].tolist(), py[::-1].tolist()))
+    )
+    d.polygon(pod, fill=tuple(int(c) for c in energy) + (min(255, a + 8),))
+    return img
+
+
 def _circular_avatar(
     avatar_bytes: bytes | None, size: int
 ) -> Image.Image:
@@ -4300,6 +4365,14 @@ def _render_profile_card_png(
     bg_seed = 0
     for ch in (headline or "Member"):
         bg_seed = (bg_seed * 131 + ord(ch)) & 0xFFFFFFFF
+    # Hero watermark: a large, faint Warframe "Lotus" sigil centred in the
+    # card's open space gives the slate backdrop a distinct Warframe
+    # identity; the scattered Orokin glyphs ride on top for texture.
+    lotus_sz = int(min(W, H) * 1.18)
+    panel.alpha_composite(
+        _lotus_sigil(lotus_sz, accent=_PROGRESS_ACCENT, alpha=16),
+        (W // 2 - lotus_sz // 2, H // 2 - lotus_sz // 2),
+    )
     panel.alpha_composite(_scatter_symbol_bg(W, H, seed=bg_seed, scale=s))
     panel_mask = _rounded_mask(W, H, sc(_PROGRESS_RADIUS))
     canvas.paste(panel, (0, 0), panel_mask)

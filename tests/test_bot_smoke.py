@@ -756,6 +756,30 @@ class ScatterBackgroundTests(unittest.TestCase):
         self.assertLess(extrema[1], 64, "glyphs must stay faint")
 
 
+class LotusSigilTests(unittest.TestCase):
+    """Tests for the Warframe Lotus hero watermark."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+
+    def test_returns_square_rgba(self):
+        img = self.b._lotus_sigil(200, alpha=18)
+        self.assertEqual(img.mode, "RGBA")
+        self.assertEqual(img.size, (200, 200))
+
+    def test_draws_the_sigil(self):
+        # The emblem must paint something (non-empty alpha channel).
+        img = self.b._lotus_sigil(220, alpha=18)
+        self.assertGreater(img.split()[3].getextrema()[1], 0)
+
+    def test_alpha_scales_with_request(self):
+        # A higher requested alpha yields more opaque ink than a faint one.
+        faint = self.b._lotus_sigil(220, alpha=12).split()[3].getextrema()[1]
+        bold = self.b._lotus_sigil(220, alpha=120).split()[3].getextrema()[1]
+        self.assertGreater(bold, faint)
+
+
 class HeavyJobGateTests(unittest.TestCase):
     """The render/OCR gate must bound concurrency to protect the 512MB box."""
 
