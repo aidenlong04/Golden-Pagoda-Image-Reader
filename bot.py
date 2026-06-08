@@ -3588,7 +3588,8 @@ def _lotus_sigil(
 ) -> Image.Image:
     """Return an RGBA ``size``×``size`` faint line-art **Warframe "Lotus"
     sigil** — the franchise's signature emblem: a central energy pod
-    flanked by symmetric upward petals over two short downward flanges.
+    flanked by symmetric petals fanned wide open (out past the horizontal)
+    over two splayed grounding flanges.
 
     Drawn in low-alpha Orokin gold with an energy-cyan pod so the
     profile-card backdrop reads as distinctly Warframe. Kept faint enough
@@ -3599,7 +3600,7 @@ def _lotus_sigil(
     d = ImageDraw.Draw(img)
     base = tuple(int(c) for c in accent)
     cx = size / 2.0
-    cy = size / 2.0 + size * 0.06   # nudge down so the upward fan centres
+    cy = size / 2.0 + size * 0.03   # slight nudge so the open fan centres
     line_w = max(1, size // 130)
     a = max(1, min(255, alpha))
 
@@ -3622,16 +3623,19 @@ def _lotus_sigil(
             width=line_w, joint="curve",
         )
 
-    L = size * 0.46
-    # Central petal + two symmetric pairs fanning outward and shrinking.
-    _petal(0.0, L, size * 0.085, a)
-    for ang in (28.0, 58.0):
-        scale_l = 1.0 - ang / 150.0
-        _petal(ang, L * scale_l, size * 0.072, a)
-        _petal(-ang, L * scale_l, size * 0.072, a)
-    # Two short downward flanges to ground the sigil like the real emblem.
-    _petal(150.0, L * 0.32, size * 0.05, a)
-    _petal(-150.0, L * 0.32, size * 0.05, a)
+    L = size * 0.47
+    petal_w = size * 0.086
+    # A fully-open bloom: petals fan symmetrically across a wide arc (out
+    # past the horizontal) and only gently shorten toward the edges, so the
+    # lotus reads as spread wide open rather than upright. The energy pod
+    # anchors the centre.
+    _petal(0.0, L, petal_w, a)
+    for ang, lf in ((38.0, 0.94), (74.0, 0.84), (108.0, 0.68)):
+        _petal(ang, L * lf, petal_w * 0.92, a)
+        _petal(-ang, L * lf, petal_w * 0.92, a)
+    # Two grounding flanges splayed wide at the base to complete the bloom.
+    _petal(150.0, L * 0.42, petal_w * 0.72, a)
+    _petal(-150.0, L * 0.42, petal_w * 0.72, a)
 
     # Central energy pod: a small filled vertical lens in Warframe cyan.
     pod_h, pod_w = size * 0.17, size * 0.05
