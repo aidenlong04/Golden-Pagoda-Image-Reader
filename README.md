@@ -49,6 +49,25 @@ full env reference.
 - `/status` — paginated ephemeral status panel (bot, roles, channels, OCR,
   stats, clans, latency). Surfaces uvloop, RSS, BG tasks, the pooled HTTP
   session and the analytics SQLite WAL state. Requires **Manage Server**.
+- `/manage member:<member>` — paginated ephemeral admin console (styled like
+  `/status`, with Prev/Next/Refresh) to inspect a member's stored profile +
+  titles and, on the last page, **clear** them behind a confirm step. This is
+  the manual backup of the automatic on-leave clear below; it works for
+  members who have already left the server. Requires **Manage Server**.
+
+## Data retention / on-leave clear
+
+The bot keeps a small durable per-member store (`member_profiles` +
+`member_titles` in the analytics SQLite DB) so profile cards survive restarts.
+When a member **leaves, is kicked, or is banned**, `on_member_remove` fires an
+automatic "on-leave data clear": their stored profile and awarded titles are
+deleted and their verification telemetry is anonymised (the rows stay for
+aggregate stats, but `user_id` is set to `NULL`). The clear is scoped strictly
+to that `(guild_id, user_id)` pair, runs off the event loop, and is fail-soft
+(a gateway event can never crash the bot). The rendered profile/progress cards
+hold no persisted state of their own, so clearing the store leaves nothing to
+reference. `/manage` is the manual backup for cases the automatic clear can't
+cover. Roles are never touched by either path.
 
 ## Deployment
 

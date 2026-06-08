@@ -539,5 +539,233 @@ class MemberProfileInfoLinesTests(unittest.TestCase):
         self.assertEqual(value, "28")
 
 
+class ManagePanelTests(unittest.TestCase):
+    """Tests for the /manage admin backup console (styled after /status)."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+
+    @staticmethod
+    def _container(components):
+        # Header text (type 10) + container (type 17).
+        return next(c for c in components if c["type"] == 17)
+
+    @staticmethod
+    def _buttons(container):
+        out = []
+        for comp in container["components"]:
+            if comp.get("type") == 1:
+                out.extend(comp["components"])
+        return out
+
+    def test_overview_page_lists_stored_profile(self):
+        snap = {
+            "profile": {
+                "in_game_name": "Tenno", "mastery_rank": "MR 28",
+                "platform": "PC", "clan": "Golden Pagoda",
+                "last_verified_ts": 1000,
+            },
+            "titles": [{"title": "boot licker", "awarded_ts": 1}],
+        }
+        member = Mock(display_name="Tenno")
+        comps = self.b._manage_components(5, member, 0, snap)
+        # Header is a top-level text component.
+        self.assertEqual(comps[0]["type"], 10)
+        self.assertIn("Manage", comps[0]["content"])
+        body = self._container(comps)["components"][0]["content"]
+        self.assertIn("Tenno", body)
+        self.assertIn("MR 28", body)
+        self.assertIn("Titles: `1`", body)
+
+    def test_data_page_shows_clear_button(self):
+        snap = {"profile": {"in_game_name": "X"}, "titles": []}
+        comps = self.b._manage_components(5, Mock(display_name="X"), 2, snap)
+        buttons = self._buttons(self._container(comps))
+        clear = next(
+            (b for b in buttons if b.get("custom_id") == "manage:5:clear"),
+            None,
+        )
+        self.assertIsNotNone(clear, "Clear button missing")
+        self.assertEqual(clear["style"], 4)  # danger
+
+    def test_data_page_no_clear_button_when_empty(self):
+        snap = {"profile": None, "titles": []}
+        comps = self.b._manage_components(5, Mock(display_name="X"), 2, snap)
+        buttons = self._buttons(self._container(comps))
+        self.assertFalse(
+            any(b.get("custom_id", "").endswith(":clear") for b in buttons)
+        )
+
+    def test_confirm_clear_uses_fail_accent_and_confirm_buttons(self):
+        snap = {"profile": {"in_game_name": "X"}, "titles": []}
+        comps = self.b._manage_components(
+            5, Mock(display_name="X"), 2, snap, confirm_clear=True
+        )
+        container = self._container(comps)
+        self.assertEqual(container["accent_color"], self.b.ACCENT_FAIL)
+        ids = {b.get("custom_id") for b in self._buttons(container)}
+        self.assertIn("manage:5:clearok", ids)
+        self.assertIn("manage:5:p:2", ids)  # Cancel -> back to data page
+
+    def test_cleared_state_reports_counts_and_drops_clear(self):
+        snap = {"profile": None, "titles": []}
+        cleared = {"profiles": 1, "titles": 2, "events_anonymized": 3}
+        comps = self.b._manage_components(
+            5, Mock(display_name="X"), 2, snap, cleared=cleared
+        )
+        container = self._container(comps)
+        body = container["components"][0]["content"]
+        self.assertIn("Cleared", body)
+        ids = {b.get("custom_id") for b in self._buttons(container)}
+        self.assertNotIn("manage:5:clearok", ids)
+        self.assertNotIn("manage:5:clear", ids)
+
+    def test_departed_member_falls_back_to_stored_name(self):
+        snap = {"profile": {"in_game_name": "GhostTenno"}, "titles": []}
+        comps = self.b._manage_components(5, None, 0, snap)
+        body = self._container(comps)["components"][0]["content"]
+        self.assertIn("not in server", body)
+
+    def test_nav_row_prev_disabled_on_first_page(self):
+        row = self.b._manage_nav_row(5, 0)
+        prev = row["components"][0]
+        self.assertTrue(prev["disabled"])
+        nxt = row["components"][2]
+        self.assertEqual(nxt["custom_id"], "manage:5:p:1")
+
+
+class OnLeaveClearTests(unittest.TestCase):
+    """Tests for the autonomous on-leave data clear."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+
+    def test_clear_helper_calls_delete_scoped(self):
+        import asyncio
+        captured = {}
+
+        def _fake_delete(*, guild_id, user_id):
+            captured["guild_id"] = guild_id
+            captured["user_id"] = user_id
+            return {"profiles": 1, "titles": 0, "events_anonymized": 2}
+
+        orig = self.b.analytics.delete_member_data
+        self.b.analytics.delete_member_data = _fake_delete
+        try:
+            asyncio.run(
+                self.b._clear_member_data_on_leave(2, 5, "Tenno")
+            )
+        finally:
+            self.b.analytics.delete_member_data = orig
+        self.assertEqual(captured, {"guild_id": 2, "user_id": 5})
+
+    def test_clear_helper_is_exception_safe(self):
+        import asyncio
+
+        def _boom(*, guild_id, user_id):
+            raise RuntimeError("db exploded")
+
+        orig = self.b.analytics.delete_member_data
+        self.b.analytics.delete_member_data = _boom
+        try:
+            # Must not propagate — a gateway event can't crash the bot.
+            asyncio.run(
+                self.b._clear_member_data_on_leave(2, 5, "Tenno")
+            )
+        finally:
+            self.b.analytics.delete_member_data = orig
+
+    def test_on_member_remove_spawns_clear(self):
+        import asyncio
+        captured = []
+
+        def _fake_spawn(coro):
+            captured.append(coro)
+            coro.close()  # avoid "coroutine never awaited" warning
+
+        orig = self.b._spawn_bg_task
+        self.b._spawn_bg_task = _fake_spawn
+        try:
+            member = Mock()
+            member.id = 5
+            member.guild = Mock(id=2)
+            member.display_name = "Tenno"
+            asyncio.run(self.b.on_member_remove(member))
+        finally:
+            self.b._spawn_bg_task = orig
+        self.assertEqual(len(captured), 1)
+
+
+class CardTextHelperTests(unittest.TestCase):
+    """Tests for the shared card-text helpers."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+        self.font = self.b._load_font(16)
+        from PIL import Image, ImageDraw
+        self.draw = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+
+    def test_ellipsize_keeps_short_text(self):
+        # Text that already fits is returned unchanged (no ellipsis).
+        out = self.b._ellipsize(self.draw, "Hi", self.font, 10_000)
+        self.assertEqual(out, "Hi")
+
+    def test_ellipsize_truncates_with_ellipsis(self):
+        long = "WidescreenTennoNameThatIsWayTooLong" * 4
+        out = self.b._ellipsize(self.draw, long, self.font, 80)
+        self.assertTrue(out.endswith("\u2026"))
+        self.assertLess(len(out), len(long))
+        self.assertLessEqual(self.draw.textlength(out, font=self.font), 80)
+
+    def test_ellipsize_handles_empty(self):
+        self.assertEqual(self.b._ellipsize(self.draw, "", self.font, 50), "")
+
+
+class HeavyJobGateTests(unittest.TestCase):
+    """The render/OCR gate must bound concurrency to protect the 512MB box."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+
+    def test_run_heavy_bounds_concurrency_to_two(self):
+        import asyncio
+
+        async def _scenario():
+            live = 0
+            peak = 0
+            lock = asyncio.Lock()
+
+            def _job():
+                # Pure-sync work runs in a worker thread via to_thread.
+                return None
+
+            async def _tracked():
+                nonlocal live, peak
+                async with self.b._HEAVY_JOB_SEMAPHORE:
+                    async with lock:
+                        live += 1
+                        peak = max(peak, live)
+                    await asyncio.sleep(0.02)
+                    async with lock:
+                        live -= 1
+
+            # Fan out more jobs than the semaphore allows at once.
+            await asyncio.gather(*[_tracked() for _ in range(6)])
+            return peak
+
+        peak = asyncio.run(_scenario())
+        self.assertLessEqual(peak, 2)
+
+    def test_run_heavy_returns_callable_result(self):
+        import asyncio
+        out = asyncio.run(self.b._run_heavy(lambda a, b: a + b, 2, 3))
+        self.assertEqual(out, 5)
+
+
 if __name__ == "__main__":
     unittest.main()
+

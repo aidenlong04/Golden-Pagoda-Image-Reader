@@ -15,3 +15,8 @@ README.md
 .vscode
 .idea
 .DS_Store
+# Runtime state — bind-mounted at /app/data and /app/icons on the server, so
+# baking the host copies into the image only bloats it (and the build-context
+# upload on the CX22) with a stale snapshot of the live SQLite DB + icons.
+data
+icons

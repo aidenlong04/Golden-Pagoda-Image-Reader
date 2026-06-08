@@ -42,7 +42,7 @@ jobs:
       - name: Build image and restart service
         run: |
           ssh -i ~/.ssh/hetzner "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
-            set -e
+            set -eo pipefail
             cd /opt/golden-pagoda
             sudo mkdir -p /opt/golden-pagoda/data /opt/golden-pagoda/icons
             # Container runs as uid 10001 (bot); the bind-mounted data dir
@@ -68,10 +68,10 @@ jobs:
             sleep 5
             systemctl is-active golden-pagoda
             docker logs golden-pagoda --tail 20
-            # Reclaim build cache & dangling images (keeps disk healthy on CX22).
-            # Build cache adds up fast on subsequent deploys — drop everything
-            # not used by the running image. Layers from the just-built image
-            # are pinned (in use) so this is safe.
-            docker image prune -af >/dev/null || true
-            docker builder prune -af >/dev/null || true
+            # Reclaim disk on the CX22 without nuking the warm cache: drop only
+            # dangling images (keeps the python:3.12-slim base for next build)
+            # and cap the build cache rather than wiping it, so the next deploy
+            # still hits the apt/pip layers instead of a cold from-scratch build.
+            docker image prune -f >/dev/null || true
+            docker builder prune -f --keep-storage 2GB >/dev/null || true
           '

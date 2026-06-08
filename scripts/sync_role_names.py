@@ -20,8 +20,6 @@ logger = logging.getLogger("sync_role_names")
 
 
 async def _main() -> None:
-    ready = asyncio.Event()
-
     @bot.client.event
     async def on_ready() -> None:  # overrides bot.on_ready for this run
         try:
@@ -35,7 +33,6 @@ async def _main() -> None:
             logger.info("Clan slots: %s", [(s.slot, s.clan_name, s.role_id) for s in bot.CLAN_SLOTS])
             logger.info("Platform roles: %s", bot.PLATFORM_ROLE_IDS)
         finally:
-            ready.set()
             await bot.client.close()
 
     await bot.client.start(bot.DISCORD_TOKEN)

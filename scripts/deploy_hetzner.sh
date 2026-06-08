@@ -30,6 +30,8 @@ rsync -az --delete -e "$RSYNC_RSH" \
     --exclude '*.pyc' \
     --exclude '.venv' \
     --exclude '.env' \
+    --exclude 'data' \
+    --exclude 'icons' \
     "$REPO_ROOT/" "$REMOTE:$APP_DIR/"
 
 echo ">> installing systemd unit"
@@ -47,7 +49,9 @@ echo ">> installing watchdog (event-driven service)"
     && sudo systemctl restart golden-pagoda-watchdog.service"
 
 echo ">> building image"
-"${SSH[@]}" "$REMOTE" "cd $APP_DIR && docker build -t golden-pagoda:latest . | tail -3"
+# No `| tail` here: a failed build must propagate its exit code through SSH
+# (set -euo pipefail) so we never restart the service on a stale image.
+"${SSH[@]}" "$REMOTE" "cd $APP_DIR && docker build -t golden-pagoda:latest ."
 
 echo ">> (re)starting service"
 "${SSH[@]}" "$REMOTE" "sudo systemctl enable --now $SERVICE && sudo systemctl restart $SERVICE && sleep 5 && systemctl is-active $SERVICE"

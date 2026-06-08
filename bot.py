@@ -492,6 +492,21 @@ _COMMAND_IDS: dict[str, int] = {}
 # garbage-collected mid-await. We discard each task once it completes.
 _BG_TASKS: set[asyncio.Task] = set()
 
+# Caps how many heavy image jobs (supersampled card renders + OCR upscales)
+# run concurrently. On the CX22 (512MB / 2-3 cores) several simultaneous
+# verifications could otherwise each allocate tens of MB of RGBA buffers at
+# once and spike toward the memory limit. Two in flight keeps it bounded
+# while still overlapping one render with one OCR.
+_HEAVY_JOB_SEMAPHORE = asyncio.Semaphore(2)
+
+
+async def _run_heavy(func, /, *args, **kwargs):
+    """Run a CPU/memory-heavy callable in a worker thread, bounded by
+    ``_HEAVY_JOB_SEMAPHORE`` so concurrent renders/OCR can't pile up and
+    blow the 512MB container budget."""
+    async with _HEAVY_JOB_SEMAPHORE:
+        return await asyncio.to_thread(func, *args, **kwargs)
+
 # Sliding-window error tracking for the healthcheck. When >= 3 errors
 # occur in a 60s window, the health-tick task stops writing the signal
 # file so the watchdog sees the container as unhealthy and restarts it.
@@ -1149,7 +1164,7 @@ async def _ocr_profile_fields(
     started = time.monotonic()
     try:
         # OCR involves blocking HTTP (up to 60s) and subprocess work.
-        ocr_text_raw, ocr_words, engine = await asyncio.to_thread(
+        ocr_text_raw, ocr_words, engine = await _run_heavy(
             _ocr, image_bytes, filename, content_type,
         )
         ocr_text = (ocr_text_raw or "").strip()
@@ -1164,7 +1179,7 @@ async def _ocr_profile_fields(
     # OCR.space often drops the small title-bar text; rerun Tesseract on the
     # top strip to recover the PlayerName#NNN token when it's missing.
     try:
-        ocr_text, ocr_words = await asyncio.to_thread(
+        ocr_text, ocr_words = await _run_heavy(
             _supplement_title_bar_ocr, image_bytes, ocr_text, ocr_words,
         )
     except Exception:
@@ -1450,7 +1465,7 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
             size=256, format="png"
         ).url
         avatar_bytes = await _fetch_avatar_bytes(avatar_url)
-        progress_png = await asyncio.to_thread(
+        progress_png = await _run_heavy(
             _render_progress_card_png,
             avatar_bytes=avatar_bytes,
             display_name=member.display_name,
@@ -2580,6 +2595,63 @@ async def on_message(message: discord.Message) -> None:
     await _process_screenshot(message)
 
 
+async def _clear_member_data_on_leave(
+    guild_id: int, user_id: int, label: str
+) -> None:
+    """Erase a member's durable data after they leave (the "on-leave data
+    clear" policy). Runs off the event loop and never raises so a gateway
+    member-remove event can't crash the bot.
+
+    Deletes their stored profile + awarded titles and anonymises their
+    verification telemetry (see :func:`analytics.delete_member_data`). The
+    rendered profile/progress cards hold no persisted state of their own, so
+    clearing the store leaves nothing behind to reference.
+    """
+    try:
+        result = await asyncio.to_thread(
+            analytics.delete_member_data,
+            guild_id=guild_id,
+            user_id=user_id,
+        )
+    except Exception:
+        logger.exception(
+            "on-leave clear failed for %s (guild %s)", user_id, guild_id
+        )
+        return
+    if result.get("profiles") or result.get("titles") or result.get(
+        "events_anonymized"
+    ):
+        logger.info(
+            "on-leave clear: %s (%s) left guild %s \u2014 removed "
+            "profile=%d titles=%d, anonymised events=%d",
+            label,
+            user_id,
+            guild_id,
+            result.get("profiles", 0),
+            result.get("titles", 0),
+            result.get("events_anonymized", 0),
+        )
+
+
+@client.event
+async def on_member_remove(member: discord.Member) -> None:
+    """Apply the on-leave data clear when a member leaves, is kicked, or is
+    banned (all surface as a member-remove gateway event).
+
+    We only have the member's guild + user IDs to work with reliably here,
+    so the clear is scoped strictly to that ``(guild_id, user_id)`` pair.
+    """
+    guild = member.guild
+    if guild is None:
+        return
+    label = getattr(member, "display_name", None) or getattr(
+        member, "name", "member"
+    )
+    _spawn_bg_task(
+        _clear_member_data_on_leave(guild.id, member.id, str(label))
+    )
+
+
 # ---------- Slash commands --------------------------------------------------
 
 # Stricter than the module-level `_CUSTOM_EMOJI_RE` used for reaction parsing:
@@ -2945,7 +3017,18 @@ def _status_nav_row(page: int) -> dict:
     }
 
 
-def _status_components(interaction: discord.Interaction, page: int) -> list[dict]:
+def _status_page_needs_snapshot(page: int) -> bool:
+    """Whether the page at ``page`` consumes ``analytics.summary()`` \u2014 lets the
+    async callers fetch the snapshot off the event loop before building."""
+    page = max(0, min(page, len(_STATUS_PAGES) - 1))
+    return _STATUS_PAGES[page][0] in _PAGES_NEEDING_SNAPSHOT
+
+
+def _status_components(
+    interaction: discord.Interaction,
+    page: int,
+    snap: dict | None = None,
+) -> list[dict]:
     page = max(0, min(page, len(_STATUS_PAGES) - 1))
     key, title, builder = _STATUS_PAGES[page]
     nav_row = _status_nav_row(page)
@@ -2964,7 +3047,12 @@ def _status_components(interaction: discord.Interaction, page: int) -> list[dict
             nav_row,
         ]
     else:
-        snap = analytics.summary() if key in _PAGES_NEEDING_SNAPSHOT else {}
+        # Snapshot is fetched off-loop by the caller (see _send_status_page);
+        # fall back to a synchronous fetch only if one wasn't supplied.
+        if key in _PAGES_NEEDING_SNAPSHOT:
+            snap = snap if snap is not None else analytics.summary()
+        else:
+            snap = {}
         assert builder is not None  # only the "roles" slot is None
         container_components = [
             {"type": 10, "content": builder(interaction, snap)},
@@ -3016,7 +3104,11 @@ async def _interaction_callback(
 
 async def _send_status_page(interaction: discord.Interaction, page: int) -> None:
     try:
-        components = _status_components(interaction, page)
+        snap = (
+            await asyncio.to_thread(analytics.summary)
+            if _status_page_needs_snapshot(page) else None
+        )
+        components = _status_components(interaction, page, snap)
         await _interaction_callback(interaction, 4, components)
     except Exception:
         logger.exception("status page %s failed", page)
@@ -3036,6 +3128,288 @@ async def _send_status_page(interaction: discord.Interaction, page: int) -> None
 @app_commands.default_permissions(manage_guild=True)
 async def status_cmd(interaction: discord.Interaction) -> None:
     await _send_status_page(interaction, 0)
+
+
+# ---------- /manage (admin backup console) ----------------------------------
+
+# Manual admin counterpart to the autonomous on-leave data clear
+# (`on_member_remove`). Styled exactly like /status: a single ephemeral
+# Components V2 message that paginates through a member's stored data with
+# Prev/Next/Refresh buttons, plus a confirm-gated "Clear stored data" button
+# on the last page so a moderator can wipe a member's profile + titles by
+# hand whenever the automatic clear isn't enough (e.g. a member who is still
+# in the server, or a leave the bot missed while offline).
+
+# (page key, title) — mirrors `_STATUS_PAGES`. Bodies are built inline in
+# `_manage_components` because each one needs the gathered snapshot + member.
+_MANAGE_PAGES: list[tuple[str, str]] = [
+    ("overview", "Overview"),
+    ("titles",   "Titles"),
+    ("data",     "Data & Clear"),
+]
+
+
+async def _manage_snapshot(guild_id: int, user_id: int) -> dict:
+    """Gather a member's durable store rows for the /manage panel.
+
+    Reads the profile row + awarded titles off the event loop (SQLite),
+    fail-soft via the analytics layer. Returns ``{"profile", "titles"}``.
+    """
+    profile = await asyncio.to_thread(
+        analytics.get_member_profile, guild_id, user_id
+    )
+    titles = await asyncio.to_thread(
+        analytics.list_member_titles, guild_id, user_id
+    )
+    return {"profile": profile, "titles": titles}
+
+
+def _manage_nav_row(member_id: int, page: int) -> dict:
+    last = len(_MANAGE_PAGES) - 1
+    return {
+        "type": 1,
+        "components": [
+            {"type": 2, "style": 2, "label": "\u25C0 Prev",
+             "custom_id": f"manage:{member_id}:p:{page - 1}",
+             "disabled": page == 0},
+            {"type": 2, "style": 2,
+             "label": f"{page + 1}/{len(_MANAGE_PAGES)}",
+             "custom_id": "manage:noop", "disabled": True},
+            {"type": 2, "style": 2, "label": "Next \u25B6",
+             "custom_id": f"manage:{member_id}:p:{page + 1}",
+             "disabled": page >= last},
+            {"type": 2, "style": 1,
+             "emoji": {"name": "\U0001F504"},
+             "custom_id": f"manage:{member_id}:p:{page}"},
+        ],
+    }
+
+
+def _manage_components(
+    member_id: int,
+    member: "discord.Member | None",
+    page: int,
+    snap: dict,
+    *,
+    confirm_clear: bool = False,
+    cleared: dict | None = None,
+) -> list[dict]:
+    """Build the Components V2 payload for one /manage page.
+
+    Tolerates ``member is None`` (the target already left the server) so the
+    panel still works as a backup clear for departed members — it falls back
+    to the stored in-game name / bare id for the identity line.
+    """
+    page = max(0, min(page, len(_MANAGE_PAGES) - 1))
+    key, title = _MANAGE_PAGES[page]
+    nav_row = _manage_nav_row(member_id, page)
+    profile = snap.get("profile")
+    titles = snap.get("titles") or []
+    accent = ACCENT_PASS
+
+    if member is not None:
+        ident = f"<@{member_id}> (`{member_id}`)"
+        name = member.display_name
+    else:
+        stored_name = (profile or {}).get("in_game_name")
+        name = _strip_clan_tag(stored_name) if stored_name else f"User {member_id}"
+        ident = f"*(not in server)* `{member_id}`"
+
+    if key == "overview":
+        lines = ["**Member**", f"-# {ident}", "", "**Stored profile**"]
+        if profile:
+            ign = profile.get("in_game_name")
+            mr = profile.get("mastery_rank")
+            plat = profile.get("platform")
+            clan = profile.get("clan")
+            lv = profile.get("last_verified_ts")
+            lines.append(f"-# In-game name: {f'`{ign}`' if ign else '*(unset)*'}")
+            lines.append(f"-# Mastery Rank: {f'`{mr}`' if mr else '*(unset)*'}")
+            lines.append(f"-# Platform: {f'`{plat}`' if plat else '*(unset)*'}")
+            lines.append(f"-# Clan: {f'`{clan}`' if clan else '*(unset)*'}")
+            lines.append(
+                f"-# Last verified: {f'<t:{int(lv)}:R>' if lv else '*(never)*'}"
+            )
+        else:
+            lines.append("-# No stored profile data.")
+        lines.append(f"-# Titles: `{len(titles)}`")
+        container_components = [
+            {"type": 10, "content": "\n".join(lines)}, nav_row,
+        ]
+    elif key == "titles":
+        lines = [f"**Titles** ({len(titles)})"]
+        if titles:
+            for t in titles:
+                t_name = t.get("title") or "?"
+                reason = (t.get("reason") or "").strip()
+                ts = t.get("awarded_ts")
+                row = f"-# \u2022 `{t_name}`"
+                if reason:
+                    row += f" \u2014 {reason}"
+                if ts:
+                    row += f" \u2022 <t:{int(ts)}:R>"
+                lines.append(row)
+        else:
+            lines.append("-# No titles awarded.")
+        container_components = [
+            {"type": 10, "content": "\n".join(lines)}, nav_row,
+        ]
+    else:  # "data"
+        has_profile = "yes" if profile else "no"
+        lines = [
+            "**Stored data**",
+            f"-# Profile row: `{has_profile}`",
+            f"-# Titles: `{len(titles)}`",
+            "",
+        ]
+        action_row: dict | None = None
+        if cleared is not None:
+            lines.append(
+                "-# \u2705 Cleared \u2014 removed profile "
+                f"({cleared.get('profiles', 0)}) + titles "
+                f"({cleared.get('titles', 0)}); anonymised "
+                f"{cleared.get('events_anonymized', 0)} telemetry rows."
+            )
+            lines.append("-# Roles aren't touched \u2014 remove those manually.")
+        elif confirm_clear:
+            accent = ACCENT_FAIL
+            lines.append(
+                f"-# \u26A0\uFE0F This permanently deletes **{name}**'s stored "
+                "profile + titles and anonymises their telemetry. Roles are "
+                "NOT touched. This can't be undone."
+            )
+            action_row = {"type": 1, "components": [
+                {"type": 2, "style": 4, "label": "Confirm clear",
+                 "custom_id": f"manage:{member_id}:clearok"},
+                {"type": 2, "style": 2, "label": "Cancel",
+                 "custom_id": f"manage:{member_id}:p:2"},
+            ]}
+        else:
+            lines.append(
+                "-# Clearing removes the durable store (profile + titles) and "
+                "anonymises telemetry. Roles are NOT touched. This is the "
+                "manual backup of the automatic on-leave clear."
+            )
+            if profile or titles:
+                action_row = {"type": 1, "components": [
+                    {"type": 2, "style": 4, "label": "Clear stored data",
+                     "custom_id": f"manage:{member_id}:clear"},
+                ]}
+        container_components = [{"type": 10, "content": "\n".join(lines)}]
+        if action_row is not None:
+            container_components.append(action_row)
+        container_components.append(nav_row)
+
+    return [
+        {"type": 10, "content": f"### \U0001F6E0\uFE0F  Manage \u2014 {title}"},
+        {
+            "type": 17,
+            "accent_color": accent,
+            "components": container_components,
+        },
+    ]
+
+
+@tree.command(
+    name="manage",
+    description="Admin backup console: view or clear a member's stored data.",
+)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(
+    member="The member whose stored data to inspect or clear.",
+)
+async def manage_cmd(
+    interaction: discord.Interaction,
+    member: discord.User,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "\u274C /manage can only be used in a server.", ephemeral=True
+        )
+        return
+    try:
+        target = guild.get_member(member.id)
+        snap = await _manage_snapshot(guild.id, member.id)
+        components = _manage_components(member.id, target, 0, snap)
+        await _interaction_callback(interaction, 4, components)
+    except Exception:
+        logger.exception("/manage failed")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "\u274C Failed to open the manage panel.", ephemeral=True
+            )
+
+
+async def _handle_manage_interaction(
+    interaction: discord.Interaction, custom_id: str
+) -> None:
+    """Dispatch the /manage panel's buttons (Prev/Next/Refresh + the
+    confirm-gated Clear). Re-checks Manage Server on every click as defence
+    in depth even though the panel is ephemeral (only the invoker sees it).
+    """
+    parts = custom_id.split(":")
+    if len(parts) >= 2 and parts[1] == "noop":
+        with contextlib.suppress(Exception):
+            await _interaction_callback(interaction, 6, [])  # DEFERRED_UPDATE
+        return
+
+    user = interaction.user
+    guild = interaction.guild
+    if guild is None or not (
+        isinstance(user, discord.Member)
+        and user.guild_permissions.manage_guild
+    ):
+        with contextlib.suppress(Exception):
+            await _interaction_callback(interaction, 6, [])
+        return
+
+    try:
+        member_id = int(parts[1])
+    except (IndexError, ValueError):
+        return
+    action = parts[2] if len(parts) > 2 else "p"
+    member = guild.get_member(member_id)
+
+    if action == "clear":
+        snap = await _manage_snapshot(guild.id, member_id)
+        components = _manage_components(
+            member_id, member, 2, snap, confirm_clear=True
+        )
+        with contextlib.suppress(Exception):
+            await _interaction_callback(interaction, 7, components)
+        return
+
+    if action == "clearok":
+        result = await asyncio.to_thread(
+            analytics.delete_member_data,
+            guild_id=guild.id,
+            user_id=member_id,
+        )
+        logger.info(
+            "manage: admin %s cleared data for %s in guild %s \u2014 "
+            "profile=%d titles=%d events=%d",
+            user.id, member_id, guild.id,
+            result.get("profiles", 0),
+            result.get("titles", 0),
+            result.get("events_anonymized", 0),
+        )
+        snap = await _manage_snapshot(guild.id, member_id)
+        components = _manage_components(
+            member_id, member, 2, snap, cleared=result
+        )
+        with contextlib.suppress(Exception):
+            await _interaction_callback(interaction, 7, components)
+        return
+
+    try:
+        page = int(parts[3])
+    except (IndexError, ValueError):
+        page = 0
+    snap = await _manage_snapshot(guild.id, member_id)
+    components = _manage_components(member_id, member, page, snap)
+    with contextlib.suppress(Exception):
+        await _interaction_callback(interaction, 7, components)  # UPDATE_MESSAGE
 
 
 # ---------- Progress card (rendered PNG, shared by the verify flow) ---------
@@ -3096,6 +3470,18 @@ def _load_font_cached(size: int, bold: bool) -> ImageFont.FreeTypeFont:
         except OSError:
             continue
     return ImageFont.load_default()  # type: ignore[return-value]
+
+
+def _ellipsize(draw, text: str, font, max_w: float) -> str:
+    """Trim ``text`` (appending an ellipsis) until it fits within ``max_w``
+    pixels for ``font``. Shared by every card-text field that has to budget
+    a label/value to a column width."""
+    text = text or ""
+    if draw.textlength(text, font=font) <= max_w:
+        return text
+    while text and draw.textlength(text + "\u2026", font=font) > max_w:
+        text = text[:-1]
+    return text + "\u2026"
 
 
 def _vertical_gradient(
@@ -3418,13 +3804,7 @@ def _draw_info_grid(
         )
         value_x = text_x0 + draw.textlength(label_text, font=lf)
         max_value_w = right_edge - value_x
-        v = value or ""
-        if draw.textlength(v, font=vf) > max_value_w:
-            while v and draw.textlength(
-                v + "\u2026", font=vf
-            ) > max_value_w:
-                v = v[:-1]
-            v = v + "\u2026"
+        v = _ellipsize(draw, value or "", vf, max_value_w)
         draw.text(
             (value_x, cy), v, font=vf,
             fill=_PROGRESS_TEXT, anchor="lm",
@@ -3562,12 +3942,7 @@ def _render_progress_card_png(
 
     name = display_name or "Member"
     max_name_w = right_x - text_x - sc(10)
-    if draw.textlength(name, font=name_font) > max_name_w:
-        while name and draw.textlength(
-            name + "\u2026", font=name_font
-        ) > max_name_w:
-            name = name[:-1]
-        name = name + "\u2026"
+    name = _ellipsize(draw, name, name_font, max_name_w)
     draw.text((text_x, sc(18)), name, font=name_font, fill=_PROGRESS_TEXT)
 
     count_text = f"{count} / {target}"
@@ -3912,12 +4287,7 @@ def _render_profile_card_png(
 
     name = headline
     max_name_w = name_right_bound - text_x
-    if draw.textlength(name, font=name_font) > max_name_w:
-        while name and draw.textlength(
-            name + "\u2026", font=name_font
-        ) > max_name_w:
-            name = name[:-1]
-        name = name + "\u2026"
+    name = _ellipsize(draw, name, name_font, max_name_w)
     draw.text(
         (text_x, name_cy), name, font=name_font,
         fill=_PROGRESS_TEXT, anchor="lm",
@@ -3926,14 +4296,8 @@ def _render_profile_card_png(
     # Server nickname as a small muted subtitle beneath the in-game handle.
     if subtitle:
         sub_font = _load_font(sc(12), bold=True)
-        sub_txt = subtitle
         max_sub_w = name_right_bound - text_x
-        if draw.textlength(sub_txt, font=sub_font) > max_sub_w:
-            while sub_txt and draw.textlength(
-                sub_txt + "\u2026", font=sub_font
-            ) > max_sub_w:
-                sub_txt = sub_txt[:-1]
-            sub_txt = sub_txt + "\u2026"
+        sub_txt = _ellipsize(draw, subtitle, sub_font, max_sub_w)
         draw.text(
             (text_x, subtitle_cy), sub_txt, font=sub_font,
             fill=_PROGRESS_MUTED, anchor="lm",
@@ -3981,14 +4345,8 @@ def _render_profile_card_png(
             )
             row_cx += syn_icon_px + sc(9)
         syn_font = _load_font(sc(15), bold=True)
-        nm = sname or ""
         max_w = name_right_bound - row_cx
-        if draw.textlength(nm, font=syn_font) > max_w:
-            while nm and draw.textlength(
-                nm + "\u2026", font=syn_font
-            ) > max_w:
-                nm = nm[:-1]
-            nm = nm + "\u2026"
+        nm = _ellipsize(draw, sname or "", syn_font, max_w)
         draw.text(
             (row_cx, plat_cy), nm, font=syn_font,
             fill=scolor or _PROGRESS_TEXT, anchor="lm",
@@ -4030,12 +4388,7 @@ def _render_profile_card_png(
         max_clan_w = sc(col_divider_x) - cx0 - sc(14)
         icon_w = (clan_icon_px + clan_icon_gap) if has_clan_icon else 0
         max_val_w = max_clan_w - icon_w
-        if draw.textlength(clan_val, font=clan_value_font) > max_val_w:
-            while clan_val and draw.textlength(
-                clan_val + "\u2026", font=clan_value_font
-            ) > max_val_w:
-                clan_val = clan_val[:-1]
-            clan_val = clan_val + "\u2026"
+        clan_val = _ellipsize(draw, clan_val, clan_value_font, max_val_w)
         ccy = sc(clan_pill_top) + sc(10)
         cx = cx0
         if has_clan_icon and _paste_emoji_icon(
@@ -4225,10 +4578,16 @@ async def _fetch_emoji_bytes(literal: str | None) -> bytes | None:
     eid = _emoji_id_from_literal(literal)
     if eid is None:
         return None
-    if eid not in _EMOJI_BYTES_CACHE:
-        url = f"https://cdn.discordapp.com/emojis/{eid}.png?size=128&quality=lossless"
-        _EMOJI_BYTES_CACHE[eid] = await _fetch_cdn_bytes(url)
-    return _EMOJI_BYTES_CACHE[eid]
+    cached = _EMOJI_BYTES_CACHE.get(eid)
+    if cached is not None:
+        return cached
+    url = f"https://cdn.discordapp.com/emojis/{eid}.png?size=128&quality=lossless"
+    data = await _fetch_cdn_bytes(url)
+    # Only cache successful fetches — caching a transient CDN failure (None)
+    # would permanently blank that icon for the rest of the process life.
+    if data is not None:
+        _EMOJI_BYTES_CACHE[eid] = data
+    return data
 
 
 # ---------- /profile mastery-rank editor ------------------------------------
@@ -4423,7 +4782,7 @@ class _MasteryEditorView(discord.ui.View):
             mastery_rank=f"{kind} {value}",
         )
         info = await _member_profile_info_lines(self.member)
-        png = await asyncio.to_thread(
+        png = await _run_heavy(
             _render_profile_card_png,
             avatar_bytes=self.avatar_bytes,
             display_name=self.display_name,
@@ -4546,7 +4905,7 @@ class _ScreenshotVerifyModal(discord.ui.Modal):
 
         info = await _member_profile_info_lines(member)
         in_game_name = await _member_in_game_name(member)
-        png = await asyncio.to_thread(
+        png = await _run_heavy(
             _render_profile_card_png,
             avatar_bytes=self._gp_avatar_bytes,
             display_name=self._gp_display_name,
@@ -4838,7 +5197,7 @@ async def profile_cmd(
         info = await _member_profile_info_lines(target)
         in_game_name = await _member_in_game_name(target)
         avatar_bytes = await _fetch_avatar_bytes(avatar_url)
-        png = await asyncio.to_thread(
+        png = await _run_heavy(
             _render_profile_card_png,
             avatar_bytes=avatar_bytes,
             display_name=display_name,
@@ -4882,10 +5241,20 @@ async def profile_cmd(
         await interaction.followup.send(**send_kwargs)
     except Exception:
         logger.exception("/profile failed")
-        if not interaction.response.is_done():
-            await interaction.response.send_message(
-                "\u274C Failed to render profile.", ephemeral=True
-            )
+        # We've already deferred, so `response.is_done()` is True and a plain
+        # `response.send_message` would be a no-op — use the followup webhook
+        # when deferred so a render/fetch failure still reaches the user.
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "\u274C Failed to render profile.", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "\u274C Failed to render profile.", ephemeral=True
+                )
+        except Exception:
+            logger.exception("/profile error reply failed")
 
 
 # /titles — admin command to grant or remove a member's cosmetic profile
@@ -5075,7 +5444,7 @@ async def _handle_nick_interaction(
                 member.display_avatar or member.default_avatar
             ).replace(size=256, format="png").url
             avatar_bytes = await _fetch_avatar_bytes(avatar_url)
-            refreshed_png = await asyncio.to_thread(
+            refreshed_png = await _run_heavy(
                 _render_progress_card_png,
                 avatar_bytes=avatar_bytes,
                 display_name=member.display_name,
@@ -5179,6 +5548,9 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     if custom_id.startswith("nick:"):
         await _handle_nick_interaction(interaction, custom_id)
         return
+    if custom_id.startswith("manage:"):
+        await _handle_manage_interaction(interaction, custom_id)
+        return
     if not custom_id.startswith("status:"):
         return
 
@@ -5217,7 +5589,11 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         page = int(parts[1])
     except ValueError:
         return
-    components = _status_components(interaction, page)
+    snap = (
+        await asyncio.to_thread(analytics.summary)
+        if _status_page_needs_snapshot(page) else None
+    )
+    components = _status_components(interaction, page, snap)
     try:
         await _interaction_callback(interaction, 7, components)  # UPDATE_MESSAGE
     except Exception:

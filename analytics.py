@@ -123,8 +123,6 @@ def _init() -> None:
                     awarded_ts INTEGER NOT NULL,
                     PRIMARY KEY (guild_id, user_id, title_key)
                 );
-                CREATE INDEX IF NOT EXISTS idx_member_titles_user
-                    ON member_titles(guild_id, user_id);
                 """
             )
             conn.commit()
@@ -361,6 +359,64 @@ def revoke_title(*, guild_id: int, user_id: int, title: str) -> bool:
         except Exception:
             logger.exception("analytics: revoke_title failed")
             return False
+
+
+def delete_member_data(*, guild_id: int, user_id: int) -> dict:
+    """Erase a member's durable data when they leave the server.
+
+    Scoped strictly to ``(guild_id, user_id)``. Drops their profile row and
+    every awarded title, then anonymises their verification telemetry by
+    NULLing ``user_id`` on the ``events`` rows (the aggregate /status stats
+    only ever group by outcome/clan, so the counts stay exact while the
+    personal reference is gone). Fail-soft like the rest of the module.
+
+    Returns a small audit dict ``{"profiles", "titles", "events_anonymized"}``
+    with the number of rows touched in each table (all zero when disabled).
+    """
+    out = {"profiles": 0, "titles": 0, "events_anonymized": 0}
+    if _disabled:
+        return out
+    with _lock:
+        _init()
+        if _disabled:
+            return out
+        try:
+            with _connect() as conn:
+                # The connection is autocommit (isolation_level=None), so an
+                # explicit transaction is required to make the purge atomic —
+                # otherwise a crash mid-delete could drop the profile while
+                # leaving the member's titles / telemetry behind.
+                conn.execute("BEGIN")
+                try:
+                    cur = conn.execute(
+                        "DELETE FROM member_profiles"
+                        " WHERE guild_id=? AND user_id=?",
+                        (guild_id, user_id),
+                    )
+                    profiles = cur.rowcount or 0
+                    cur = conn.execute(
+                        "DELETE FROM member_titles"
+                        " WHERE guild_id=? AND user_id=?",
+                        (guild_id, user_id),
+                    )
+                    titles = cur.rowcount or 0
+                    cur = conn.execute(
+                        "UPDATE events SET user_id=NULL"
+                        " WHERE guild_id=? AND user_id=?",
+                        (guild_id, user_id),
+                    )
+                    events = cur.rowcount or 0
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+                # Only report counts once the whole purge has committed.
+                out["profiles"] = profiles
+                out["titles"] = titles
+                out["events_anonymized"] = events
+        except Exception:
+            logger.exception("analytics: delete_member_data failed")
+        return out
 
 
 def _percentile(values: list[int], pct: float) -> int:

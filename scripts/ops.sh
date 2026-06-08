@@ -71,6 +71,11 @@ gp-env-set() {
         echo "usage: gp-env-set KEY VALUE" >&2
         return 2
     fi
+    # Guard against regex/awk metacharacters corrupting the .env rewrite.
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "gp-env-set: invalid key '$key' (use A-Z, 0-9, _)" >&2
+        return 2
+    fi
     # Base64 the value to avoid any quoting / sed-delimiter pain over SSH.
     local b64
     b64="$(printf '%s' "$value" | base64 -w0)"
@@ -85,7 +90,12 @@ gp-env-set() {
         else
             echo \"$key=\$VAL\" | sudo tee -a \"\$ENV_FILE\" > /dev/null
         fi
-        sudo grep -nE '^$key=' \"\$ENV_FILE\" || true
+        # Keep the secrets file owned by the container uid + non-readable to
+        # others (the tee/mv above can reset it to root:root 0644).
+        sudo chown 10001:10001 \"\$ENV_FILE\" 2>/dev/null || true
+        sudo chmod 0600 \"\$ENV_FILE\"
+        # Confirm the key is present WITHOUT echoing its (possibly secret) value.
+        if sudo grep -qE '^$key=' \"\$ENV_FILE\"; then echo '$key updated'; else echo '$key MISSING after write' >&2; fi
         sudo systemctl restart $GP_SERVICE
         sleep 3
         systemctl is-active $GP_SERVICE
@@ -93,6 +103,8 @@ gp-env-set() {
 }
 
 # Print one or more keys from the server's .env. Usage: gp-env-get KEY [KEY...]
+# Secret-looking keys (token/key/secret/password) are masked so they don't
+# leak into the terminal / CI logs; everything else is printed verbatim.
 gp-env-get() {
     local keys="$*"
     if [[ -z "$keys" ]]; then
@@ -101,7 +113,9 @@ gp-env-get() {
     fi
     local pattern
     pattern="^($(echo "$keys" | tr ' ' '|'))="
-    _gp_ssh "sudo grep -nE '$pattern' /opt/golden-pagoda/.env || echo '(no matches)'"
+    _gp_ssh "sudo grep -nE '$pattern' /opt/golden-pagoda/.env \
+        | sed -E 's/^([0-9]+:[A-Za-z0-9_]*(TOKEN|KEY|SECRET|PASSWORD)[A-Za-z0-9_]*=).*/\1****(masked)/I' \
+        || echo '(no matches)'"
 }
 
 # Allow direct invocation:  scripts/ops.sh <cmd> [args...]
