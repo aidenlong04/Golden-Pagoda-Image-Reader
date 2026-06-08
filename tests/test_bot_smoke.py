@@ -724,38 +724,6 @@ class CardTextHelperTests(unittest.TestCase):
         self.assertEqual(self.b._ellipsize(self.draw, "", self.font, 50), "")
 
 
-class ScatterBackgroundTests(unittest.TestCase):
-    """Tests for the scattered Orokin-glyph profile-card backdrop."""
-
-    def setUp(self):
-        import bot as bot_module
-        self.b = bot_module
-
-    def test_returns_rgba_of_requested_size(self):
-        img = self.b._scatter_symbol_bg(200, 120, seed=1, scale=1)
-        self.assertEqual(img.mode, "RGBA")
-        self.assertEqual(img.size, (200, 120))
-
-    def test_is_deterministic_for_seed(self):
-        a = self.b._scatter_symbol_bg(160, 100, seed=7, scale=1)
-        b = self.b._scatter_symbol_bg(160, 100, seed=7, scale=1)
-        self.assertEqual(a.tobytes(), b.tobytes())
-
-    def test_varies_across_seeds(self):
-        a = self.b._scatter_symbol_bg(160, 100, seed=1, scale=1)
-        b = self.b._scatter_symbol_bg(160, 100, seed=2, scale=1)
-        self.assertNotEqual(a.tobytes(), b.tobytes())
-
-    def test_draws_some_faint_pixels(self):
-        # The overlay must actually paint glyphs (non-empty alpha) but stay
-        # faint — every painted pixel well under half opacity.
-        img = self.b._scatter_symbol_bg(240, 160, seed=3, scale=1)
-        alpha = img.split()[3]
-        extrema = alpha.getextrema()  # (min, max)
-        self.assertGreater(extrema[1], 0, "expected some glyph pixels")
-        self.assertLess(extrema[1], 64, "glyphs must stay faint")
-
-
 class LotusSigilTests(unittest.TestCase):
     """Tests for the Warframe Lotus hero watermark."""
 

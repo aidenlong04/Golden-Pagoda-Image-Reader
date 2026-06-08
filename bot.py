@@ -3515,86 +3515,19 @@ def _rounded_mask(width: int, height: int, radius: int) -> Image.Image:
     return mask.resize((width, height), Image.LANCZOS)
 
 
-# Glyph mix scattered across the profile-card background. Diamonds are
-# weighted heavily so the Orokin motif dominates, leavened with rings,
-# tick crosses, and small pips for variety.
-_PROFILE_BG_GLYPHS = ("diamond", "diamond", "diamond", "ring", "cross", "pip")
-
-
-def _scatter_symbol_bg(
-    width: int, height: int, *,
-    accent: tuple[int, int, int] = _PROGRESS_ACCENT,
-    seed: int = 0, scale: int = 1,
-) -> Image.Image:
-    """Return a faint scattered-glyph overlay sized ``(width, height)``.
-
-    Lays Warframe-flavoured symbols (concentric Orokin diamonds, rings,
-    tick crosses, pips) on a jittered grid with varied size / opacity so
-    the profile card's slate panel carries subtle texture instead of a
-    flat fill. Kept at very low alpha so overlaid text/icons stay crisp.
-    Deterministic for a given ``seed`` (numpy ``RandomState``) so a
-    member's backdrop is stable across re-renders. The caller composites
-    this onto the gradient panel *before* the rounded-mask clip, so no
-    separate clipping is needed.
-    """
-    layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    rng = np.random.RandomState(seed & 0xFFFFFFFF)
-    cell = max(8, int(116 * scale))
-    jit = max(1, cell // 4)
-    lw = max(1, int(2 * scale))
-    base = tuple(int(c) for c in accent)
-
-    def _diamond(cx: int, cy: int, rr: int, a: int, *, fill: bool = False):
-        pts = [(cx, cy - rr), (cx + rr, cy), (cx, cy + rr), (cx - rr, cy)]
-        if fill:
-            d.polygon(pts, fill=base + (a,))
-        else:
-            d.polygon(pts, outline=base + (a,), width=lw)
-
-    cols = width // cell + 2
-    rows = height // cell + 2
-    for gy in range(-1, rows):
-        for gx in range(-1, cols):
-            cx = gx * cell + cell // 2 + int(rng.randint(-jit, jit + 1))
-            cy = gy * cell + cell // 2 + int(rng.randint(-jit, jit + 1))
-            r = int(cell * (0.20 + 0.22 * rng.rand()))
-            a = 7 + int(rng.randint(0, 8))  # 7..14 alpha — very faint
-            kind = _PROFILE_BG_GLYPHS[int(rng.randint(0, len(_PROFILE_BG_GLYPHS)))]
-            if kind == "diamond":
-                for frac in (1.0, 0.6, 0.28):
-                    _diamond(cx, cy, max(1, int(r * frac)), a)
-                _diamond(cx, cy, max(1, r // 8), min(255, a + 8), fill=True)
-            elif kind == "ring":
-                for frac in (1.0, 0.55):
-                    rr = max(1, int(r * frac))
-                    d.ellipse(
-                        (cx - rr, cy - rr, cx + rr, cy + rr),
-                        outline=base + (a,), width=lw,
-                    )
-            elif kind == "cross":
-                arm = max(2, r // 2)
-                d.line((cx - arm, cy, cx + arm, cy), fill=base + (a,), width=lw)
-                d.line((cx, cy - arm, cx, cy + arm), fill=base + (a,), width=lw)
-            else:  # pip — a tiny filled diamond
-                _diamond(cx, cy, max(1, r // 5), min(255, a + 4), fill=True)
-    return layer
-
-
 def _lotus_sigil(
     size: int, *,
     accent: tuple[int, int, int] = _PROGRESS_ACCENT,
-    alpha: int = 18, energy: tuple[int, int, int] = _PROGRESS_FILL_START,
+    alpha: int = 18,
 ) -> Image.Image:
     """Return an RGBA ``size``×``size`` faint line-art **Warframe "Lotus"
-    sigil** — the franchise's signature emblem: a central energy pod
-    flanked by symmetric petals fanned wide open (out past the horizontal)
-    over two splayed grounding flanges.
+    sigil** — the franchise's signature emblem: symmetric petals fanned
+    wide open (out past the horizontal) over two splayed grounding flanges.
 
-    Drawn in low-alpha Orokin gold with an energy-cyan pod so the
-    profile-card backdrop reads as distinctly Warframe. Kept faint enough
-    that overlaid text/icons stay crisp; the caller composites it onto the
-    gradient panel beneath the scattered glyphs and the rounded-mask clip.
+    Drawn in low-alpha Orokin gold so the profile-card backdrop reads as
+    distinctly Warframe. Kept faint enough that overlaid text/icons stay
+    crisp; the caller composites it onto the gradient panel beneath the
+    rounded-mask clip.
     """
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
@@ -3627,8 +3560,7 @@ def _lotus_sigil(
     petal_w = size * 0.086
     # A fully-open bloom: petals fan symmetrically across a wide arc (out
     # past the horizontal) and only gently shorten toward the edges, so the
-    # lotus reads as spread wide open rather than upright. The energy pod
-    # anchors the centre.
+    # lotus reads as spread wide open rather than upright.
     _petal(0.0, L, petal_w, a)
     for ang, lf in ((38.0, 0.94), (74.0, 0.84), (108.0, 0.68)):
         _petal(ang, L * lf, petal_w * 0.92, a)
@@ -3636,17 +3568,6 @@ def _lotus_sigil(
     # Two grounding flanges splayed wide at the base to complete the bloom.
     _petal(150.0, L * 0.42, petal_w * 0.72, a)
     _petal(-150.0, L * 0.42, petal_w * 0.72, a)
-
-    # Central energy pod: a small filled vertical lens in Warframe cyan.
-    pod_h, pod_w = size * 0.17, size * 0.05
-    t = np.linspace(0.0, 1.0, 21)
-    pw = (np.sin(np.pi * t) ** 0.8) * pod_w
-    py = cy - t * pod_h
-    pod = (
-        list(zip((cx + pw).tolist(), py.tolist()))
-        + list(zip((cx - pw)[::-1].tolist(), py[::-1].tolist()))
-    )
-    d.polygon(pod, fill=tuple(int(c) for c in energy) + (min(255, a + 8),))
     return img
 
 
@@ -4362,22 +4283,15 @@ def _render_profile_card_png(
     W, H = sc(_PROGRESS_CARD_W), sc(card_h)
     canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     panel = _vertical_gradient(W, H, _PROGRESS_BG_TOP, _PROGRESS_BG_BOTTOM)
-    # Scatter faint Orokin-style glyphs across the slate backdrop for
-    # texture. Seeded off the headline so each member's pattern is stable
-    # across re-renders but varies between members. Composited onto the
-    # gradient *before* the rounded-mask clip so the corners stay clean.
-    bg_seed = 0
-    for ch in (headline or "Member"):
-        bg_seed = (bg_seed * 131 + ord(ch)) & 0xFFFFFFFF
     # Hero watermark: a large, faint Warframe "Lotus" sigil centred in the
     # card's open space gives the slate backdrop a distinct Warframe
-    # identity; the scattered Orokin glyphs ride on top for texture.
+    # identity. Composited onto the gradient *before* the rounded-mask clip
+    # so the corners stay clean.
     lotus_sz = int(min(W, H) * 1.18)
     panel.alpha_composite(
         _lotus_sigil(lotus_sz, accent=_PROGRESS_ACCENT, alpha=16),
         (W // 2 - lotus_sz // 2, H // 2 - lotus_sz // 2),
     )
-    panel.alpha_composite(_scatter_symbol_bg(W, H, seed=bg_seed, scale=s))
     panel_mask = _rounded_mask(W, H, sc(_PROGRESS_RADIUS))
     canvas.paste(panel, (0, 0), panel_mask)
     ImageDraw.Draw(canvas).rounded_rectangle(
