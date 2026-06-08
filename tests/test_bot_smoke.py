@@ -634,6 +634,27 @@ class ManagePanelTests(unittest.TestCase):
         nxt = row["components"][2]
         self.assertEqual(nxt["custom_id"], "manage:5:p:1")
 
+    def test_overview_page_offers_screenshot_update_for_present_member(self):
+        snap = {"profile": {"in_game_name": "Tenno"}, "titles": []}
+        comps = self.b._manage_components(5, Mock(display_name="Tenno"), 0, snap)
+        ids = {b.get("custom_id") for b in self._buttons(self._container(comps))}
+        self.assertIn("manage:5:update", ids)
+
+    def test_overview_page_hides_screenshot_update_for_departed_member(self):
+        snap = {"profile": {"in_game_name": "GhostTenno"}, "titles": []}
+        comps = self.b._manage_components(5, None, 0, snap)
+        ids = {b.get("custom_id") for b in self._buttons(self._container(comps))}
+        self.assertNotIn("manage:5:update", ids)
+
+    def test_manage_screenshot_modal_constructs(self):
+        """The /manage admin screenshot modal builds cleanly and carries a
+        single file-upload component for the target member's screenshot."""
+        import discord
+        modal = self.b._ManageScreenshotModal(member=Mock(), admin_id=123)
+        self.assertIsInstance(modal.screenshot, discord.ui.FileUpload)
+        self.assertEqual(modal.screenshot.max_values, 1)
+        self.assertEqual(modal._gp_admin_id, 123)
+
 
 class OnLeaveClearTests(unittest.TestCase):
     """Tests for the autonomous on-leave data clear."""

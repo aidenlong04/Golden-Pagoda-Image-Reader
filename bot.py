@@ -3102,6 +3102,34 @@ async def _interaction_callback(
         interaction.response._responded = True  # type: ignore[attr-defined]
 
 
+async def _interaction_edit_original_v2(
+    interaction: discord.Interaction, components: list[dict]
+) -> None:
+    """PATCH a deferred interaction's original message with refreshed V2
+    components via raw HTTP.
+
+    discord.py 2.x can't edit a message with raw Components V2 dicts, so
+    after a DEFERRED_UPDATE_MESSAGE ack we hit the interaction webhook's
+    ``@original`` route directly. The message keeps its IS_COMPONENTS_V2
+    flag, so the edit only needs to carry the new component tree.
+    """
+    from discord.http import Route
+
+    route = Route(
+        "PATCH",
+        "/webhooks/{application_id}/{interaction_token}/messages/@original",
+        application_id=interaction.application_id,
+        interaction_token=interaction.token,
+    )
+    await client.http.request(
+        route,
+        json={
+            "components": components,
+            "allowed_mentions": {"parse": []},
+        },
+    )
+
+
 async def _send_status_page(interaction: discord.Interaction, page: int) -> None:
     try:
         snap = (
@@ -3233,9 +3261,19 @@ def _manage_components(
         else:
             lines.append("-# No stored profile data.")
         lines.append(f"-# Titles: `{len(titles)}`")
-        container_components = [
-            {"type": 10, "content": "\n".join(lines)}, nav_row,
-        ]
+        container_components = [{"type": 10, "content": "\n".join(lines)}]
+        if member is not None:
+            # Admin shortcut: OCR a fresh profile screenshot and write the
+            # member's in-game name / clan / mastery straight into the store
+            # + roles (mirrors the member-facing /profile "Verify Profile
+            # Data" button). Only offered while the member is still here.
+            container_components.append({"type": 1, "components": [
+                {"type": 2, "style": 1,
+                 "label": "Update from screenshot",
+                 "emoji": {"name": "\U0001F4F7"},
+                 "custom_id": f"manage:{member_id}:update"},
+            ]})
+        container_components.append(nav_row)
     elif key == "titles":
         lines = [f"**Titles** ({len(titles)})"]
         if titles:
@@ -3400,6 +3438,30 @@ async def _handle_manage_interaction(
         )
         with contextlib.suppress(Exception):
             await _interaction_callback(interaction, 7, components)
+        return
+
+    if action == "update":
+        if member is None:
+            # Raced: the member left between render and click. Nothing to
+            # verify from a screenshot (no roles to assign).
+            with contextlib.suppress(Exception):
+                await _interaction_callback(
+                    interaction, 4,
+                    [{"type": 10,
+                      "content": "### \U0001F6E0\uFE0F  Manage"},
+                     {"type": 17, "accent_color": ACCENT_FAIL,
+                      "components": [{"type": 10, "content": (
+                          "-# That member is no longer in the server, so "
+                          "there's nothing to update from a screenshot."
+                      )}]}],
+                )
+            return
+        try:
+            await interaction.response.send_modal(
+                _ManageScreenshotModal(member=member, admin_id=user.id)
+            )
+        except Exception:
+            logger.exception("manage: send screenshot modal failed")
         return
 
     try:
@@ -5144,6 +5206,103 @@ class _ScreenshotVerifyButton(discord.ui.Button):
             source_view=self.view,
         )
         await interaction.response.send_modal(modal)
+
+
+class _ManageScreenshotModal(discord.ui.Modal):
+    """Admin screenshot modal opened from the /manage panel. OCRs a member's
+    Warframe profile screenshot and writes their in-game name / clan /
+    mastery straight into the durable store + roles (same pipeline as the
+    member-facing self-verification), then refreshes the /manage Overview
+    page in place.
+
+    Distinct from ``_ScreenshotVerifyModal`` (which re-renders a member's own
+    /profile card): this one targets *another* member on an admin's behalf
+    and refreshes the text-based V2 manage panel instead.
+    """
+
+    def __init__(self, *, member: discord.Member, admin_id: int) -> None:
+        super().__init__(title="Update Member from Screenshot", timeout=600)
+        self._gp_member = member
+        self._gp_admin_id = admin_id
+        self.screenshot = discord.ui.FileUpload(
+            min_values=1, max_values=1, required=True,
+        )
+        self.add_item(discord.ui.Label(
+            text="Profile screenshot",
+            description=(
+                "Upload the member's Warframe profile screenshot "
+                "(title bar + CLAN visible)."
+            ),
+            component=self.screenshot,
+        ))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Defence in depth: Discord only shows a modal to the user it was
+        # sent to, but re-check Manage Server before mutating another member.
+        user = interaction.user
+        if not (
+            isinstance(user, discord.Member)
+            and user.guild_permissions.manage_guild
+        ):
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "Operator, you can't use this.", ephemeral=True
+                )
+            return
+
+        member = self._gp_member
+        files = list(self.screenshot.values or [])
+        if not files:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.defer()
+            return
+        attachment = files[0]
+        # OCR + role HTTP can take seconds; ack as a deferred message update
+        # so we can refresh the /manage panel afterward (@original PATCH).
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.defer()
+        try:
+            image_bytes = await attachment.read()
+        except Exception:
+            logger.warning(
+                "manage screenshot: attachment read failed", exc_info=True
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.followup.send(
+                    "Couldn't read that upload \u2014 try again.",
+                    ephemeral=True,
+                )
+            return
+
+        summary = await _verify_member_from_screenshot(
+            member,
+            image_bytes=image_bytes,
+            filename=attachment.filename or "profile.png",
+            content_type=attachment.content_type or "image/png",
+        )
+
+        # Refresh the /manage Overview page in place so the stored-profile
+        # block reflects whatever the screenshot just wrote.
+        with contextlib.suppress(Exception):
+            snap = await _manage_snapshot(member.guild.id, member.id)
+            components = _manage_components(member.id, member, 0, snap)
+            await _interaction_edit_original_v2(interaction, components)
+
+        if summary:
+            body = (
+                f"> Operator, <@{member.id}>'s data has been adjusted.\n"
+                + "\n".join(f"* -# {line}" for line in summary)
+            )
+        else:
+            body = (
+                "I couldn't read that screenshot. Upload a clearer PNG/JPG "
+                "with the title bar (PlayerName#NNN) and CLAN visible."
+            )
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.followup.send(
+                body, ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
 
 async def _verify_member_from_screenshot(
