@@ -1185,6 +1185,67 @@ async def _ocr_profile_fields(
     )
 
 
+async def _build_pass_info_lines(
+    *,
+    clan_name: str | None,
+    clan_emoji: str | None,
+    member_platform: str | None,
+    mastery_rank: str | None,
+    profile_name: str | None,
+    pass_missing: list[str],
+) -> list[tuple]:
+    """Build the row-major info grid rendered beneath the progress bar on a
+    passing verification card.
+
+    Order matters: the card grid fills row-major (index 0 = top-left, 1 =
+    top-right, 2 = bottom-left, 3 = bottom-right), so this order lays out
+    as  Clan | Mastery Rank  /  Profile | Platform  — keeping Profile
+    directly under Clan in the left column. Clan + platform rows carry
+    their configured custom emoji bytes; profile / mastery / missing rows
+    reuse the operator / mastery sigil / warning emojis the text embed
+    renders, each falling back to the bullet glyph inside the renderer
+    when its emoji can't be fetched.
+    """
+    clan_emoji_bytes: bytes | None = None
+    platform_emoji_bytes: bytes | None = None
+    if clan_emoji:
+        clan_emoji_bytes = await _fetch_emoji_bytes(clan_emoji)
+    if member_platform:
+        platform_emoji_bytes = await _fetch_emoji_bytes(
+            PLATFORM_EMOJIS.get(member_platform)
+        )
+    profile_emoji_bytes = await _fetch_emoji_bytes(OPERATOR_EMOJI_RAW)
+    mastery_emoji_bytes = await _fetch_emoji_bytes(MASTERY_RANK_EMOJI_RAW)
+    missing_emoji_bytes = await _fetch_emoji_bytes(WARNING_EMOJI_RAW)
+
+    info_lines: list[tuple] = []
+    if clan_name:
+        info_lines.append(
+            ("Clan", _strip_clan_tag(clan_name), clan_emoji_bytes)
+        )
+    if mastery_rank:
+        info_lines.append(
+            (*_mastery_label_value(mastery_rank), mastery_emoji_bytes)
+        )
+    if profile_name:
+        display_profile = (
+            profile_name if profile_name.startswith("Tenno #")
+            else _strip_clan_tag(profile_name)
+        )
+        info_lines.append(
+            ("Profile", display_profile, profile_emoji_bytes)
+        )
+    if member_platform:
+        info_lines.append(
+            ("Platform", member_platform, platform_emoji_bytes)
+        )
+    if pass_missing:
+        info_lines.append(
+            ("Missing Data", ", ".join(pass_missing), missing_emoji_bytes)
+        )
+    return info_lines
+
+
 async def _process_screenshot(message: discord.Message) -> None:
     """Core screenshot verification logic. Extracted from on_message to support
     both live processing and catch-up scanning."""
@@ -1396,56 +1457,16 @@ async def _process_screenshot_impl(message: discord.Message) -> None:
             member_platform = plat
             break
 
-    clan_emoji_bytes: bytes | None = None
-    platform_emoji_bytes: bytes | None = None
-    profile_emoji_bytes: bytes | None = None
-    mastery_emoji_bytes: bytes | None = None
-    missing_emoji_bytes: bytes | None = None
-    if passed:
-        if clan_emoji:
-            clan_emoji_bytes = await _fetch_emoji_bytes(clan_emoji)
-        if member_platform:
-            platform_emoji_bytes = await _fetch_emoji_bytes(
-                PLATFORM_EMOJIS.get(member_platform)
-            )
-        # Profile / mastery / missing rows reuse the same custom emojis the
-        # text embed renders (operator, mastery sigil, warning) so the card
-        # icons match the bot's established identity. Each falls back to the
-        # bullet glyph inside the renderer when its emoji can't be fetched.
-        profile_emoji_bytes = await _fetch_emoji_bytes(OPERATOR_EMOJI_RAW)
-        mastery_emoji_bytes = await _fetch_emoji_bytes(MASTERY_RANK_EMOJI_RAW)
-        missing_emoji_bytes = await _fetch_emoji_bytes(WARNING_EMOJI_RAW)
-
     info_lines: list[tuple] = []
     if passed:
-        # Order matters: the card grid fills row-major (index 0 = top-left,
-        # 1 = top-right, 2 = bottom-left, 3 = bottom-right), so this order
-        # lays out as:  Clan | Mastery Rank  /  Profile | Platform  —
-        # keeping Profile directly under Clan in the left column.
-        if clan_name:
-            info_lines.append(
-                ("Clan", _strip_clan_tag(clan_name), clan_emoji_bytes)
-            )
-        if mastery_rank:
-            info_lines.append(
-                (*_mastery_label_value(mastery_rank), mastery_emoji_bytes)
-            )
-        if profile_name:
-            display_profile = (
-                profile_name if profile_name.startswith("Tenno #")
-                else _strip_clan_tag(profile_name)
-            )
-            info_lines.append(
-                ("Profile", display_profile, profile_emoji_bytes)
-            )
-        if member_platform:
-            info_lines.append(
-                ("Platform", member_platform, platform_emoji_bytes)
-            )
-        if pass_missing:
-            info_lines.append(
-                ("Missing Data", ", ".join(pass_missing), missing_emoji_bytes)
-            )
+        info_lines = await _build_pass_info_lines(
+            clan_name=clan_name,
+            clan_emoji=clan_emoji,
+            member_platform=member_platform,
+            mastery_rank=mastery_rank,
+            profile_name=profile_name,
+            pass_missing=pass_missing,
+        )
 
     # Render the progress card once; both pass and incomplete embeds attach it.
     progress_png: bytes | None = None

@@ -1288,6 +1288,56 @@ class ProfileAccessGateTests(unittest.TestCase):
             )
 
 
+class BuildPassInfoLinesTests(unittest.TestCase):
+    """The pass-card info-row builder must keep the documented row-major
+    order (Clan | Mastery / Profile | Platform, then Missing Data) and omit
+    fields the member hasn't earned. _fetch_emoji_bytes is patched out so
+    the test never touches the network."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+
+    def _run(self, **kw):
+        import asyncio
+
+        async def _fake_fetch(literal):
+            return None
+
+        defaults = dict(
+            clan_name=None, clan_emoji=None, member_platform=None,
+            mastery_rank=None, profile_name=None, pass_missing=[],
+        )
+        defaults.update(kw)
+        with patch.object(self.b, "_fetch_emoji_bytes", _fake_fetch):
+            return asyncio.run(self.b._build_pass_info_lines(**defaults))
+
+    def test_full_row_order(self):
+        rows = self._run(
+            clan_name="Golden Tenno", clan_emoji="<:c:1>",
+            member_platform="PC", mastery_rank="MR 28",
+            profile_name="Tenno#1234", pass_missing=["Syndicate"],
+        )
+        self.assertEqual(
+            [r[0] for r in rows],
+            ["Clan", "Mastery Rank", "Profile", "Platform", "Missing Data"],
+        )
+
+    def test_absent_fields_are_omitted(self):
+        rows = self._run(clan_name="Golden Tenno")
+        self.assertEqual([r[0] for r in rows], ["Clan"])
+
+    def test_empty_inputs_give_no_rows(self):
+        self.assertEqual(self._run(), [])
+
+    def test_tenno_fallback_name_kept_verbatim(self):
+        # The synthetic "Tenno #NNN" fallback keeps its suffix verbatim;
+        # real handles are clan-tag stripped.
+        rows = self._run(profile_name="Tenno #465")
+        profile = [r for r in rows if r[0] == "Profile"][0]
+        self.assertEqual(profile[1], "Tenno #465")
+
+
 if __name__ == "__main__":
     unittest.main()
 
