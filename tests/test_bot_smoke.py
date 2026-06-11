@@ -831,6 +831,40 @@ class CardBackdropTests(unittest.TestCase):
         self.assertEqual(a.tobytes(), b.tobytes())
 
 
+class PagodaSilhouetteTests(unittest.TestCase):
+    """Tests for the faint pagoda watermark layered into the backdrop."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+
+    def test_returns_rgba_of_requested_size(self):
+        img = self.b._pagoda_silhouette(
+            120, 160, color=(200, 156, 102), alpha=15,
+        )
+        self.assertEqual(img.mode, "RGBA")
+        self.assertEqual(img.size, (120, 160))
+
+    def test_paints_some_pixels_but_stays_faint(self):
+        # The silhouette must actually draw (non-empty alpha) yet never
+        # exceed the requested faint cap.
+        img = self.b._pagoda_silhouette(
+            160, 220, color=(200, 156, 102), alpha=15,
+        )
+        lo, hi = img.split()[3].getextrema()
+        self.assertGreater(hi, 0, "expected some silhouette pixels")
+        self.assertLessEqual(hi, 15, "watermark must stay faint")
+
+    def test_is_deterministic(self):
+        a = self.b._pagoda_silhouette(
+            96, 130, color=(200, 156, 102), alpha=12,
+        )
+        b = self.b._pagoda_silhouette(
+            96, 130, color=(200, 156, 102), alpha=12,
+        )
+        self.assertEqual(a.tobytes(), b.tobytes())
+
+
 class HeavyJobGateTests(unittest.TestCase):
     """The render/OCR gate must bound concurrency to protect the 512MB box."""
 

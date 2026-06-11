@@ -3497,6 +3497,9 @@ _PROGRESS_TEXT = (236, 238, 240)
 _PROGRESS_MUTED = (163, 166, 170)
 _PROGRESS_ACCENT = (212, 168, 87)      # gold accent (footer / pct)
 _PROGRESS_MISSING = (236, 170, 92)     # amber — 'missing data' callout
+# Warm sandstone tint for the faint Golden Pagoda watermark in the card
+# backdrop — echoes the landmark without pulling the slate palette warm.
+_PAGODA_TINT = (200, 156, 102)
 _PROGRESS_AVATAR_SIZE = 112
 _PROGRESS_AVATAR_RING = (212, 168, 87)
 # Supersample factor: the card is laid out in logical units then rendered
@@ -3634,18 +3637,93 @@ def _vignette(
     return Image.fromarray(arr, "RGBA")
 
 
+def _pagoda_silhouette(
+    width: int, height: int, *,
+    color: tuple[int, int, int], alpha: int,
+) -> Image.Image:
+    """Return an RGBA image (``width`` × ``height``) holding a faint, clean
+    silhouette of a multi-tiered pagoda anchored to the bottom-centre,
+    transparent everywhere else.
+
+    The Golden Pagoda landmark rendered as a *solid filled* silhouette
+    (never line-art) so it reads as a tasteful architectural watermark
+    rather than scratchy ornament. Drawn supersampled then downscaled and
+    lightly blurred for smooth, anti-aliased eaves, tinted ``color`` and
+    capped at ``alpha`` so it stays subtle enough never to compete with
+    the avatar, name, or profile fields drawn on top.
+    """
+    ss = 2
+    W, H = max(1, width) * ss, max(1, height) * ss
+    mask = Image.new("L", (W, H), 0)
+    d = ImageDraw.Draw(mask)
+    cx = W * 0.5
+
+    def body(top: float, half_w: float, h: float) -> None:
+        d.rectangle(
+            [cx - half_w * W, top * H, cx + half_w * W, (top + h) * H],
+            fill=255,
+        )
+
+    def roof(top: float, half_w: float, rh: float, ridge: float) -> None:
+        hw, r = half_w * W, ridge * W
+        t, h = top * H, rh * H
+        d.polygon(
+            [
+                (cx - r, t), (cx + r, t),
+                (cx + 0.60 * hw, t + 0.60 * h),
+                (cx + 0.90 * hw, t + 0.80 * h),
+                (cx + hw, t + 0.52 * h),          # right eave flicks up
+                (cx + 0.84 * hw, t + h),
+                (cx - 0.84 * hw, t + h),
+                (cx - hw, t + 0.52 * h),          # left eave flicks up
+                (cx - 0.90 * hw, t + 0.80 * h),
+                (cx - 0.60 * hw, t + 0.60 * h),
+            ],
+            fill=255,
+        )
+
+    # Tiered tower bodies + stepped base (drawn first; roofs union over).
+    body(0.205, 0.060, 0.060)
+    body(0.375, 0.095, 0.075)
+    body(0.590, 0.150, 0.115)
+    body(0.700, 0.220, 0.105)   # base block
+    body(0.800, 0.285, 0.085)   # wider step
+    body(0.880, 0.330, 0.055)   # ground platform
+    # Upturned-eave roofs, smallest at the crown.
+    roof(0.110, 0.150, 0.100, 0.030)
+    roof(0.255, 0.245, 0.125, 0.045)
+    roof(0.440, 0.355, 0.155, 0.065)
+    # Finial: slender mast, a ring, and a crowning sphere.
+    mast = 0.018 * W
+    d.rectangle([cx - mast, 0.045 * H, cx + mast, 0.130 * H], fill=255)
+    ring = 0.040 * W
+    d.ellipse([cx - ring, 0.070 * H, cx + ring, 0.070 * H + ring], fill=255)
+    sph = 0.028 * W
+    d.ellipse([cx - sph, 0.010 * H, cx + sph, 0.010 * H + 2 * sph], fill=255)
+
+    fw, fh = max(1, width), max(1, height)
+    mask = mask.resize((fw, fh), Image.LANCZOS)
+    mask = mask.filter(ImageFilter.GaussianBlur(0.8))
+    mask = mask.point(lambda v: int(v * alpha / 255))
+    out = Image.new("RGBA", (fw, fh), (color[0], color[1], color[2], 0))
+    out.putalpha(mask)
+    return out
+
+
 def _card_backdrop(width: int, height: int) -> Image.Image:
     """Return the finished card backdrop sized ``(width, height)``.
 
     The shared backdrop for both the profile and progress cards so they
     read as one family: a slate vertical gradient lifted by a warm gold
     focal glow over the avatar zone (left), balanced by a faint Warframe
-    energy-cyan bloom bleeding from the upper-right, and finished with a
-    soft vignette that frames the corners. Built purely from smooth
-    gradients — no scattered glyphs or line-art emblems — so it carries
-    depth and a distinct Warframe palette without the noise/artifacts of
-    drawn ornament, and overlaid text/icons stay crisp. The caller
-    composites it onto the canvas through the rounded-corner mask.
+    energy-cyan bloom bleeding from the upper-right, a faint Golden Pagoda
+    silhouette settled low and right-of-centre as an architectural
+    watermark, and finished with a soft vignette that frames the corners.
+    Built from smooth gradients plus that single solid silhouette — no
+    scattered glyphs or scratchy line-art — so it carries depth and a
+    distinct identity without the noise/artifacts of drawn ornament, and
+    overlaid text/icons stay crisp. The caller composites it onto the
+    canvas through the rounded-corner mask.
     """
     panel = _vertical_gradient(
         width, height, _PROGRESS_BG_TOP, _PROGRESS_BG_BOTTOM
@@ -3656,17 +3734,30 @@ def _card_backdrop(width: int, height: int) -> Image.Image:
     panel.alpha_composite(_radial_gradient(
         width, height, center=(width * 0.12, height * 0.40),
         radius=longest * 0.62, color=_PROGRESS_ACCENT,
-        inner_alpha=30, falloff=1.7,
+        inner_alpha=22, falloff=1.7,
     ))
     # Cool energy-cyan bloom from the upper-right balances the warm glow
     # with a hint of Warframe energy.
     panel.alpha_composite(_radial_gradient(
         width, height, center=(width * 0.97, height * 0.12),
         radius=longest * 0.72, color=_PROGRESS_FILL_START,
-        inner_alpha=18, falloff=2.0,
+        inner_alpha=13, falloff=2.0,
     ))
+    # Subtle Golden Pagoda watermark — the landmark behind the name,
+    # anchored low and right-of-centre, layered over the glows but under
+    # the vignette so its edges settle into the frame. Composited through
+    # a full-size transparent layer (paste clips safely for any card
+    # height) and kept very faint so it never disrupts the avatar, name,
+    # or profile fields drawn on top.
+    pag_h = int(height * 0.72)
+    pag_w = int(pag_h * 0.95)
+    pagoda = _pagoda_silhouette(pag_w, pag_h, color=_PAGODA_TINT, alpha=15)
+    motif = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    motif.paste(pagoda, (int(width * 0.62) - pag_w // 2,
+                         height - pag_h - int(height * 0.03)))
+    panel.alpha_composite(motif)
     # Vignette frames the content and deepens the panel corners.
-    panel.alpha_composite(_vignette(width, height, strength=85))
+    panel.alpha_composite(_vignette(width, height, strength=64))
     return panel
 
 
