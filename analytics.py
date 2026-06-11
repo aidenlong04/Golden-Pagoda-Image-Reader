@@ -100,6 +100,8 @@ def _init() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
                 CREATE INDEX IF NOT EXISTS idx_events_outcome ON events(outcome);
+                CREATE INDEX IF NOT EXISTS idx_events_user_guild
+                    ON events(guild_id, user_id);
 
                 CREATE TABLE IF NOT EXISTS member_profiles (
                     guild_id INTEGER NOT NULL,

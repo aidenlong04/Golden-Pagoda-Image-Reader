@@ -249,6 +249,21 @@ def test_delete_member_data_anonymizes_events_only(analytics_module):
     assert rows[0]["outcome"] == "pass"
 
 
+def test_events_user_guild_index_exists(analytics_module):
+    a = analytics_module
+    # Touch the store so the schema (and its indexes) is initialised.
+    a.record_verification(outcome="pass", user_id=5, guild_id=2)
+    with a._connect() as conn:
+        names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+    # Backs the delete_member_data anonymise scan (guild_id, user_id).
+    assert "idx_events_user_guild" in names
+
+
 def test_delete_member_data_scoped_to_user_and_guild(analytics_module):
     a = analytics_module
     a.upsert_member_profile(guild_id=2, user_id=5, mastery_rank="MR 12")
