@@ -880,6 +880,25 @@ class CardBackdropTests(unittest.TestCase):
         self.assertGreaterEqual(info.hits, 2)
         self.assertEqual(info.misses, 1)
 
+    def test_scenic_backdrop_is_opaque_and_distinct(self):
+        # The /profile scenic variant (moon disc + mountains + pagoda +
+        # reflection) stays a fully-opaque RGBA of the requested size and
+        # differs from the plain verification backdrop.
+        plain = self.b._card_backdrop(320, 200)
+        scenic = self.b._card_backdrop(320, 200, scenic=True)
+        self.assertEqual(scenic.mode, "RGBA")
+        self.assertEqual(scenic.size, (320, 200))
+        self.assertEqual(scenic.split()[3].getextrema(), (255, 255))
+        self.assertNotEqual(
+            plain.tobytes(), scenic.tobytes(),
+            "scenic backdrop should differ from the plain one",
+        )
+
+    def test_scenic_backdrop_is_deterministic(self):
+        a = self.b._card_backdrop(300, 180, scenic=True)
+        b = self.b._card_backdrop(300, 180, scenic=True)
+        self.assertEqual(a.tobytes(), b.tobytes())
+
 
 class PagodaSilhouetteTests(unittest.TestCase):
     """Tests for the faint pagoda watermark layered into the backdrop."""

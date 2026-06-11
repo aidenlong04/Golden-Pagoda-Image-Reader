@@ -47,6 +47,9 @@ _PROGRESS_MISSING = (236, 170, 92)     # amber — 'missing data' callout
 # Warm sandstone tint for the faint Golden Pagoda watermark in the card
 # backdrop — echoes the landmark without pulling the slate palette warm.
 _PAGODA_TINT = (200, 156, 102)
+# Pale warm moon/sun disc that sits behind the pagoda in the profile
+# card's scenic backdrop (echoes the celestial disc in the reference art).
+_PAGODA_DISC = (236, 226, 198)
 _PROGRESS_AVATAR_SIZE = 112
 _PROGRESS_AVATAR_RING = (212, 168, 87)
 # Supersample factor: the card is laid out in logical units then rendered
@@ -211,42 +214,50 @@ def _pagoda_silhouette(
             fill=255,
         )
 
-    def roof(top: float, half_w: float, rh: float, ridge: float) -> None:
-        hw, r = half_w * W, ridge * W
+    def roof(top: float, half_w: float, rh: float) -> None:
+        """One gracefully upswept tier roof: a peaked ridge, a concave
+        underside, and eave tips that flick up at the corners — the
+        signature line of the reference pagodas."""
+        hw = half_w * W
         t, h = top * H, rh * H
         d.polygon(
             [
-                (cx - r, t), (cx + r, t),
-                (cx + 0.60 * hw, t + 0.60 * h),
-                (cx + 0.90 * hw, t + 0.80 * h),
-                (cx + hw, t + 0.52 * h),          # right eave flicks up
-                (cx + 0.84 * hw, t + h),
-                (cx - 0.84 * hw, t + h),
-                (cx - hw, t + 0.52 * h),          # left eave flicks up
-                (cx - 0.90 * hw, t + 0.80 * h),
-                (cx - 0.60 * hw, t + 0.60 * h),
+                (cx, t - 0.12 * h),                  # crown peak
+                (cx + 0.26 * hw, t + 0.22 * h),
+                (cx + 0.58 * hw, t + 0.46 * h),
+                (cx + 0.90 * hw, t + 0.72 * h),
+                (cx + hw, t + 0.40 * h),             # right eave sweeps up
+                (cx + 0.82 * hw, t + 0.86 * h),
+                (cx + 0.30 * hw, t + h),             # concave underside
+                (cx - 0.30 * hw, t + h),
+                (cx - 0.82 * hw, t + 0.86 * h),
+                (cx - hw, t + 0.40 * h),             # left eave sweeps up
+                (cx - 0.90 * hw, t + 0.72 * h),
+                (cx - 0.58 * hw, t + 0.46 * h),
+                (cx - 0.26 * hw, t + 0.22 * h),
             ],
             fill=255,
         )
 
-    # Tiered tower bodies + stepped base (drawn first; roofs union over).
-    body(0.205, 0.060, 0.060)
-    body(0.375, 0.095, 0.075)
-    body(0.590, 0.150, 0.115)
-    body(0.700, 0.220, 0.105)   # base block
-    body(0.800, 0.285, 0.085)   # wider step
-    body(0.880, 0.330, 0.055)   # ground platform
-    # Upturned-eave roofs, smallest at the crown.
-    roof(0.110, 0.150, 0.100, 0.030)
-    roof(0.255, 0.245, 0.125, 0.045)
-    roof(0.440, 0.355, 0.155, 0.065)
-    # Finial: slender mast, a ring, and a crowning sphere.
-    mast = 0.018 * W
-    d.rectangle([cx - mast, 0.045 * H, cx + mast, 0.130 * H], fill=255)
-    ring = 0.040 * W
-    d.ellipse([cx - ring, 0.070 * H, cx + ring, 0.070 * H + ring], fill=255)
-    sph = 0.028 * W
-    d.ellipse([cx - sph, 0.010 * H, cx + sph, 0.010 * H + 2 * sph], fill=255)
+    # Four tapering tiers (slender bodies) crowned by upswept roofs, on a
+    # two-step podium — bodies drawn first; the roofs union over them.
+    body(0.190, 0.050, 0.058)   # tier 1 (top)
+    body(0.330, 0.072, 0.062)   # tier 2
+    body(0.480, 0.100, 0.075)   # tier 3
+    body(0.650, 0.150, 0.128)   # main hall
+    body(0.775, 0.250, 0.075)   # podium step
+    body(0.850, 0.330, 0.060)   # ground platform
+    roof(0.095, 0.150, 0.095)   # crown roof
+    roof(0.235, 0.215, 0.110)
+    roof(0.395, 0.290, 0.120)
+    roof(0.560, 0.375, 0.135)   # widest, over the main hall
+    # Finial: a slender mast rising to a ring and a crowning jewel.
+    mast = 0.016 * W
+    d.rectangle([cx - mast, 0.040 * H, cx + mast, 0.120 * H], fill=255)
+    ring = 0.038 * W
+    d.ellipse([cx - ring, 0.066 * H, cx + ring, 0.066 * H + ring], fill=255)
+    sph = 0.026 * W
+    d.ellipse([cx - sph, 0.008 * H, cx + sph, 0.008 * H + 2 * sph], fill=255)
 
     fw, fh = max(1, width), max(1, height)
     mask = mask.resize((fw, fh), Image.LANCZOS)
@@ -257,17 +268,165 @@ def _pagoda_silhouette(
     return out
 
 
+def _paste_full(
+    sub: Image.Image, x: int, y: int, width: int, height: int
+) -> Image.Image:
+    """Place ``sub`` at ``(x, y)`` on a fresh full-size transparent RGBA
+    layer (paste clips safely past the edges), ready to ``alpha_composite``
+    onto the scene so partially out-of-bounds elements don't raise."""
+    layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    layer.paste(sub, (x, y))
+    return layer
+
+
+def _ramp_alpha(img: Image.Image, *, top: float, bottom: float) -> Image.Image:
+    """Return ``img`` with its alpha scaled by a vertical ramp from ``top``
+    (at the top row) to ``bottom`` (at the bottom row). Used to fade the
+    water reflection out with depth."""
+    alpha = np.asarray(img.split()[3], dtype=np.float32)
+    h = alpha.shape[0]
+    ramp = np.linspace(top, bottom, h, dtype=np.float32)[:, None]
+    faded = np.clip(alpha * ramp, 0.0, 255.0).astype(np.uint8)
+    out = img.copy()
+    out.putalpha(Image.fromarray(faded, "L"))
+    return out
+
+
+def _mountain_band(
+    width: int, height: int, *, base_y: int,
+    ridges: list[tuple[float, tuple[int, int, int], int]],
+) -> Image.Image:
+    """Return faint, layered mountain ridgelines sitting on ``base_y``.
+
+    Each ``ridges`` entry is ``(peak_height_frac, color, alpha)`` — back
+    ridges taller and fainter, front ridges lower and a touch stronger, so
+    the band reads with depth. Kept soft (blurred, low alpha) so it frames
+    the pagoda base without competing with the card content above it.
+    """
+    out = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    # Fixed, irregular ridge profile (deterministic — no RNG so the cached
+    # backdrop stays byte-stable across renders).
+    xs = (0.0, 0.16, 0.33, 0.52, 0.70, 0.86, 1.0)
+    hs = (0.32, 0.84, 0.52, 1.0, 0.46, 0.74, 0.28)
+    for peak_frac, color, alpha in ridges:
+        peak = int(height * peak_frac)
+        mask = Image.new("L", (width, height), 0)
+        d = ImageDraw.Draw(mask)
+        pts = [(0, base_y)]
+        pts += [
+            (int(width * xf), base_y - int(peak * hf))
+            for xf, hf in zip(xs, hs)
+        ]
+        pts += [(width, base_y), (width, height), (0, height)]
+        d.polygon(pts, fill=alpha)
+        mask = mask.filter(ImageFilter.GaussianBlur(1.0))
+        tint = Image.new("RGBA", (width, height), tuple(color) + (0,))
+        tint.putalpha(mask)
+        out.alpha_composite(tint)
+    return out
+
+
+def _pagoda_scene(width: int, height: int) -> Image.Image:
+    """Return the faint scenic motif for the /profile card: a soft moon
+    disc, layered mountain ridges, the multi-tiered pagoda, and its water
+    reflection — all kept subtle so overlaid text/avatar stay crisp.
+
+    Composed lower-right so the avatar (left) and the headline stay clear,
+    and returned as a full-size RGBA layer the backdrop composites in.
+    """
+    layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    pag_h = int(height * 0.72)
+    pag_w = max(1, int(pag_h * 0.92))
+    anchor_cx = int(width * 0.66)
+    waterline = height - int(height * 0.05)
+    pag_top = waterline - pag_h
+    px = anchor_cx - pag_w // 2
+
+    # Moon disc behind the upper tiers: a soft halo + a flatter, defined
+    # disc, both faint and pale-warm.
+    disc_cx = anchor_cx - int(pag_w * 0.02)
+    disc_cy = pag_top + int(pag_h * 0.20)
+    disc_r = pag_w * 0.46
+    layer.alpha_composite(_radial_gradient(
+        width, height, center=(disc_cx, disc_cy),
+        radius=disc_r * 2.2, color=_PAGODA_DISC, inner_alpha=12, falloff=2.4,
+    ))
+    layer.alpha_composite(_radial_gradient(
+        width, height, center=(disc_cx, disc_cy),
+        radius=disc_r, color=_PAGODA_DISC, inner_alpha=30, falloff=0.5,
+    ))
+
+    # Soft cloud streaks drifting across the moon (blurred into bands).
+    clouds = Image.new("L", (width, height), 0)
+    dc = ImageDraw.Draw(clouds)
+    band_w = max(2, int(height * 0.030))
+    for fy, x0f, x1f, a in (
+        (-0.34, 0.50, 0.86, 16),
+        (-0.06, 0.45, 0.90, 22),
+        (0.22, 0.53, 0.82, 13),
+    ):
+        yy = disc_cy + int(disc_r * fy)
+        dc.line(
+            [(int(width * x0f), yy), (int(width * x1f), yy)],
+            fill=a, width=band_w,
+        )
+    clouds = clouds.filter(ImageFilter.GaussianBlur(max(1, int(height * 0.02))))
+    cloud_layer = Image.new("RGBA", (width, height), _PAGODA_DISC + (0,))
+    cloud_layer.putalpha(clouds)
+    layer.alpha_composite(cloud_layer)
+
+    # Layered mountain ridges resting on the waterline.
+    layer.alpha_composite(_mountain_band(
+        width, height, base_y=waterline,
+        ridges=[
+            (0.36, (74, 82, 96), 14),   # back ridge: taller, faint
+            (0.22, (54, 60, 73), 19),   # front ridge: lower, stronger
+        ],
+    ))
+
+    # Pagoda + its water reflection (flipped, faded with depth).
+    pag = _pagoda_silhouette(pag_w, pag_h, color=_PAGODA_TINT, alpha=16)
+    layer.alpha_composite(_paste_full(pag, px, pag_top, width, height))
+    refl = _ramp_alpha(
+        pag.transpose(Image.FLIP_TOP_BOTTOM), top=0.42, bottom=0.0
+    )
+    layer.alpha_composite(_paste_full(refl, px, waterline, width, height))
+
+    # A few soft water-shimmer lines below the waterline.
+    sh = Image.new("L", (width, height), 0)
+    ds = ImageDraw.Draw(sh)
+    for i, fy in enumerate((0.015, 0.038, 0.063)):
+        yy = waterline + int(height * fy)
+        ds.line(
+            [(int(width * 0.40), yy), (int(width * 0.92), yy)],
+            fill=max(3, 11 - i * 3), width=1,
+        )
+    sh = sh.filter(ImageFilter.GaussianBlur(0.9))
+    shimmer = Image.new("RGBA", (width, height), _PAGODA_DISC + (0,))
+    shimmer.putalpha(sh)
+    layer.alpha_composite(shimmer)
+    return layer
+
+
 @functools.lru_cache(maxsize=8)
-def _card_backdrop_cached(width: int, height: int) -> Image.Image:
+def _card_backdrop_cached(
+    width: int, height: int, scenic: bool = False
+) -> Image.Image:
     """Build the finished card backdrop sized ``(width, height)``.
 
-    Memoised because the backdrop is deterministic per ``(width, height)``
-    yet expensive — it allocates several full-size numpy layers and draws
-    the supersampled pagoda silhouette. Card dimensions repeat across
-    renders (the progress card is a fixed size; profile heights cluster on
-    a few values), so a small LRU keeps the heavy build off the hot path
-    on the 512MB box. ``_card_backdrop`` hands callers a defensive copy so
-    this shared instance is never mutated.
+    Memoised because the backdrop is deterministic per
+    ``(width, height, scenic)`` yet expensive — it allocates several
+    full-size numpy layers and draws the supersampled pagoda silhouette.
+    Card dimensions repeat across renders (the progress card is a fixed
+    size; profile heights cluster on a few values), so a small LRU keeps
+    the heavy build off the hot path on the 512MB box. ``_card_backdrop``
+    hands callers a defensive copy so this shared instance is never
+    mutated.
+
+    When ``scenic`` is set (the /profile card) the lone pagoda watermark
+    is replaced by a fuller, still-faint scene — a soft moon disc, layered
+    mountain ridges, the multi-tiered pagoda, and its water reflection.
+    The verification card keeps the simpler single-silhouette watermark.
     """
     panel = _vertical_gradient(
         width, height, _PROGRESS_BG_TOP, _PROGRESS_BG_BOTTOM
@@ -287,25 +446,30 @@ def _card_backdrop_cached(width: int, height: int) -> Image.Image:
         radius=longest * 0.72, color=_PROGRESS_FILL_START,
         inner_alpha=13, falloff=2.0,
     ))
-    # Subtle Golden Pagoda watermark — the landmark behind the name,
-    # anchored low and right-of-centre, layered over the glows but under
-    # the vignette so its edges settle into the frame. Composited through
-    # a full-size transparent layer (paste clips safely for any card
-    # height) and kept very faint so it never disrupts the avatar, name,
-    # or profile fields drawn on top.
-    pag_h = int(height * 0.72)
-    pag_w = int(pag_h * 0.95)
-    pagoda = _pagoda_silhouette(pag_w, pag_h, color=_PAGODA_TINT, alpha=15)
-    motif = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    motif.paste(pagoda, (int(width * 0.62) - pag_w // 2,
-                         height - pag_h - int(height * 0.03)))
-    panel.alpha_composite(motif)
+    if scenic:
+        # Profile card: the full faint pagoda scene (disc + mountains +
+        # pagoda + reflection), layered over the glows, under the vignette.
+        panel.alpha_composite(_pagoda_scene(width, height))
+    else:
+        # Verification card: a single subtle Golden Pagoda watermark behind
+        # the name, anchored low and right-of-centre. Composited through a
+        # full-size transparent layer (paste clips safely for any card
+        # height) and kept very faint so it never disrupts the content.
+        pag_h = int(height * 0.72)
+        pag_w = int(pag_h * 0.95)
+        pagoda = _pagoda_silhouette(pag_w, pag_h, color=_PAGODA_TINT, alpha=15)
+        motif = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        motif.paste(pagoda, (int(width * 0.62) - pag_w // 2,
+                             height - pag_h - int(height * 0.03)))
+        panel.alpha_composite(motif)
     # Vignette frames the content and deepens the panel corners.
     panel.alpha_composite(_vignette(width, height, strength=64))
     return panel
 
 
-def _card_backdrop(width: int, height: int) -> Image.Image:
+def _card_backdrop(
+    width: int, height: int, scenic: bool = False
+) -> Image.Image:
     """Return the shared card backdrop sized ``(width, height)``.
 
     The shared backdrop for both the profile and progress cards so they
@@ -321,9 +485,10 @@ def _card_backdrop(width: int, height: int) -> Image.Image:
     canvas through the rounded-corner mask.
 
     Returns a fresh copy of the memoised build (see ``_card_backdrop_cached``)
-    so callers may safely composite onto it.
+    so callers may safely composite onto it. ``scenic`` selects the fuller
+    pagoda scene used by the /profile card.
     """
-    return _card_backdrop_cached(width, height).copy()
+    return _card_backdrop_cached(width, height, scenic).copy()
 
 
 def _circular_avatar(
@@ -1039,12 +1204,12 @@ def _render_profile_card_png(
 
     W, H = sc(_PROGRESS_CARD_W), sc(card_h)
     canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    # Shared slate backdrop: a smooth gradient lifted by soft gold/energy
-    # glows and a framing vignette (see _card_backdrop) — no scattered
-    # glyphs or line-art emblems, so the panel stays clean behind the
-    # content. Composited through the rounded-corner mask so the corners
-    # stay clean.
-    panel = _card_backdrop(W, H)
+    # Scenic slate backdrop (profile variant): the smooth gold/energy glows
+    # plus a faint pagoda scene — moon disc, mountain ridges, the
+    # multi-tiered pagoda and its water reflection — kept subtle behind the
+    # content, framed by a vignette. Composited through the rounded-corner
+    # mask so the corners stay clean.
+    panel = _card_backdrop(W, H, scenic=True)
     panel_mask = _rounded_mask(W, H, sc(_PROGRESS_RADIUS))
     canvas.paste(panel, (0, 0), panel_mask)
     ImageDraw.Draw(canvas).rounded_rectangle(
