@@ -2987,23 +2987,44 @@ _STATUS_PAGES: list[tuple[str, str, _StatusBuilder | None]] = [
 _PAGES_NEEDING_SNAPSHOT = frozenset({"ocr", "stats"})
 
 
-def _status_nav_row(page: int) -> dict:
-    last = len(_STATUS_PAGES) - 1
+def _pagination_nav_row(
+    total: int,
+    page: int,
+    *,
+    prev_id: str,
+    noop_id: str,
+    next_id: str,
+    refresh_id: str,
+) -> dict:
+    """Shared Prev / page-indicator / Next / Refresh nav row for the
+    paginated /status and /manage panels. Callers supply the four button
+    custom_ids (the only thing that differs between the two panels)."""
+    last = total - 1
     return {
         "type": 1,
         "components": [
             {"type": 2, "style": 2, "label": "\u25C0 Prev",
-             "custom_id": f"status:{page - 1}", "disabled": page == 0},
+             "custom_id": prev_id, "disabled": page == 0},
             {"type": 2, "style": 2,
-             "label": f"{page + 1}/{len(_STATUS_PAGES)}",
-             "custom_id": "status:noop", "disabled": True},
+             "label": f"{page + 1}/{total}",
+             "custom_id": noop_id, "disabled": True},
             {"type": 2, "style": 2, "label": "Next \u25B6",
-             "custom_id": f"status:{page + 1}", "disabled": page >= last},
+             "custom_id": next_id, "disabled": page >= last},
             {"type": 2, "style": 1,
              "emoji": {"name": "\U0001F504"},
-             "custom_id": f"status:{page}"},
+             "custom_id": refresh_id},
         ],
     }
+
+
+def _status_nav_row(page: int) -> dict:
+    return _pagination_nav_row(
+        len(_STATUS_PAGES), page,
+        prev_id=f"status:{page - 1}",
+        noop_id="status:noop",
+        next_id=f"status:{page + 1}",
+        refresh_id=f"status:{page}",
+    )
 
 
 def _status_page_needs_snapshot(page: int) -> bool:
@@ -3182,24 +3203,13 @@ async def _manage_snapshot(guild_id: int, user_id: int) -> dict:
 
 
 def _manage_nav_row(member_id: int, page: int) -> dict:
-    last = len(_MANAGE_PAGES) - 1
-    return {
-        "type": 1,
-        "components": [
-            {"type": 2, "style": 2, "label": "\u25C0 Prev",
-             "custom_id": f"manage:{member_id}:p:{page - 1}",
-             "disabled": page == 0},
-            {"type": 2, "style": 2,
-             "label": f"{page + 1}/{len(_MANAGE_PAGES)}",
-             "custom_id": "manage:noop", "disabled": True},
-            {"type": 2, "style": 2, "label": "Next \u25B6",
-             "custom_id": f"manage:{member_id}:p:{page + 1}",
-             "disabled": page >= last},
-            {"type": 2, "style": 1,
-             "emoji": {"name": "\U0001F504"},
-             "custom_id": f"manage:{member_id}:p:{page}"},
-        ],
-    }
+    return _pagination_nav_row(
+        len(_MANAGE_PAGES), page,
+        prev_id=f"manage:{member_id}:p:{page - 1}",
+        noop_id="manage:noop",
+        next_id=f"manage:{member_id}:p:{page + 1}",
+        refresh_id=f"manage:{member_id}:p:{page}",
+    )
 
 
 def _manage_components(
