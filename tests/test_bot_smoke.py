@@ -9,7 +9,7 @@ signature-drift bugs at test time instead of runtime.
 from __future__ import annotations
 
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import discord
 
@@ -905,6 +905,366 @@ class HeavyJobGateTests(unittest.TestCase):
         import asyncio
         out = asyncio.run(self.b._run_heavy(lambda a, b: a + b, 2, 3))
         self.assertEqual(out, 5)
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 characterization tests (regression oracle).
+#
+# These lock the CURRENT exact output shapes of the V2 component builders,
+# the status/manage nav rows, the custom_id routing contract that
+# on_interaction dispatches on, the .env rewrite skeleton, and the /profile
+# access gates -- BEFORE any refactor touches them. They are intentionally
+# strict so a behaviour-changing refactor fails loudly.
+# ---------------------------------------------------------------------------
+
+
+class IncompleteAndNickStructureTests(unittest.TestCase):
+    """Exact V2 shape of the incomplete / nickname / call-sign builders."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+
+    def test_incomplete_components_minimal_is_single_container(self):
+        # No progress card, no image, no links -> just the gold-accent
+        # incomplete container at the top level.
+        result = self.b._incomplete_components(reason="Missing Platform role.")
+        self.assertEqual(len(result), 1)
+        container = result[0]
+        self.assertEqual(container["type"], 17)
+        self.assertEqual(container["accent_color"], self.b.ACCENT_INCOMPLETE)
+        heading = container["components"][0]
+        self.assertEqual(heading["type"], 10)
+        self.assertIn("Please select the missing roles", heading["content"])
+        self.assertIn("Missing Platform role.", heading["content"])
+
+    def test_incomplete_components_with_card_puts_image_on_top(self):
+        result = self.b._incomplete_components(
+            reason="Missing Platform role.",
+            progress_attachment="progress.png",
+            link_buttons=[("Help", "https://discord.com/channels/1/2")],
+        )
+        # Top-level media gallery first, container last.
+        self.assertEqual(result[0]["type"], 12)
+        self.assertEqual(
+            result[0]["items"][0]["media"]["url"],
+            "attachment://progress.png",
+        )
+        container = result[-1]
+        self.assertEqual(container["type"], 17)
+        self.assertEqual(container["accent_color"], self.b.ACCENT_INCOMPLETE)
+        # The Help link button lives inside the container as a style-5 button.
+        link_buttons = [
+            btn
+            for child in container["components"]
+            if child.get("type") == 1
+            for btn in child.get("components", [])
+            if btn.get("style") == 5
+        ]
+        self.assertTrue(link_buttons, "expected a link button in the container")
+        self.assertEqual(
+            link_buttons[0]["url"], "https://discord.com/channels/1/2"
+        )
+
+    def test_nickname_prompt_components_structure(self):
+        result = self.b._nickname_prompt_components(
+            "GoldenTenno", 4242, current_nick="oldnick",
+        )
+        self.assertEqual(len(result), 1)
+        container = result[0]
+        self.assertEqual(container["type"], 17)
+        self.assertEqual(container["accent_color"], self.b._NICK_PROMPT_ACCENT)
+        rows = [c for c in container["components"] if c.get("type") == 1]
+        self.assertEqual(len(rows), 1, "expected exactly one action row")
+        buttons = rows[0]["components"]
+        self.assertLessEqual(len(buttons), 5)
+        self.assertTrue(
+            all(str(b["custom_id"]).startswith("nick:") for b in buttons)
+        )
+
+    def test_callsign_buttons_empty_without_suggestion(self):
+        caption, buttons = self.b._callsign_buttons(None, None, "")
+        self.assertEqual(caption, [])
+        self.assertEqual(buttons, [])
+
+    def test_callsign_buttons_yes_no_custom_id_prefixes(self):
+        caption, buttons = self.b._callsign_buttons("GoldenTenno", 4242, "old")
+        self.assertTrue(caption, "expected a caption when a name is offered")
+        self.assertEqual(len(buttons), 2)
+        ids = [b["custom_id"] for b in buttons]
+        # Order is (server-nick "no", in-game "yes").
+        self.assertTrue(ids[0].startswith("nick:n:4242:"))
+        self.assertTrue(ids[1].startswith("nick:y:4242:"))
+
+
+class StatusNavContractTests(unittest.TestCase):
+    """The /status nav row + outer container contract (guards on_interaction
+    routing + the shared-pagination refactor)."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+        self._orig_client = getattr(bot_module, "client", None)
+        mock_client = Mock()
+        mock_client.user = Mock(id=12345)
+        mock_client.latency = 0.05
+        mock_client.guilds = []
+        bot_module.client = mock_client
+
+    def tearDown(self):
+        if self._orig_client is not None:
+            self.b.client = self._orig_client
+
+    def test_nav_row_all_custom_ids_use_status_prefix(self):
+        for page in range(len(self.b._STATUS_PAGES)):
+            row = self.b._status_nav_row(page)
+            self.assertEqual(row["type"], 1)
+            buttons = row["components"]
+            self.assertEqual(len(buttons), 4)
+            for btn in buttons:
+                self.assertTrue(
+                    str(btn["custom_id"]).startswith("status:"),
+                    f"nav button custom_id must route to status: {btn}",
+                )
+            # Prev disabled on the first page, Next disabled on the last.
+            self.assertEqual(buttons[0]["disabled"], page == 0)
+            self.assertEqual(
+                buttons[2]["disabled"], page >= len(self.b._STATUS_PAGES) - 1
+            )
+            self.assertEqual(
+                buttons[1]["label"], f"{page + 1}/{len(self.b._STATUS_PAGES)}"
+            )
+
+    def test_status_components_outer_shape(self):
+        mock_interaction = Mock(spec=discord.Interaction)
+        mock_interaction.guild = None
+        for page in (0, 1):  # bot (builder) + roles (inline, no builder)
+            result = self.b._status_components(mock_interaction, page)
+            self.assertEqual(len(result), 2)
+            self.assertEqual(result[0]["type"], 10)
+            self.assertTrue(result[0]["content"].startswith("### "))
+            container = result[1]
+            self.assertEqual(container["type"], 17)
+            self.assertEqual(container["accent_color"], self.b.ACCENT_PASS)
+            # The nav row is the LAST child of the container.
+            self.assertEqual(container["components"][-1]["type"], 1)
+
+    def test_status_page_clamp_is_stable(self):
+        # Out-of-range pages clamp to the first / last page; the snapshot
+        # predicate (same clamp logic) is the cheapest deterministic probe.
+        self.assertEqual(
+            self.b._status_page_needs_snapshot(-5),
+            self.b._status_page_needs_snapshot(0),
+        )
+        self.assertEqual(
+            self.b._status_page_needs_snapshot(9999),
+            self.b._status_page_needs_snapshot(len(self.b._STATUS_PAGES) - 1),
+        )
+
+
+class ManageComponentsCharacterizationTests(unittest.TestCase):
+    """Exact V2 shape of every /manage page + its action buttons."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+        self.member = Mock()
+        self.member.display_name = "TestUser"
+        self.snap = {
+            "profile": {
+                "in_game_name": "GoldenTenno",
+                "mastery_rank": "MR 28",
+                "platform": "PC",
+                "clan": "Golden Tenno",
+                "last_verified_ts": 1700000000,
+            },
+            "titles": [
+                {"title": "boot licker", "reason": "",
+                 "awarded_ts": 1700000000},
+            ],
+        }
+
+    def _ids(self, result):
+        return [
+            btn.get("custom_id")
+            for child in result[1]["components"]
+            if child.get("type") == 1
+            for btn in child.get("components", [])
+        ]
+
+    def test_outer_shape_and_header(self):
+        result = self.b._manage_components(42, self.member, 0, self.snap)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["type"], 10)
+        self.assertTrue(result[0]["content"].startswith("### "))
+        self.assertEqual(result[1]["type"], 17)
+        self.assertEqual(result[1]["accent_color"], self.b.ACCENT_PASS)
+
+    def test_overview_has_update_button_when_member_present(self):
+        result = self.b._manage_components(42, self.member, 0, self.snap)
+        self.assertIn("manage:42:update", self._ids(result))
+
+    def test_overview_omits_update_button_when_member_absent(self):
+        result = self.b._manage_components(42, None, 0, self.snap)
+        self.assertNotIn("manage:42:update", self._ids(result))
+
+    def test_data_page_default_offers_clear(self):
+        result = self.b._manage_components(42, self.member, 2, self.snap)
+        self.assertIn("manage:42:clear", self._ids(result))
+
+    def test_data_page_confirm_is_fail_accent_with_confirm_cancel(self):
+        result = self.b._manage_components(
+            42, self.member, 2, self.snap, confirm_clear=True,
+        )
+        self.assertEqual(result[1]["accent_color"], self.b.ACCENT_FAIL)
+        ids = self._ids(result)
+        self.assertIn("manage:42:clearok", ids)
+        self.assertIn("manage:42:p:2", ids)  # Cancel returns to the data page.
+
+    def test_data_page_cleared_shows_no_action_buttons(self):
+        cleared = {"profiles": 1, "titles": 1, "events_anonymized": 3}
+        result = self.b._manage_components(
+            42, self.member, 2, self.snap, cleared=cleared,
+        )
+        ids = self._ids(result)
+        self.assertNotIn("manage:42:clear", ids)
+        self.assertNotIn("manage:42:clearok", ids)
+
+    def test_data_page_empty_store_has_no_clear(self):
+        empty = {"profile": None, "titles": []}
+        result = self.b._manage_components(42, self.member, 2, empty)
+        self.assertNotIn("manage:42:clear", self._ids(result))
+
+    def test_all_nav_custom_ids_use_manage_prefix(self):
+        for page in range(len(self.b._MANAGE_PAGES)):
+            row = self.b._manage_nav_row(7, page)
+            self.assertEqual(row["type"], 1)
+            for btn in row["components"]:
+                self.assertTrue(
+                    str(btn["custom_id"]).startswith("manage:"),
+                    f"nav button must route to manage: {btn}",
+                )
+
+    def test_page_index_clamps(self):
+        low = self.b._manage_components(42, self.member, -3, self.snap)
+        high = self.b._manage_components(42, self.member, 99, self.snap)
+        self.assertIn("Overview", low[0]["content"])
+        self.assertIn("Data", high[0]["content"])
+
+
+class EnvRewriteRoundtripTests(unittest.TestCase):
+    """The shared .env read->replace->append skeleton (Phase 4 moves this to
+    envstore.py; the roundtrip locks its behaviour first)."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+        import tempfile
+        import pathlib
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.env_path = pathlib.Path(self._dir.name) / "config.env"
+        self._orig = self.b.ENV_FILE_PATH
+        self.b.ENV_FILE_PATH = self.env_path
+
+    def tearDown(self):
+        self.b.ENV_FILE_PATH = self._orig
+
+    def test_returns_false_when_file_missing(self):
+        self.assertFalse(
+            self.b._rewrite_env_file(lambda line: None, lambda: [])
+        )
+
+    def test_replace_existing_line(self):
+        self.env_path.write_text("A=1\nB=2\n")
+        ok = self.b._rewrite_env_file(
+            lambda line: "A=9" if line == "A=1" else None,
+            lambda: [],
+        )
+        self.assertTrue(ok)
+        self.assertEqual(self.env_path.read_text(), "A=9\nB=2\n")
+
+    def test_append_missing_line_after_blank_separator(self):
+        self.env_path.write_text("A=1\n")
+        ok = self.b._rewrite_env_file(lambda line: None, lambda: ["C=3"])
+        self.assertTrue(ok)
+        self.assertEqual(self.env_path.read_text(), "A=1\n\nC=3\n")
+
+    def test_atomic_write_leaves_no_tmp_file(self):
+        self.env_path.write_text("A=1\n")
+        self.b._rewrite_env_file(lambda line: None, lambda: ["C=3"])
+        tmp = self.env_path.with_suffix(self.env_path.suffix + ".tmp")
+        self.assertFalse(tmp.exists(), "atomic write must remove the .tmp file")
+
+    def test_update_env_id_list_replaces_then_appends(self):
+        self.env_path.write_text("FOO_IDS=9\nBAR=1\n")
+        self.assertTrue(self.b._update_env_id_list("FOO_IDS", [1, 2, 3]))
+        self.assertEqual(
+            self.env_path.read_text(), "FOO_IDS=1,2,3\nBAR=1\n"
+        )
+        # Missing key path appends after a blank separator.
+        self.env_path.write_text("BAR=1\n")
+        self.assertTrue(self.b._update_env_id_list("NEW_IDS", [4, 5]))
+        self.assertEqual(self.env_path.read_text(), "BAR=1\n\nNEW_IDS=4,5\n")
+
+
+class ProfileAccessGateTests(unittest.TestCase):
+    """Truth table for the two /profile gates (Phase 2 merges them into one
+    _can_use_command helper; this locks the current semantics)."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+
+    def _member(self, *, manage_guild, role_ids):
+        m = Mock()
+        m.guild_permissions = Mock(manage_guild=manage_guild)
+        m.roles = [Mock(id=r) for r in role_ids]
+        return m
+
+    def test_profile_open_when_no_access_role_configured(self):
+        with patch.object(self.b, "PROFILE_ACCESS_ROLE_ID", 0):
+            self.assertTrue(
+                self.b._can_use_profile(
+                    self._member(manage_guild=False, role_ids=[])
+                )
+            )
+
+    def test_profile_requires_access_role_or_manager(self):
+        with patch.object(self.b, "PROFILE_ACCESS_ROLE_ID", 555):
+            self.assertTrue(  # manager always allowed
+                self.b._can_use_profile(
+                    self._member(manage_guild=True, role_ids=[])
+                )
+            )
+            self.assertTrue(  # has the access role
+                self.b._can_use_profile(
+                    self._member(manage_guild=False, role_ids=[555])
+                )
+            )
+            self.assertFalse(  # neither
+                self.b._can_use_profile(
+                    self._member(manage_guild=False, role_ids=[1, 2])
+                )
+            )
+
+    def test_profile_options_require_options_role_or_manager(self):
+        with patch.object(self.b, "PROFILE_OPTIONS_ROLE_IDS", [777]):
+            self.assertTrue(
+                self.b._can_use_profile_options(
+                    self._member(manage_guild=True, role_ids=[])
+                )
+            )
+            self.assertTrue(
+                self.b._can_use_profile_options(
+                    self._member(manage_guild=False, role_ids=[777])
+                )
+            )
+            self.assertFalse(
+                self.b._can_use_profile_options(
+                    self._member(manage_guild=False, role_ids=[1])
+                )
+            )
 
 
 if __name__ == "__main__":
