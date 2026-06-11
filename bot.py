@@ -13,7 +13,7 @@ import time
 import warnings
 from collections import deque
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 from pathlib import Path
 from typing import NamedTuple
@@ -212,17 +212,6 @@ REPLY_TTL_SECONDS = _int_env("REPLY_TTL_SECONDS", 180)
 # Role removed from a member on successful verification (e.g. an "unverified"
 # gate role). Set to 0 to disable.
 VERIFY_REMOVE_ROLE_ID = _int_env("VERIFY_REMOVE_ROLE_ID", 1459326361968574555)
-
-# --- TEMPORARY (remove after the deadline below) ---------------------------
-# Event role granted on a successful /profile "Verify Profile Data" screenshot
-# self-verification, until 2026-06-09 23:00 UTC. After the deadline the grant
-# becomes a no-op; delete this block and its use in
-# _ScreenshotVerifyModal.on_submit.
-_TEMP_VERIFY_EVENT_ROLE_ID = 1513035847912657056
-_TEMP_VERIFY_EVENT_DEADLINE = datetime(
-    2026, 6, 9, 23, 0, tzinfo=timezone.utc
-).timestamp()
-# ---------------------------------------------------------------------------
 
 # Catch-up scan: process missed messages from recent history on startup.
 CATCHUP_LOOKBACK_HOURS = _int_env("CATCHUP_LOOKBACK_HOURS", 24)
@@ -5142,15 +5131,6 @@ class _ScreenshotVerifyModal(discord.ui.Modal):
             content_type=attachment.content_type or "image/png",
         )
 
-        # TEMPORARY (remove after 2026-06-09 23:00 UTC): grant the event role
-        # on a successful screenshot self-verification, until the deadline.
-        if summary and time.time() < _TEMP_VERIFY_EVENT_DEADLINE:
-            event_role = member.guild.get_role(_TEMP_VERIFY_EVENT_ROLE_ID)
-            if event_role is not None:
-                await _add_role(
-                    member, event_role, "Verify Profile Data event role"
-                )
-
         # Re-fetch so the re-render reflects freshly assigned roles (the
         # cached member.roles lags the role-add gateway event).
         with contextlib.suppress(discord.HTTPException):
@@ -5892,9 +5872,6 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     data = interaction.data or {}
     custom_id = str(data.get("custom_id", ""))
 
-    # Backwards-compatible: accept legacy "stats:N" buttons too.
-    if custom_id.startswith("stats:"):
-        custom_id = "status:" + custom_id.split(":", 1)[1]
     if custom_id.startswith("nick:"):
         await _handle_nick_interaction(interaction, custom_id)
         return
