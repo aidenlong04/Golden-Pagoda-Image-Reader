@@ -146,3 +146,38 @@ def find_clan_slot(slots: Iterable["ClanSlot"], clan_name: str) -> "ClanSlot | N
         if candidate == needle:
             return slot
     return None
+
+
+def _format_mastery_display(value: str | None) -> str:
+    """Normalize a stored/OCR'd mastery rank to a card-ready value.
+
+    The label on the card is already "Mastery Rank", so the value drops
+    the redundant prefix: ``"MR 28" -> "28"``. Legendary ranks expand:
+    ``"LR 3" -> "Legendary 3"``. Anything else (e.g. "Unranked") passes
+    through unchanged. Shared by the verify card, the /profile gatherer,
+    and the mastery editor so the formatting lives in one place.
+    """
+    if not value:
+        return ""
+    upper = value.upper()
+    if upper.startswith("MR "):
+        return value[3:].strip()
+    if upper.startswith("LR "):
+        return f"Legendary {value[3:].strip()}"
+    return value
+
+
+def _mastery_label_value(value: str | None) -> tuple[str, str]:
+    """Return the ``(label, display_value)`` for a member's mastery field.
+
+    Legendary ranks surface under a "Legendary Rank" label carrying just
+    the number/range (``"LR 3" -> ("Legendary Rank", "3")``,
+    ``"LR 1-7" -> ("Legendary Rank", "1-7")``); every other rank keeps the
+    "Mastery Rank" label (``"MR 28" -> ("Mastery Rank", "28")``). Accepts a
+    raw stored rank, a coarse bucket role name, or an already-formatted
+    display value, so every card labels the field consistently.
+    """
+    disp = _format_mastery_display(value)
+    if disp.startswith("Legendary"):
+        return "Legendary Rank", disp[len("Legendary"):].strip() or disp
+    return "Mastery Rank", disp
