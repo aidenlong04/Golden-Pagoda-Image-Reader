@@ -56,6 +56,7 @@ from logic import (
     parse_profile_name,
 )
 import analytics
+from config import _csv, _csv_ids, _float_env, _int_env
 from envstore import (
     ENV_FILE_PATH,
     PLATFORM_ROLE_ID_ENV_KEYS,
@@ -139,29 +140,6 @@ for _name in ("discord.client", "discord.voice_client"):
 # ---------- Configuration ---------------------------------------------------
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
-
-
-def _int_env(name: str, default: int = 0) -> int:
-    raw = (os.getenv(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        # base=0 accepts decimal, 0x hex, 0o octal, 0b binary literals.
-        return int(raw, 0) if raw.lower().startswith(("0x", "0o", "0b")) else int(raw)
-    except ValueError:
-        logger.warning("Env var %s=%r is not a valid integer; using %d", name, raw, default)
-        return default
-
-
-def _float_env(name: str, default: float = 0.0) -> float:
-    raw = (os.getenv(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        logger.warning("Env var %s=%r is not a valid float; using %s", name, raw, default)
-        return default
 
 
 TARGET_CHANNEL_ID = _int_env("TARGET_CHANNEL_ID")
@@ -270,16 +248,6 @@ CATCHUP_DELAY_SECONDS = _float_env("CATCHUP_DELAY_SECONDS", 1.0)
 # against each guild's role list and the IDs are written back to
 # MR_ROLE_IDS / SYNDICATE_ROLE_IDS in .env. The _IDS vars are still
 # the source of truth at runtime (and can be hand-edited as a fallback).
-def _csv(name: str, default: str = "") -> list[str]:
-    return [
-        x.strip() for x in (os.getenv(name) or default).split(",") if x.strip()
-    ]
-
-
-def _csv_ids(name: str) -> list[int]:
-    return [int(x) for x in _csv(name) if x.isdigit()]
-
-
 MR_ROLE_NAMES: list[str] = _csv(
     "MR_ROLE_NAMES",
     "MR 1-10,MR 11-15,MR 16-22,MR 22-29,MR 30,LR 1-7",
