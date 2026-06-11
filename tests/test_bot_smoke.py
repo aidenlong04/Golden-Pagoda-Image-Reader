@@ -1203,22 +1203,26 @@ class ManageComponentsCharacterizationTests(unittest.TestCase):
 
 
 class EnvRewriteRoundtripTests(unittest.TestCase):
-    """The shared .env read->replace->append skeleton (Phase 4 moves this to
-    envstore.py; the roundtrip locks its behaviour first)."""
+    """The shared .env read->replace->append skeleton (now in envstore.py,
+    re-exported via bot.*). The roundtrip locks its behaviour."""
 
     def setUp(self):
         import bot as bot_module
+        import envstore as envstore_module
         self.b = bot_module
+        self.envstore = envstore_module
         import tempfile
         import pathlib
         self._dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._dir.cleanup)
         self.env_path = pathlib.Path(self._dir.name) / "config.env"
-        self._orig = self.b.ENV_FILE_PATH
-        self.b.ENV_FILE_PATH = self.env_path
+        # The env writers read envstore.ENV_FILE_PATH from their own module
+        # namespace, so patch it there (bot re-exports the functions verbatim).
+        self._orig = self.envstore.ENV_FILE_PATH
+        self.envstore.ENV_FILE_PATH = self.env_path
 
     def tearDown(self):
-        self.b.ENV_FILE_PATH = self._orig
+        self.envstore.ENV_FILE_PATH = self._orig
 
     def test_returns_false_when_file_missing(self):
         self.assertFalse(
