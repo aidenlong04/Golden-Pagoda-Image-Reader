@@ -381,10 +381,10 @@ def _pagoda_scene(width: int, height: int) -> Image.Image:
     disc_cy = int(disc_r) + max(1, int(height * 0.08))
     layer.alpha_composite(_radial_gradient(
         width, height, center=(disc_cx, disc_cy),
-        radius=disc_r * 2.4, color=_PAGODA_DISC, inner_alpha=14, falloff=2.2,
+        radius=disc_r * 2.4, color=_PAGODA_DISC, inner_alpha=8, falloff=2.4,
     ))
     layer.alpha_composite(_moon_disc(
-        width, height, cx=disc_cx, cy=disc_cy, r=disc_r, alpha=48,
+        width, height, cx=disc_cx, cy=disc_cy, r=disc_r, alpha=28,
     ))
 
     # Faint cloud wisps drifting across the moon (kept very subtle).
