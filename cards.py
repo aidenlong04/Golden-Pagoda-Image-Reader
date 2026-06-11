@@ -239,25 +239,34 @@ def _pagoda_silhouette(
             fill=255,
         )
 
-    # Four tapering tiers (slender bodies) crowned by upswept roofs, on a
-    # two-step podium — bodies drawn first; the roofs union over them.
-    body(0.190, 0.050, 0.058)   # tier 1 (top)
-    body(0.330, 0.072, 0.062)   # tier 2
-    body(0.480, 0.100, 0.075)   # tier 3
-    body(0.650, 0.150, 0.128)   # main hall
-    body(0.775, 0.250, 0.075)   # podium step
-    body(0.850, 0.330, 0.060)   # ground platform
-    roof(0.095, 0.150, 0.095)   # crown roof
-    roof(0.235, 0.215, 0.110)
-    roof(0.395, 0.290, 0.120)
-    roof(0.560, 0.375, 0.135)   # widest, over the main hall
+    # Classic five-roof pagoda: slender tier columns stepped by five
+    # gracefully upswept roofs that widen toward the base, set on a solid
+    # two-step stone plinth that meets the ground. Bodies first; roofs
+    # union over them.
+    body(0.205, 0.045, 0.072)   # column under the crown roof
+    body(0.345, 0.058, 0.075)   # tier-2 column
+    body(0.490, 0.072, 0.078)   # tier-3 column
+    body(0.635, 0.090, 0.082)   # tier-4 column
+    body(0.775, 0.130, 0.078)   # ground-floor hall
+    body(0.848, 0.250, 0.052)   # base step
+    body(0.898, 0.312, 0.092)   # plinth meeting the ground line
+    roof(0.135, 0.140, 0.092)   # crown roof (smallest)
+    roof(0.280, 0.180, 0.098)
+    roof(0.425, 0.225, 0.104)
+    roof(0.570, 0.282, 0.112)
+    roof(0.715, 0.345, 0.126)   # ground-floor eaves (widest)
     # Finial: a slender mast rising to a ring and a crowning jewel.
-    mast = 0.016 * W
-    d.rectangle([cx - mast, 0.040 * H, cx + mast, 0.120 * H], fill=255)
-    ring = 0.038 * W
-    d.ellipse([cx - ring, 0.066 * H, cx + ring, 0.066 * H + ring], fill=255)
-    sph = 0.026 * W
-    d.ellipse([cx - sph, 0.008 * H, cx + sph, 0.008 * H + 2 * sph], fill=255)
+    mast = 0.013 * W
+    d.rectangle([cx - mast, 0.048 * H, cx + mast, 0.140 * H], fill=255)
+    ring_r, ring_cy = 0.030 * W, 0.078 * H
+    d.ellipse(
+        [cx - ring_r, ring_cy - ring_r, cx + ring_r, ring_cy + ring_r],
+        fill=255,
+    )
+    sph_r, sph_cy = 0.022 * W, 0.030 * H
+    d.ellipse(
+        [cx - sph_r, sph_cy - sph_r, cx + sph_r, sph_cy + sph_r], fill=255,
+    )
 
     fw, fh = max(1, width), max(1, height)
     mask = mask.resize((fw, fh), Image.LANCZOS)
@@ -277,19 +286,6 @@ def _paste_full(
     layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     layer.paste(sub, (x, y))
     return layer
-
-
-def _ramp_alpha(img: Image.Image, *, top: float, bottom: float) -> Image.Image:
-    """Return ``img`` with its alpha scaled by a vertical ramp from ``top``
-    (at the top row) to ``bottom`` (at the bottom row). Used to fade the
-    water reflection out with depth."""
-    alpha = np.asarray(img.split()[3], dtype=np.float32)
-    h = alpha.shape[0]
-    ramp = np.linspace(top, bottom, h, dtype=np.float32)[:, None]
-    faded = np.clip(alpha * ramp, 0.0, 255.0).astype(np.uint8)
-    out = img.copy()
-    out.putalpha(Image.fromarray(faded, "L"))
-    return out
 
 
 def _mountain_band(
@@ -326,85 +322,113 @@ def _mountain_band(
     return out
 
 
+def _moon_disc(
+    width: int, height: int, *, cx: int, cy: int, r: float, alpha: int,
+) -> Image.Image:
+    """Return a crisp, faint moon: an anti-aliased pale disc with a few
+    softer 'maria' (dimmer circular lowlands) so it reads as the moon
+    rather than a fuzzy glow. Drawn supersampled then downscaled, tinted
+    pale-warm and capped at ``alpha``."""
+    ss = 2
+    W, H = max(1, width) * ss, max(1, height) * ss
+    m = Image.new("L", (W, H), 0)
+    d = ImageDraw.Draw(m)
+    cxs, cys, rs = cx * ss, cy * ss, r * ss
+    d.ellipse([cxs - rs, cys - rs, cxs + rs, cys + rs], fill=alpha)
+    # Maria: dimmer pools (a fraction of the disc alpha) read as shadowed
+    # lowlands. Fixed positions keep the cached backdrop byte-stable.
+    maria = max(1, int(alpha * 0.55))
+    for fx, fy, fr in (
+        (-0.32, -0.26, 0.20), (0.30, 0.04, 0.15),
+        (-0.10, 0.34, 0.13), (0.34, -0.30, 0.085),
+    ):
+        ox, oy, cr = cxs + fx * rs, cys + fy * rs, fr * rs
+        d.ellipse([ox - cr, oy - cr, ox + cr, oy + cr], fill=maria)
+    m = m.resize((max(1, width), max(1, height)), Image.LANCZOS)
+    m = m.filter(ImageFilter.GaussianBlur(0.4))
+    out = Image.new("RGBA", (max(1, width), max(1, height)), _PAGODA_DISC + (0,))
+    out.putalpha(m)
+    return out
+
+
 def _pagoda_scene(width: int, height: int) -> Image.Image:
-    """Return the faint scenic motif for the /profile card: a soft moon
-    disc, layered mountain ridges, the multi-tiered pagoda, and its water
-    reflection — all kept subtle so overlaid text/avatar stay crisp.
+    """Return the faint scenic motif for the /profile card: a crisp moon
+    in the sky, layered mountain ridges, and the multi-tiered pagoda
+    grounded on the base line with a soft shadow at its foot — all kept
+    subtle so overlaid text/avatar stay crisp.
 
     Composed lower-right so the avatar (left) and the headline stay clear,
     and returned as a full-size RGBA layer the backdrop composites in.
     """
     layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    pag_h = int(height * 0.72)
-    pag_w = max(1, int(pag_h * 0.92))
+    pag_h = int(height * 0.62)
+    pag_w = max(1, int(pag_h * 0.88))
     anchor_cx = int(width * 0.66)
-    waterline = height - int(height * 0.05)
-    pag_top = waterline - pag_h
+    # Lower to the ground: the base sits on a ground line a touch above the
+    # bottom edge (clear of the darkest vignette band so the base reads).
+    ground_y = height - max(1, int(height * 0.05))
+    pag_top = ground_y - pag_h
     px = anchor_cx - pag_w // 2
 
-    # Moon disc behind the upper tiers: a soft halo + a flatter, defined
-    # disc, both faint and pale-warm.
-    disc_cx = anchor_cx - int(pag_w * 0.02)
-    disc_cy = pag_top + int(pag_h * 0.20)
-    disc_r = pag_w * 0.46
+    # Crisp moon high in the sky, up and to the right of the pagoda crown:
+    # a soft halo behind a defined pale disc with faint maria.
+    disc_r = min(pag_w * 0.34, height * 0.26)
+    disc_cx = anchor_cx + int(pag_w * 0.20)
+    disc_cy = max(int(disc_r * 1.15), pag_top - int(height * 0.04))
     layer.alpha_composite(_radial_gradient(
         width, height, center=(disc_cx, disc_cy),
-        radius=disc_r * 2.2, color=_PAGODA_DISC, inner_alpha=12, falloff=2.4,
+        radius=disc_r * 2.4, color=_PAGODA_DISC, inner_alpha=11, falloff=2.2,
     ))
-    layer.alpha_composite(_radial_gradient(
-        width, height, center=(disc_cx, disc_cy),
-        radius=disc_r, color=_PAGODA_DISC, inner_alpha=30, falloff=0.5,
+    layer.alpha_composite(_moon_disc(
+        width, height, cx=disc_cx, cy=disc_cy, r=disc_r, alpha=44,
     ))
 
-    # Soft cloud streaks drifting across the moon (blurred into bands).
+    # Faint cloud wisps drifting across the moon (kept very subtle).
     clouds = Image.new("L", (width, height), 0)
     dc = ImageDraw.Draw(clouds)
-    band_w = max(2, int(height * 0.030))
+    band_w = max(2, int(height * 0.026))
     for fy, x0f, x1f, a in (
-        (-0.34, 0.50, 0.86, 9),
-        (-0.06, 0.45, 0.90, 12),
-        (0.22, 0.53, 0.82, 7),
+        (-0.42, 0.52, 0.84, 7),
+        (-0.04, 0.46, 0.88, 10),
+        (0.32, 0.54, 0.80, 6),
     ):
         yy = disc_cy + int(disc_r * fy)
         dc.line(
             [(int(width * x0f), yy), (int(width * x1f), yy)],
             fill=a, width=band_w,
         )
-    clouds = clouds.filter(ImageFilter.GaussianBlur(max(1, int(height * 0.02))))
+    clouds = clouds.filter(ImageFilter.GaussianBlur(max(1, int(height * 0.022))))
     cloud_layer = Image.new("RGBA", (width, height), _PAGODA_DISC + (0,))
     cloud_layer.putalpha(clouds)
     layer.alpha_composite(cloud_layer)
 
-    # Layered mountain ridges resting on the waterline.
+    # Layered mountain ridges resting on the ground line, behind the pagoda.
     layer.alpha_composite(_mountain_band(
-        width, height, base_y=waterline,
+        width, height, base_y=ground_y,
         ridges=[
-            (0.36, (74, 82, 96), 14),   # back ridge: taller, faint
-            (0.22, (54, 60, 73), 19),   # front ridge: lower, stronger
+            (0.34, (74, 82, 96), 13),   # back ridge: taller, faint
+            (0.20, (54, 60, 73), 18),   # front ridge: lower, stronger
         ],
     ))
 
-    # Pagoda + its water reflection (flipped, faded with depth).
-    pag = _pagoda_silhouette(pag_w, pag_h, color=_PAGODA_TINT, alpha=16)
-    layer.alpha_composite(_paste_full(pag, px, pag_top, width, height))
-    refl = _ramp_alpha(
-        pag.transpose(Image.FLIP_TOP_BOTTOM), top=0.42, bottom=0.0
+    # A soft shadow pooled at the pagoda's foot grounds it on the base line
+    # (replaces the old water reflection now that it sits on land), drawn
+    # under the silhouette.
+    shadow = Image.new("L", (width, height), 0)
+    dsh = ImageDraw.Draw(shadow)
+    sh_w, sh_h = int(pag_w * 0.40), max(2, int(height * 0.014))
+    dsh.ellipse(
+        [anchor_cx - sh_w, ground_y - sh_h, anchor_cx + sh_w, ground_y + sh_h],
+        fill=30,
     )
-    layer.alpha_composite(_paste_full(refl, px, waterline, width, height))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(max(1, int(height * 0.012))))
+    shadow_layer = Image.new("RGBA", (width, height), (8, 10, 14, 0))
+    shadow_layer.putalpha(shadow)
+    layer.alpha_composite(shadow_layer)
 
-    # A few soft water-shimmer lines below the waterline.
-    sh = Image.new("L", (width, height), 0)
-    ds = ImageDraw.Draw(sh)
-    for i, fy in enumerate((0.015, 0.038, 0.063)):
-        yy = waterline + int(height * fy)
-        ds.line(
-            [(int(width * 0.40), yy), (int(width * 0.92), yy)],
-            fill=max(3, 11 - i * 3), width=1,
-        )
-    sh = sh.filter(ImageFilter.GaussianBlur(0.9))
-    shimmer = Image.new("RGBA", (width, height), _PAGODA_DISC + (0,))
-    shimmer.putalpha(sh)
-    layer.alpha_composite(shimmer)
+    # The pagoda itself, grounded on the base line.
+    pag = _pagoda_silhouette(pag_w, pag_h, color=_PAGODA_TINT, alpha=23)
+    layer.alpha_composite(_paste_full(pag, px, pag_top, width, height))
     return layer
 
 
