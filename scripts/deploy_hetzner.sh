@@ -51,10 +51,18 @@ echo ">> installing watchdog (event-driven service)"
 echo ">> building image"
 # No `| tail` here: a failed build must propagate its exit code through SSH
 # (set -euo pipefail) so we never restart the service on a stale image.
-"${SSH[@]}" "$REMOTE" "cd $APP_DIR && docker build -t golden-pagoda:latest ."
+# BuildKit (parity with the GitHub Actions deploy) gives faster, cache-aware
+# builds; it's the default on modern Docker but set explicitly for older hosts.
+"${SSH[@]}" "$REMOTE" "cd $APP_DIR && DOCKER_BUILDKIT=1 docker build -t golden-pagoda:latest ."
 
 echo ">> (re)starting service"
 "${SSH[@]}" "$REMOTE" "sudo systemctl enable --now $SERVICE && sudo systemctl restart $SERVICE && sleep 5 && systemctl is-active $SERVICE"
+
+echo ">> reclaiming disk (keep warm cache)"
+# Mirror the workflow: drop only dangling images (keeps the python:3.12-slim
+# base for the next build) and cap the build cache rather than wiping it, so
+# the next deploy still hits the apt/pip layers instead of a cold build.
+"${SSH[@]}" "$REMOTE" "docker image prune -f >/dev/null 2>&1 || true; docker builder prune -f --keep-storage 2GB >/dev/null 2>&1 || true"
 
 echo ">> recent logs:"
 "${SSH[@]}" "$REMOTE" "docker logs $SERVICE --tail 20 2>&1 || true"
