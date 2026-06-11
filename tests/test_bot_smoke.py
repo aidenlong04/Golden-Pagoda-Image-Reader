@@ -830,6 +830,27 @@ class CardBackdropTests(unittest.TestCase):
         b = self.b._card_backdrop(220, 120)
         self.assertEqual(a.tobytes(), b.tobytes())
 
+    def test_returns_distinct_copies(self):
+        # Each call must hand back a fresh object so a caller compositing
+        # onto the backdrop can never corrupt the memoised instance.
+        a = self.b._card_backdrop(180, 100)
+        b = self.b._card_backdrop(180, 100)
+        self.assertIsNot(a, b)
+        a.paste((255, 0, 0, 255), (0, 0, a.width, a.height))
+        # Mutating one copy leaves the next call's backdrop untouched.
+        c = self.b._card_backdrop(180, 100)
+        self.assertEqual(b.tobytes(), c.tobytes())
+
+    def test_build_is_memoised(self):
+        # Repeated same-size requests hit the LRU instead of rebuilding.
+        self.b._card_backdrop_cached.cache_clear()
+        self.b._card_backdrop(200, 110)
+        self.b._card_backdrop(200, 110)
+        self.b._card_backdrop(200, 110)
+        info = self.b._card_backdrop_cached.cache_info()
+        self.assertGreaterEqual(info.hits, 2)
+        self.assertEqual(info.misses, 1)
+
 
 class PagodaSilhouetteTests(unittest.TestCase):
     """Tests for the faint pagoda watermark layered into the backdrop."""

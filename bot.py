@@ -3709,20 +3709,17 @@ def _pagoda_silhouette(
     return out
 
 
-def _card_backdrop(width: int, height: int) -> Image.Image:
-    """Return the finished card backdrop sized ``(width, height)``.
+@functools.lru_cache(maxsize=8)
+def _card_backdrop_cached(width: int, height: int) -> Image.Image:
+    """Build the finished card backdrop sized ``(width, height)``.
 
-    The shared backdrop for both the profile and progress cards so they
-    read as one family: a slate vertical gradient lifted by a warm gold
-    focal glow over the avatar zone (left), balanced by a faint Warframe
-    energy-cyan bloom bleeding from the upper-right, a faint Golden Pagoda
-    silhouette settled low and right-of-centre as an architectural
-    watermark, and finished with a soft vignette that frames the corners.
-    Built from smooth gradients plus that single solid silhouette — no
-    scattered glyphs or scratchy line-art — so it carries depth and a
-    distinct identity without the noise/artifacts of drawn ornament, and
-    overlaid text/icons stay crisp. The caller composites it onto the
-    canvas through the rounded-corner mask.
+    Memoised because the backdrop is deterministic per ``(width, height)``
+    yet expensive — it allocates several full-size numpy layers and draws
+    the supersampled pagoda silhouette. Card dimensions repeat across
+    renders (the progress card is a fixed size; profile heights cluster on
+    a few values), so a small LRU keeps the heavy build off the hot path
+    on the 512MB box. ``_card_backdrop`` hands callers a defensive copy so
+    this shared instance is never mutated.
     """
     panel = _vertical_gradient(
         width, height, _PROGRESS_BG_TOP, _PROGRESS_BG_BOTTOM
@@ -3758,6 +3755,27 @@ def _card_backdrop(width: int, height: int) -> Image.Image:
     # Vignette frames the content and deepens the panel corners.
     panel.alpha_composite(_vignette(width, height, strength=64))
     return panel
+
+
+def _card_backdrop(width: int, height: int) -> Image.Image:
+    """Return the shared card backdrop sized ``(width, height)``.
+
+    The shared backdrop for both the profile and progress cards so they
+    read as one family: a slate vertical gradient lifted by a warm gold
+    focal glow over the avatar zone (left), balanced by a faint Warframe
+    energy-cyan bloom bleeding from the upper-right, a faint Golden Pagoda
+    silhouette settled low and right-of-centre as an architectural
+    watermark, and finished with a soft vignette that frames the corners.
+    Built from smooth gradients plus that single solid silhouette — no
+    scattered glyphs or scratchy line-art — so it carries depth and a
+    distinct identity without the noise/artifacts of drawn ornament, and
+    overlaid text/icons stay crisp. The caller composites it onto the
+    canvas through the rounded-corner mask.
+
+    Returns a fresh copy of the memoised build (see ``_card_backdrop_cached``)
+    so callers may safely composite onto it.
+    """
+    return _card_backdrop_cached(width, height).copy()
 
 
 def _circular_avatar(
