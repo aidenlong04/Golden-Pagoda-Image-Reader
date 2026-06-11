@@ -361,9 +361,9 @@ def _pagoda_scene(width: int, height: int) -> Image.Image:
     dc = ImageDraw.Draw(clouds)
     band_w = max(2, int(height * 0.030))
     for fy, x0f, x1f, a in (
-        (-0.34, 0.50, 0.86, 16),
-        (-0.06, 0.45, 0.90, 22),
-        (0.22, 0.53, 0.82, 13),
+        (-0.34, 0.50, 0.86, 9),
+        (-0.06, 0.45, 0.90, 12),
+        (0.22, 0.53, 0.82, 7),
     ):
         yy = disc_cy + int(disc_r * fy)
         dc.line(
@@ -437,14 +437,14 @@ def _card_backdrop_cached(
     panel.alpha_composite(_radial_gradient(
         width, height, center=(width * 0.12, height * 0.40),
         radius=longest * 0.62, color=_PROGRESS_ACCENT,
-        inner_alpha=22, falloff=1.7,
+        inner_alpha=28, falloff=1.7,
     ))
     # Cool energy-cyan bloom from the upper-right balances the warm glow
     # with a hint of Warframe energy.
     panel.alpha_composite(_radial_gradient(
         width, height, center=(width * 0.97, height * 0.12),
         radius=longest * 0.72, color=_PROGRESS_FILL_START,
-        inner_alpha=13, falloff=2.0,
+        inner_alpha=17, falloff=2.0,
     ))
     if scenic:
         # Profile card: the full faint pagoda scene (disc + mountains +
