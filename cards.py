@@ -215,50 +215,48 @@ def _pagoda_silhouette(
         )
 
     def roof(top: float, half_w: float, rh: float) -> None:
-        """One gracefully upswept tier roof: a peaked ridge, a concave
-        underside, and eave tips that flick up at the corners — the
-        signature line of the reference pagodas."""
+        """One pagoda tier roof: a flat top ridge, wide eaves that sweep
+        out, and tips that flick up at the corners — read clearly as a
+        roof (not an arrowhead) even at watermark opacity."""
         hw = half_w * W
         t, h = top * H, rh * H
+        ridge = 0.30 * hw
         d.polygon(
             [
-                (cx, t - 0.12 * h),                  # crown peak
-                (cx + 0.26 * hw, t + 0.22 * h),
-                (cx + 0.58 * hw, t + 0.46 * h),
-                (cx + 0.90 * hw, t + 0.72 * h),
-                (cx + hw, t + 0.40 * h),             # right eave sweeps up
-                (cx + 0.82 * hw, t + 0.86 * h),
-                (cx + 0.30 * hw, t + h),             # concave underside
-                (cx - 0.30 * hw, t + h),
-                (cx - 0.82 * hw, t + 0.86 * h),
-                (cx - hw, t + 0.40 * h),             # left eave sweeps up
-                (cx - 0.90 * hw, t + 0.72 * h),
-                (cx - 0.58 * hw, t + 0.46 * h),
-                (cx - 0.26 * hw, t + 0.22 * h),
+                (cx - ridge, t),                 # flat ridge, left
+                (cx + ridge, t),                 # flat ridge, right
+                (cx + 0.70 * hw, t + 0.50 * h),  # slope down-out
+                (cx + hw, t + 0.34 * h),         # eave tip flicks UP
+                (cx + 0.80 * hw, t + h),         # underside, right corner
+                (cx - 0.80 * hw, t + h),         # underside, left corner
+                (cx - hw, t + 0.34 * h),         # left eave tip flicks up
+                (cx - 0.70 * hw, t + 0.50 * h),  # slope down-out
             ],
             fill=255,
         )
 
-    # Classic five-roof pagoda: slender tier columns stepped by five
-    # gracefully upswept roofs that widen toward the base, set on a solid
-    # two-step stone plinth that meets the ground. Bodies first; roofs
-    # union over them.
-    body(0.205, 0.045, 0.072)   # column under the crown roof
-    body(0.345, 0.058, 0.075)   # tier-2 column
-    body(0.490, 0.072, 0.078)   # tier-3 column
-    body(0.635, 0.090, 0.082)   # tier-4 column
-    body(0.775, 0.130, 0.078)   # ground-floor hall
-    body(0.848, 0.250, 0.052)   # base step
-    body(0.898, 0.312, 0.092)   # plinth meeting the ground line
-    roof(0.135, 0.140, 0.092)   # crown roof (smallest)
-    roof(0.280, 0.180, 0.098)
-    roof(0.425, 0.225, 0.104)
-    roof(0.570, 0.282, 0.112)
-    roof(0.715, 0.345, 0.126)   # ground-floor eaves (widest)
+    # Classic five-roof pagoda. Each tier is a wide upswept roof over a
+    # substantial body wall (~0.6x the roof's half-width), the bodies
+    # overlapping the roofs above so the whole tower reads as one connected
+    # silhouette — not floating chevrons — even at watermark opacity. Drawn
+    # bodies-first so the eaves overhang; widens toward a stone plinth that
+    # meets the ground line.
+    body(0.228, 0.100, 0.078)   # body under the crown roof
+    body(0.368, 0.130, 0.078)   # tier-2 body
+    body(0.510, 0.162, 0.080)   # tier-3 body
+    body(0.655, 0.196, 0.085)   # tier-4 body
+    body(0.808, 0.235, 0.082)   # ground-floor hall
+    body(0.884, 0.298, 0.058)   # base step
+    body(0.938, 0.348, 0.040)   # plinth meeting the ground line
+    roof(0.150, 0.168, 0.082)   # crown roof (smallest)
+    roof(0.292, 0.212, 0.086)
+    roof(0.432, 0.258, 0.090)
+    roof(0.576, 0.305, 0.095)
+    roof(0.726, 0.352, 0.100)   # ground-floor eaves (widest)
     # Finial: a slender mast rising to a ring and a crowning jewel.
     mast = 0.013 * W
-    d.rectangle([cx - mast, 0.048 * H, cx + mast, 0.140 * H], fill=255)
-    ring_r, ring_cy = 0.030 * W, 0.078 * H
+    d.rectangle([cx - mast, 0.052 * H, cx + mast, 0.150 * H], fill=255)
+    ring_r, ring_cy = 0.028 * W, 0.086 * H
     d.ellipse(
         [cx - ring_r, ring_cy - ring_r, cx + ring_r, ring_cy + ring_r],
         fill=255,
@@ -325,28 +323,34 @@ def _mountain_band(
 def _moon_disc(
     width: int, height: int, *, cx: int, cy: int, r: float, alpha: int,
 ) -> Image.Image:
-    """Return a crisp, faint moon: an anti-aliased pale disc with a few
-    softer 'maria' (dimmer circular lowlands) so it reads as the moon
-    rather than a fuzzy glow. Drawn supersampled then downscaled, tinted
-    pale-warm and capped at ``alpha``."""
-    ss = 2
-    W, H = max(1, width) * ss, max(1, height) * ss
-    m = Image.new("L", (W, H), 0)
-    d = ImageDraw.Draw(m)
-    cxs, cys, rs = cx * ss, cy * ss, r * ss
-    d.ellipse([cxs - rs, cys - rs, cxs + rs, cys + rs], fill=alpha)
-    # Maria: dimmer pools (a fraction of the disc alpha) read as shadowed
-    # lowlands. Fixed positions keep the cached backdrop byte-stable.
-    maria = max(1, int(alpha * 0.55))
-    for fx, fy, fr in (
-        (-0.32, -0.26, 0.20), (0.30, 0.04, 0.15),
-        (-0.10, 0.34, 0.13), (0.34, -0.30, 0.085),
-    ):
-        ox, oy, cr = cxs + fx * rs, cys + fy * rs, fr * rs
-        d.ellipse([ox - cr, oy - cr, ox + cr, oy + cr], fill=maria)
-    m = m.resize((max(1, width), max(1, height)), Image.LANCZOS)
-    m = m.filter(ImageFilter.GaussianBlur(0.4))
-    out = Image.new("RGBA", (max(1, width), max(1, height)), _PAGODA_DISC + (0,))
+    """Return a soft, faint full moon: a pale disc shaded like a sphere —
+    gentle limb-darkening toward the rim plus a directional brightening
+    from the upper-left — with two very subtle, low-contrast maria. No
+    hard "bowling-ball" holes. Computed in numpy on the alpha channel
+    (the moon is a single pale-warm tint whose visibility rides on alpha),
+    then lightly blurred so the rim stays smooth."""
+    w = max(1, width)
+    h = max(1, height)
+    yy, xx = np.ogrid[:h, :w]
+    rr = max(1.0, float(r))
+    dx = (xx.astype(np.float32) - np.float32(cx)) / np.float32(rr)
+    dy = (yy.astype(np.float32) - np.float32(cy)) / np.float32(rr)
+    dist2 = dx * dx + dy * dy
+    inside = dist2 <= 1.0
+    # Limb darkening (dimmer toward the rim) + a soft light from upper-left.
+    shade = 1.0 - 0.42 * np.clip(dist2, 0.0, 1.0)
+    light = 1.0 - 0.26 * np.clip(dx * 0.7 + dy * 0.7, -1.0, 1.0)
+    val = np.float32(alpha) * shade * light
+    # Two faint, asymmetric maria — small and low-contrast so they read as
+    # gentle shading, never as punched holes.
+    for fx, fy, fr, dim in ((0.26, -0.20, 0.22, 0.16), (-0.20, 0.24, 0.16, 0.12)):
+        cdx = (dx - fx) / fr
+        cdy = (dy - fy) / fr
+        crater = np.clip(1.0 - (cdx * cdx + cdy * cdy), 0.0, 1.0)
+        val = val * (1.0 - np.float32(dim) * crater)
+    arr = np.where(inside, np.clip(val, 0.0, 255.0), 0.0).astype(np.uint8)
+    m = Image.fromarray(arr, "L").filter(ImageFilter.GaussianBlur(0.6))
+    out = Image.new("RGBA", (w, h), _PAGODA_DISC + (0,))
     out.putalpha(m)
     return out
 
@@ -370,27 +374,27 @@ def _pagoda_scene(width: int, height: int) -> Image.Image:
     pag_top = ground_y - pag_h
     px = anchor_cx - pag_w // 2
 
-    # Crisp moon high in the sky, up and to the right of the pagoda crown:
-    # a soft halo behind a defined pale disc with faint maria.
-    disc_r = min(pag_w * 0.34, height * 0.26)
-    disc_cx = anchor_cx + int(pag_w * 0.20)
-    disc_cy = max(int(disc_r * 1.15), pag_top - int(height * 0.04))
+    # Soft full moon in the sky, up and to the right of the pagoda crown,
+    # kept clear of the top edge: a gentle halo behind a softly-shaded disc.
+    disc_r = min(pag_w * 0.26, height * 0.20)
+    disc_cx = anchor_cx + int(pag_w * 0.24)
+    disc_cy = int(disc_r) + max(1, int(height * 0.08))
     layer.alpha_composite(_radial_gradient(
         width, height, center=(disc_cx, disc_cy),
-        radius=disc_r * 2.4, color=_PAGODA_DISC, inner_alpha=11, falloff=2.2,
+        radius=disc_r * 2.4, color=_PAGODA_DISC, inner_alpha=14, falloff=2.2,
     ))
     layer.alpha_composite(_moon_disc(
-        width, height, cx=disc_cx, cy=disc_cy, r=disc_r, alpha=44,
+        width, height, cx=disc_cx, cy=disc_cy, r=disc_r, alpha=48,
     ))
 
     # Faint cloud wisps drifting across the moon (kept very subtle).
     clouds = Image.new("L", (width, height), 0)
     dc = ImageDraw.Draw(clouds)
-    band_w = max(2, int(height * 0.026))
+    band_w = max(2, int(height * 0.024))
     for fy, x0f, x1f, a in (
-        (-0.42, 0.52, 0.84, 7),
-        (-0.04, 0.46, 0.88, 10),
-        (0.32, 0.54, 0.80, 6),
+        (-0.40, 0.54, 0.82, 6),
+        (-0.02, 0.48, 0.86, 8),
+        (0.34, 0.56, 0.78, 5),
     ):
         yy = disc_cy + int(disc_r * fy)
         dc.line(
