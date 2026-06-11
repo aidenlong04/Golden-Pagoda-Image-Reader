@@ -12,7 +12,7 @@ import sys
 import time
 import warnings
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import timedelta
 
 from pathlib import Path
@@ -5441,6 +5441,26 @@ def _sync_profile_action_items(
         ))
 
 
+def _can_use_command(
+    member: discord.Member,
+    role_ids: Iterable[int],
+    *,
+    open_when_empty: bool = False,
+) -> bool:
+    """Return True when ``member`` may use a role-gated command.
+
+    Server managers are always allowed. Otherwise the member must hold one of
+    the (non-zero) ``role_ids``. When ``open_when_empty`` is set and no gate
+    role is configured, the command stays open to everyone.
+    """
+    ids = {rid for rid in role_ids if rid}
+    if open_when_empty and not ids:
+        return True
+    if member.guild_permissions.manage_guild:
+        return True
+    return any(r.id in ids for r in member.roles)
+
+
 def _can_use_profile(member: discord.Member) -> bool:
     """Return True when ``member`` may run /profile.
 
@@ -5448,11 +5468,9 @@ def _can_use_profile(member: discord.Member) -> bool:
     allowed). When that role isn't configured (0), the command stays open to
     everyone.
     """
-    if not PROFILE_ACCESS_ROLE_ID:
-        return True
-    if member.guild_permissions.manage_guild:
-        return True
-    return any(r.id == PROFILE_ACCESS_ROLE_ID for r in member.roles)
+    return _can_use_command(
+        member, (PROFILE_ACCESS_ROLE_ID,), open_when_empty=True
+    )
 
 
 def _can_use_profile_options(member: discord.Member) -> bool:
@@ -5464,10 +5482,7 @@ def _can_use_profile_options(member: discord.Member) -> bool:
     the options effectively surface only for these roles. The ``edit_mastery``
     option is intentionally exempt.
     """
-    if member.guild_permissions.manage_guild:
-        return True
-    allowed = set(PROFILE_OPTIONS_ROLE_IDS)
-    return any(r.id in allowed for r in member.roles)
+    return _can_use_command(member, PROFILE_OPTIONS_ROLE_IDS)
 
 
 @tree.command(
