@@ -288,6 +288,35 @@ class ComponentBuilderSmokeTests(unittest.TestCase):
                 "expected PNG magic bytes",
             )
 
+    def test_render_progress_card_png_returns_png(self):
+        """_render_progress_card_png returns PNG bytes across the empty /
+        partial / complete bar states and with/without info rows. (The
+        verify pass card path; previously only the profile card had a
+        render test.)"""
+        info = [
+            ("Clan", "Golden Tenno", None),
+            ("Mastery Rank", "28", None),
+            ("Profile", "Tenno#1234", None),
+            ("Platform", "PC", None),
+        ]
+        cases = [
+            dict(count=0, target=4, info_lines=None),
+            dict(count=2, target=4, info_lines=info),
+            dict(count=4, target=4, info_lines=info),
+            dict(count=0, target=0, info_lines=None),  # no categories configured
+        ]
+        for kw in cases:
+            png = self.bot_module._render_progress_card_png(
+                avatar_bytes=None,
+                display_name="Tenno",
+                **kw,
+            )
+            self.assertIsInstance(png, bytes)
+            self.assertTrue(
+                png.startswith(b"\x89PNG\r\n\x1a\n"),
+                "expected PNG magic bytes",
+            )
+
 
 class MasteryEditorHelperTests(unittest.TestCase):
     """Pure-logic tests for the /profile mastery-rank editor helpers."""
