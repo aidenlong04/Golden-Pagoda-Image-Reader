@@ -3577,139 +3577,97 @@ def _rounded_mask(width: int, height: int, radius: int) -> Image.Image:
     return mask.resize((width, height), Image.LANCZOS)
 
 
-# Glyph mix scattered across the profile-card background. Diamonds are
-# weighted heavily so the Orokin motif dominates, leavened with rings,
-# tick crosses, and small pips for variety.
-_PROFILE_BG_GLYPHS = ("diamond", "diamond", "diamond", "ring", "cross", "pip")
-
-
-def _scatter_symbol_bg(
+def _radial_gradient(
     width: int, height: int, *,
-    accent: tuple[int, int, int] = _PROGRESS_ACCENT,
-    seed: int = 0, scale: int = 1,
+    center: tuple[float, float], radius: float,
+    color: tuple[int, int, int], inner_alpha: int,
+    outer_alpha: int = 0, falloff: float = 1.6,
 ) -> Image.Image:
-    """Return a faint scattered-glyph overlay sized ``(width, height)``.
+    """Return an RGBA radial glow: ``color`` fading from ``inner_alpha`` at
+    ``center`` to ``outer_alpha`` at ``radius`` px out, with a smooth power
+    ``falloff``.
 
-    Lays Warframe-flavoured symbols (concentric Orokin diamonds, rings,
-    tick crosses, pips) on a jittered grid with varied size / opacity so
-    the profile card's slate panel carries subtle texture instead of a
-    flat fill. Kept at very low alpha so overlaid text/icons stay crisp.
-    Deterministic for a given ``seed`` (numpy ``RandomState``) so a
-    member's backdrop is stable across re-renders. The caller composites
-    this onto the gradient panel *before* the rounded-mask clip, so no
-    separate clipping is needed.
+    Computed entirely in numpy so the falloff is perfectly smooth — no
+    drawn-shape stepping or scatter noise — which keeps overlaid text and
+    icons crisp. Used to lift the slate card backdrop with soft focal
+    glows instead of busy ornament.
     """
-    layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    rng = np.random.RandomState(seed & 0xFFFFFFFF)
-    cell = max(8, int(116 * scale))
-    jit = max(1, cell // 4)
-    lw = max(1, int(2 * scale))
-    base = tuple(int(c) for c in accent)
-
-    def _diamond(cx: int, cy: int, rr: int, a: int, *, fill: bool = False):
-        pts = [(cx, cy - rr), (cx + rr, cy), (cx, cy + rr), (cx - rr, cy)]
-        if fill:
-            d.polygon(pts, fill=base + (a,))
-        else:
-            d.polygon(pts, outline=base + (a,), width=lw)
-
-    cols = width // cell + 2
-    rows = height // cell + 2
-    for gy in range(-1, rows):
-        for gx in range(-1, cols):
-            cx = gx * cell + cell // 2 + int(rng.randint(-jit, jit + 1))
-            cy = gy * cell + cell // 2 + int(rng.randint(-jit, jit + 1))
-            r = int(cell * (0.20 + 0.22 * rng.rand()))
-            a = 7 + int(rng.randint(0, 8))  # 7..14 alpha — very faint
-            kind = _PROFILE_BG_GLYPHS[int(rng.randint(0, len(_PROFILE_BG_GLYPHS)))]
-            if kind == "diamond":
-                for frac in (1.0, 0.6, 0.28):
-                    _diamond(cx, cy, max(1, int(r * frac)), a)
-                _diamond(cx, cy, max(1, r // 8), min(255, a + 8), fill=True)
-            elif kind == "ring":
-                for frac in (1.0, 0.55):
-                    rr = max(1, int(r * frac))
-                    d.ellipse(
-                        (cx - rr, cy - rr, cx + rr, cy + rr),
-                        outline=base + (a,), width=lw,
-                    )
-            elif kind == "cross":
-                arm = max(2, r // 2)
-                d.line((cx - arm, cy, cx + arm, cy), fill=base + (a,), width=lw)
-                d.line((cx, cy - arm, cx, cy + arm), fill=base + (a,), width=lw)
-            else:  # pip — a tiny filled diamond
-                _diamond(cx, cy, max(1, r // 5), min(255, a + 4), fill=True)
-    return layer
+    yy, xx = np.ogrid[:height, :width]
+    dx = xx.astype(np.float32) - np.float32(center[0])
+    dy = yy.astype(np.float32) - np.float32(center[1])
+    dist = np.sqrt(dx * dx + dy * dy) / np.float32(max(1.0, radius))
+    t = np.clip(1.0 - dist, 0.0, 1.0).astype(np.float32) ** np.float32(falloff)
+    a = np.float32(outer_alpha) + np.float32(inner_alpha - outer_alpha) * t
+    arr = np.empty((height, width, 4), dtype=np.uint8)
+    arr[..., 0] = color[0]
+    arr[..., 1] = color[1]
+    arr[..., 2] = color[2]
+    arr[..., 3] = np.clip(a, 0.0, 255.0).astype(np.uint8)
+    return Image.fromarray(arr, "RGBA")
 
 
-def _lotus_sigil(
-    size: int, *,
-    accent: tuple[int, int, int] = _PROGRESS_ACCENT,
-    alpha: int = 18, energy: tuple[int, int, int] = _PROGRESS_FILL_START,
+def _vignette(
+    width: int, height: int, *,
+    strength: int, start: float = 0.45, falloff: float = 1.7,
 ) -> Image.Image:
-    """Return an RGBA ``size``×``size`` faint line-art **Warframe "Lotus"
-    sigil** — the franchise's signature emblem: a central energy pod
-    flanked by symmetric petals fanned wide open (out past the horizontal)
-    over two splayed grounding flanges.
+    """Return a black RGBA vignette: transparent through the centre,
+    darkening toward the corners up to ``strength`` alpha.
 
-    Drawn in low-alpha Orokin gold with an energy-cyan pod so the
-    profile-card backdrop reads as distinctly Warframe. Kept faint enough
-    that overlaid text/icons stay crisp; the caller composites it onto the
-    gradient panel beneath the scattered glyphs and the rounded-mask clip.
+    ``start`` is the normalised radius (0 centre … 1 corner) where the
+    darkening begins. Pure-numpy so the gradient is smooth; the caller
+    composites it over the backdrop to frame the content and deepen the
+    panel edges.
     """
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    base = tuple(int(c) for c in accent)
-    cx = size / 2.0
-    cy = size / 2.0 + size * 0.03   # slight nudge so the open fan centres
-    line_w = max(1, size // 130)
-    a = max(1, min(255, alpha))
-
-    def _petal(angle_deg: float, length: float, half_w: float, a_line: int):
-        ang = np.radians(angle_deg)
-        ca, sa = float(np.cos(ang)), float(np.sin(ang))
-        t = np.linspace(0.0, 1.0, 29)
-        w = (np.sin(np.pi * t) ** 0.8) * half_w
-        ax_y = -t * length                       # axis points up (-Y)
-        rX = cx + w * ca - ax_y * sa
-        rY = cy + w * sa + ax_y * ca
-        lX = cx - w * ca - ax_y * sa
-        lY = cy - w * sa + ax_y * ca
-        poly = (
-            list(zip(rX.tolist(), rY.tolist()))
-            + list(zip(lX[::-1].tolist(), lY[::-1].tolist()))
-        )
-        d.line(
-            poly + [poly[0]], fill=base + (a_line,),
-            width=line_w, joint="curve",
-        )
-
-    L = size * 0.47
-    petal_w = size * 0.086
-    # A fully-open bloom: petals fan symmetrically across a wide arc (out
-    # past the horizontal) and only gently shorten toward the edges, so the
-    # lotus reads as spread wide open rather than upright. The energy pod
-    # anchors the centre.
-    _petal(0.0, L, petal_w, a)
-    for ang, lf in ((38.0, 0.94), (74.0, 0.84), (108.0, 0.68)):
-        _petal(ang, L * lf, petal_w * 0.92, a)
-        _petal(-ang, L * lf, petal_w * 0.92, a)
-    # Two grounding flanges splayed wide at the base to complete the bloom.
-    _petal(150.0, L * 0.42, petal_w * 0.72, a)
-    _petal(-150.0, L * 0.42, petal_w * 0.72, a)
-
-    # Central energy pod: a small filled vertical lens in Warframe cyan.
-    pod_h, pod_w = size * 0.17, size * 0.05
-    t = np.linspace(0.0, 1.0, 21)
-    pw = (np.sin(np.pi * t) ** 0.8) * pod_w
-    py = cy - t * pod_h
-    pod = (
-        list(zip((cx + pw).tolist(), py.tolist()))
-        + list(zip((cx - pw)[::-1].tolist(), py[::-1].tolist()))
+    yy, xx = np.ogrid[:height, :width]
+    nx = (xx.astype(np.float32) - np.float32(width) / 2.0) / (
+        np.float32(width) / 2.0
     )
-    d.polygon(pod, fill=tuple(int(c) for c in energy) + (min(255, a + 8),))
-    return img
+    ny = (yy.astype(np.float32) - np.float32(height) / 2.0) / (
+        np.float32(height) / 2.0
+    )
+    dist = np.sqrt(nx * nx + ny * ny) / np.float32(np.sqrt(2.0))
+    span = max(1e-3, 1.0 - start)
+    t = np.clip((dist - np.float32(start)) / np.float32(span), 0.0, 1.0)
+    t = t.astype(np.float32) ** np.float32(falloff)
+    arr = np.zeros((height, width, 4), dtype=np.uint8)
+    arr[..., 3] = (t * np.float32(strength)).astype(np.uint8)
+    return Image.fromarray(arr, "RGBA")
+
+
+def _card_backdrop(width: int, height: int) -> Image.Image:
+    """Return the finished card backdrop sized ``(width, height)``.
+
+    The shared backdrop for both the profile and progress cards so they
+    read as one family: a slate vertical gradient lifted by a warm gold
+    focal glow over the avatar zone (left), balanced by a faint Warframe
+    energy-cyan bloom bleeding from the upper-right, and finished with a
+    soft vignette that frames the corners. Built purely from smooth
+    gradients — no scattered glyphs or line-art emblems — so it carries
+    depth and a distinct Warframe palette without the noise/artifacts of
+    drawn ornament, and overlaid text/icons stay crisp. The caller
+    composites it onto the canvas through the rounded-corner mask.
+    """
+    panel = _vertical_gradient(
+        width, height, _PROGRESS_BG_TOP, _PROGRESS_BG_BOTTOM
+    )
+    longest = float(max(width, height))
+    # Warm gold focal glow anchored over the avatar (upper-left) — gives
+    # the card depth and a subtle halo behind the portrait.
+    panel.alpha_composite(_radial_gradient(
+        width, height, center=(width * 0.12, height * 0.40),
+        radius=longest * 0.62, color=_PROGRESS_ACCENT,
+        inner_alpha=30, falloff=1.7,
+    ))
+    # Cool energy-cyan bloom from the upper-right balances the warm glow
+    # with a hint of Warframe energy.
+    panel.alpha_composite(_radial_gradient(
+        width, height, center=(width * 0.97, height * 0.12),
+        radius=longest * 0.72, color=_PROGRESS_FILL_START,
+        inner_alpha=18, falloff=2.0,
+    ))
+    # Vignette frames the content and deepens the panel corners.
+    panel.alpha_composite(_vignette(width, height, strength=85))
+    return panel
 
 
 def _circular_avatar(
@@ -4099,9 +4057,11 @@ def _render_progress_card_png(
 
     W, H = sc(_PROGRESS_CARD_W), sc(card_h)
     canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    # Slate panel: vertical gradient clipped to rounded, transparent
-    # corners so the card blends into Discord's message background.
-    panel = _vertical_gradient(W, H, _PROGRESS_BG_TOP, _PROGRESS_BG_BOTTOM)
+    # Shared slate backdrop (see _card_backdrop): a smooth gradient lifted
+    # by soft gold/energy glows and a framing vignette, clipped to the
+    # rounded, transparent corners so the card blends into Discord's
+    # message background.
+    panel = _card_backdrop(W, H)
     panel_mask = _rounded_mask(W, H, sc(_PROGRESS_RADIUS))
     canvas.paste(panel, (0, 0), panel_mask)
     # Crisp hairline border tracing the rounded panel edge.
@@ -4423,23 +4383,12 @@ def _render_profile_card_png(
 
     W, H = sc(_PROGRESS_CARD_W), sc(card_h)
     canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    panel = _vertical_gradient(W, H, _PROGRESS_BG_TOP, _PROGRESS_BG_BOTTOM)
-    # Scatter faint Orokin-style glyphs across the slate backdrop for
-    # texture. Seeded off the headline so each member's pattern is stable
-    # across re-renders but varies between members. Composited onto the
-    # gradient *before* the rounded-mask clip so the corners stay clean.
-    bg_seed = 0
-    for ch in (headline or "Member"):
-        bg_seed = (bg_seed * 131 + ord(ch)) & 0xFFFFFFFF
-    # Hero watermark: a large, faint Warframe "Lotus" sigil centred in the
-    # card's open space gives the slate backdrop a distinct Warframe
-    # identity; the scattered Orokin glyphs ride on top for texture.
-    lotus_sz = int(min(W, H) * 1.18)
-    panel.alpha_composite(
-        _lotus_sigil(lotus_sz, accent=_PROGRESS_ACCENT, alpha=16),
-        (W // 2 - lotus_sz // 2, H // 2 - lotus_sz // 2),
-    )
-    panel.alpha_composite(_scatter_symbol_bg(W, H, seed=bg_seed, scale=s))
+    # Shared slate backdrop: a smooth gradient lifted by soft gold/energy
+    # glows and a framing vignette (see _card_backdrop) — no scattered
+    # glyphs or line-art emblems, so the panel stays clean behind the
+    # content. Composited through the rounded-corner mask so the corners
+    # stay clean.
+    panel = _card_backdrop(W, H)
     panel_mask = _rounded_mask(W, H, sc(_PROGRESS_RADIUS))
     canvas.paste(panel, (0, 0), panel_mask)
     ImageDraw.Draw(canvas).rounded_rectangle(

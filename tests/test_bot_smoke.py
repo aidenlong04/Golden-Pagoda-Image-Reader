@@ -745,60 +745,90 @@ class CardTextHelperTests(unittest.TestCase):
         self.assertEqual(self.b._ellipsize(self.draw, "", self.font, 50), "")
 
 
-class ScatterBackgroundTests(unittest.TestCase):
-    """Tests for the scattered Orokin-glyph profile-card backdrop."""
+class RadialGradientTests(unittest.TestCase):
+    """Tests for the smooth numpy radial-glow backdrop helper."""
 
     def setUp(self):
         import bot as bot_module
         self.b = bot_module
 
     def test_returns_rgba_of_requested_size(self):
-        img = self.b._scatter_symbol_bg(200, 120, seed=1, scale=1)
+        img = self.b._radial_gradient(
+            200, 120, center=(0, 0), radius=150,
+            color=(212, 168, 87), inner_alpha=40,
+        )
         self.assertEqual(img.mode, "RGBA")
         self.assertEqual(img.size, (200, 120))
 
-    def test_is_deterministic_for_seed(self):
-        a = self.b._scatter_symbol_bg(160, 100, seed=7, scale=1)
-        b = self.b._scatter_symbol_bg(160, 100, seed=7, scale=1)
+    def test_alpha_peaks_at_center_and_fades_out(self):
+        # Brightest at the glow centre, fully transparent past the radius.
+        img = self.b._radial_gradient(
+            120, 120, center=(60, 60), radius=40,
+            color=(212, 168, 87), inner_alpha=200,
+        )
+        px = img.load()
+        self.assertGreater(px[60, 60][3], px[5, 5][3])
+        self.assertEqual(px[5, 5][3], 0)  # corner lies beyond the radius
+
+    def test_inner_alpha_caps_opacity(self):
+        # The painted glow never exceeds the requested inner alpha.
+        img = self.b._radial_gradient(
+            80, 80, center=(40, 40), radius=60,
+            color=(93, 208, 243), inner_alpha=50,
+        )
+        self.assertLessEqual(img.split()[3].getextrema()[1], 50)
+
+    def test_is_deterministic(self):
+        a = self.b._radial_gradient(
+            96, 64, center=(10, 10), radius=80,
+            color=(212, 168, 87), inner_alpha=30,
+        )
+        b = self.b._radial_gradient(
+            96, 64, center=(10, 10), radius=80,
+            color=(212, 168, 87), inner_alpha=30,
+        )
         self.assertEqual(a.tobytes(), b.tobytes())
 
-    def test_varies_across_seeds(self):
-        a = self.b._scatter_symbol_bg(160, 100, seed=1, scale=1)
-        b = self.b._scatter_symbol_bg(160, 100, seed=2, scale=1)
-        self.assertNotEqual(a.tobytes(), b.tobytes())
 
-    def test_draws_some_faint_pixels(self):
-        # The overlay must actually paint glyphs (non-empty alpha) but stay
-        # faint — every painted pixel well under half opacity.
-        img = self.b._scatter_symbol_bg(240, 160, seed=3, scale=1)
-        alpha = img.split()[3]
-        extrema = alpha.getextrema()  # (min, max)
-        self.assertGreater(extrema[1], 0, "expected some glyph pixels")
-        self.assertLess(extrema[1], 64, "glyphs must stay faint")
-
-
-class LotusSigilTests(unittest.TestCase):
-    """Tests for the Warframe Lotus hero watermark."""
+class VignetteTests(unittest.TestCase):
+    """Tests for the framing vignette helper."""
 
     def setUp(self):
         import bot as bot_module
         self.b = bot_module
 
-    def test_returns_square_rgba(self):
-        img = self.b._lotus_sigil(200, alpha=18)
+    def test_returns_rgba_of_requested_size(self):
+        img = self.b._vignette(200, 120, strength=80)
         self.assertEqual(img.mode, "RGBA")
-        self.assertEqual(img.size, (200, 200))
+        self.assertEqual(img.size, (200, 120))
 
-    def test_draws_the_sigil(self):
-        # The emblem must paint something (non-empty alpha channel).
-        img = self.b._lotus_sigil(220, alpha=18)
-        self.assertGreater(img.split()[3].getextrema()[1], 0)
+    def test_center_transparent_corners_dark(self):
+        img = self.b._vignette(120, 120, strength=90)
+        px = img.load()
+        self.assertEqual(px[60, 60][3], 0)        # centre untouched
+        self.assertGreater(px[0, 0][3], 0)        # corner darkened
+        self.assertLessEqual(px[0, 0][3], 90)     # capped at strength
+        self.assertEqual(px[0, 0][:3], (0, 0, 0))  # darkens with black ink
 
-    def test_alpha_scales_with_request(self):
-        # A higher requested alpha yields more opaque ink than a faint one.
-        faint = self.b._lotus_sigil(220, alpha=12).split()[3].getextrema()[1]
-        bold = self.b._lotus_sigil(220, alpha=120).split()[3].getextrema()[1]
-        self.assertGreater(bold, faint)
+
+class CardBackdropTests(unittest.TestCase):
+    """Tests for the shared, smooth card backdrop (no scatter/lotus)."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+
+    def test_returns_opaque_rgba_of_requested_size(self):
+        img = self.b._card_backdrop(300, 160)
+        self.assertEqual(img.mode, "RGBA")
+        self.assertEqual(img.size, (300, 160))
+        # Fully opaque — the rounded-corner mask is applied by the caller.
+        self.assertEqual(img.split()[3].getextrema(), (255, 255))
+
+    def test_is_deterministic(self):
+        a = self.b._card_backdrop(220, 120)
+        b = self.b._card_backdrop(220, 120)
+        self.assertEqual(a.tobytes(), b.tobytes())
 
 
 class HeavyJobGateTests(unittest.TestCase):
