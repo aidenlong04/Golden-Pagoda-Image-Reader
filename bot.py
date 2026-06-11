@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import functools
 import io
 import json
 import logging
@@ -31,7 +30,7 @@ warnings.filterwarnings(
 import aiohttp  # noqa: E402
 import discord  # noqa: E402
 from discord import app_commands  # noqa: E402
-from PIL import Image, ImageOps  # noqa: E402
+from PIL import Image  # noqa: E402
 
 try:
     import pytesseract  # optional local fallback
@@ -57,54 +56,24 @@ from logic import (
 import analytics
 from config import _csv, _csv_ids, _float_env, _int_env
 from ocr_engine import OCR_API_KEY, _ocr, _supplement_title_bar_ocr
-from envstore import (
+from envstore import (  # noqa: F401  (some re-exported for tests via bot.*)
     ENV_FILE_PATH,
     PLATFORM_ROLE_ID_ENV_KEYS,
-    _atomic_write_text,
     _rewrite_env_file,
-    _slot_field_value,
     _update_env_clan_slots,
     _update_env_id_list,
     _update_env_platform_ids,
 )
 # Card rendering lives in cards.py; re-exported for internal callers + tests.
-from cards import (
-    _PAGODA_TINT,
-    _PROFILE_MAX_TITLE_CHIPS,
-    _PROGRESS_ACCENT,
-    _PROGRESS_AVATAR_RING,
-    _PROGRESS_AVATAR_SIZE,
-    _PROGRESS_BG_BOTTOM,
-    _PROGRESS_BG_EDGE,
-    _PROGRESS_BG_TOP,
-    _PROGRESS_BORDER,
-    _PROGRESS_CARD_W,
-    _PROGRESS_FILL_END,
-    _PROGRESS_FILL_GOLD,
-    _PROGRESS_FILL_GOLD_END,
-    _PROGRESS_FILL_START,
-    _PROGRESS_MISSING,
-    _PROGRESS_MUTED,
-    _PROGRESS_RADIUS,
-    _PROGRESS_SS,
-    _PROGRESS_TEXT,
-    _PROGRESS_TRACK,
-    _PROGRESS_TRACK_EDGE,
+from cards import (  # noqa: F401  (test-facing re-exports resolved as bot.*)
     _card_backdrop,
     _card_backdrop_cached,
-    _circular_avatar,
-    _draw_info_grid,
     _ellipsize,
     _load_font,
-    _load_font_cached,
     _pagoda_silhouette,
-    _paste_emoji_icon,
     _radial_gradient,
     _render_profile_card_png,
     _render_progress_card_png,
-    _rounded_mask,
-    _segmented_bar,
-    _vertical_gradient,
     _vignette,
 )
 
