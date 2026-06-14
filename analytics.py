@@ -5,6 +5,13 @@ defaults to ``/app/data/analytics.db`` so it can be mounted as a host volume
 on Hetzner (``/opt/golden-pagoda/data:/app/data``). If the directory is not
 writable the module silently degrades to a no-op so the bot can never crash
 because of analytics.
+
+Performance enhancements:
+- ``summary()`` result is cached for ``ANALYTICS_SUMMARY_TTL`` seconds
+  (default 30) to avoid re-running ~7 SQL queries on every /status refresh.
+  Call ``invalidate_summary_cache()`` to force a fresh snapshot.
+- A separate read-only SQLite connection is used for analytics reads so
+  ``summary()`` never contends with the write lock.
 """
 
 from __future__ import annotations
@@ -22,6 +29,14 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = os.getenv("ANALYTICS_DB_PATH", "/app/data/analytics.db")
 
+# Summary cache TTL in seconds (tunable via env var).
+try:
+    ANALYTICS_SUMMARY_TTL: float = float(
+        (os.getenv("ANALYTICS_SUMMARY_TTL") or "30").strip()
+    )
+except ValueError:
+    ANALYTICS_SUMMARY_TTL = 30.0
+
 _lock = threading.Lock()
 _initialized = False
 _disabled = False
@@ -32,6 +47,23 @@ _db_path: Path | None = None
 # connection avoids the open()/close() syscalls and per-call setup cost
 # that dominated record_verification() on the CX22's slow disk.
 _conn: sqlite3.Connection | None = None
+
+# Separate read-only connection for analytics queries (summary, profile
+# reads). WAL mode allows concurrent readers without blocking the writer
+# at all, so a dedicated reader never delays writes.
+_read_lock = threading.Lock()
+_read_conn: sqlite3.Connection | None = None
+
+# Summary snapshot cache — avoids re-running ~7 SQL queries on every
+# /status refresh.  Invalidated after writes and on TTL expiry.
+_summary_cache: dict | None = None
+_summary_cache_ts: float = 0.0
+
+
+def invalidate_summary_cache() -> None:
+    """Force the next ``summary()`` call to recompute from the database."""
+    global _summary_cache
+    _summary_cache = None
 
 
 def _resolve_path() -> Path | None:
@@ -76,6 +108,44 @@ def _connect() -> Iterator[sqlite3.Connection]:
         except Exception:
             pass
         _conn = None
+        raise
+
+
+@contextmanager
+def _connect_read() -> Iterator[sqlite3.Connection]:
+    """Open (or reuse) a read-only connection for analytics queries.
+
+    Uses ``uri=True`` with ``mode=ro`` so SQLite refuses accidental writes.
+    Falls back to the write connection on platforms that don't support URI
+    filenames (rare, but guards against edge cases).
+    """
+    global _read_conn
+    p = _resolve_path()
+    if p is None:
+        raise RuntimeError("analytics disabled")
+    if _read_conn is None:
+        try:
+            uri = f"file:{p}?mode=ro"
+            _read_conn = sqlite3.connect(
+                uri, uri=True, timeout=2.0,
+                check_same_thread=False, isolation_level=None,
+            )
+            _read_conn.row_factory = sqlite3.Row
+        except sqlite3.OperationalError:
+            # DB file doesn't exist yet (first run before any writes).
+            # Yield the write connection so callers get an empty result
+            # set rather than a crash.
+            with _connect() as c:
+                yield c
+            return
+    try:
+        yield _read_conn
+    except sqlite3.Error:
+        try:
+            _read_conn.close()
+        except Exception:
+            pass
+        _read_conn = None
         raise
 
 
@@ -177,6 +247,7 @@ def record_verification(
                     ),
                 )
                 conn.commit()
+            invalidate_summary_cache()
         except Exception:
             logger.exception("analytics: record failed")
 
@@ -416,6 +487,8 @@ def delete_member_data(*, guild_id: int, user_id: int) -> dict:
                 out["profiles"] = profiles
                 out["titles"] = titles
                 out["events_anonymized"] = events
+            if out["events_anonymized"] or out["profiles"] or out["titles"]:
+                invalidate_summary_cache()
         except Exception:
             logger.exception("analytics: delete_member_data failed")
         return out
@@ -429,8 +502,13 @@ def _percentile(values: list[int], pct: float) -> int:
     return s[k]
 
 
-def summary() -> dict:
-    """Return a snapshot summary used by the /status stats page."""
+def _compute_summary() -> dict:
+    """Run the actual SQL queries and return a fresh summary dict.
+
+    Must be called with ``_lock`` held (or from a context where no concurrent
+    writes are possible).  Uses ``_connect_read`` to avoid blocking the write
+    lock while running the ~7 aggregation queries.
+    """
     out: dict = {
         "available": False,
         "total": 0,
@@ -443,68 +521,62 @@ def summary() -> dict:
         "db_path": str(_db_path) if _db_path else DEFAULT_DB_PATH,
         "db_size_bytes": 0,
     }
-    if _disabled:
-        return out
-    with _lock:
-        _init()
-        if _disabled:
-            return out
-        try:
-            with _connect() as conn:
-                row = conn.execute(
-                    "SELECT COUNT(*) AS c, MIN(ts) AS mn, MAX(ts) AS mx FROM events"
+    try:
+        with _connect_read() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c, MIN(ts) AS mn, MAX(ts) AS mx FROM events"
+            ).fetchone()
+            out["available"] = True
+            out["total"] = row["c"] or 0
+            out["first_ts"] = row["mn"]
+            out["last_ts"] = row["mx"]
+
+            out["by_outcome"] = {
+                r["outcome"]: r["c"]
+                for r in conn.execute(
+                    "SELECT outcome, COUNT(*) AS c FROM events GROUP BY outcome"
+                )
+            }
+
+            out["by_clan"] = [
+                (r["clan"] or "(none)", r["c"])
+                for r in conn.execute(
+                    "SELECT clan, COUNT(*) AS c FROM events GROUP BY clan ORDER BY c DESC LIMIT 10"
+                )
+            ]
+
+            now = int(time.time())
+            for label, secs in (("24h", 86400), ("7d", 7 * 86400), ("30d", 30 * 86400)):
+                r = conn.execute(
+                    "SELECT COUNT(*) AS c FROM events WHERE ts >= ?",
+                    (now - secs,),
                 ).fetchone()
-                out["available"] = True
-                out["total"] = row["c"] or 0
-                out["first_ts"] = row["mn"]
-                out["last_ts"] = row["mx"]
+                out["windows"][label] = r["c"] or 0
 
-                out["by_outcome"] = {
-                    r["outcome"]: r["c"]
-                    for r in conn.execute(
-                        "SELECT outcome, COUNT(*) AS c FROM events GROUP BY outcome"
-                    )
-                }
+            lat = [
+                int(r["ocr_latency_ms"])
+                for r in conn.execute(
+                    "SELECT ocr_latency_ms FROM events"
+                    " WHERE ocr_latency_ms IS NOT NULL"
+                    " ORDER BY ts DESC LIMIT 500"
+                )
+            ]
+            if lat:
+                out["ocr"]["samples"] = len(lat)
+                out["ocr"]["avg_ms"] = sum(lat) // len(lat)
+                out["ocr"]["p50_ms"] = _percentile(lat, 50)
+                out["ocr"]["p95_ms"] = _percentile(lat, 95)
 
-                out["by_clan"] = [
-                    (r["clan"] or "(none)", r["c"])
-                    for r in conn.execute(
-                        "SELECT clan, COUNT(*) AS c FROM events GROUP BY clan ORDER BY c DESC LIMIT 10"
-                    )
-                ]
-
-                now = int(time.time())
-                for label, secs in (("24h", 86400), ("7d", 7 * 86400), ("30d", 30 * 86400)):
-                    r = conn.execute(
-                        "SELECT COUNT(*) AS c FROM events WHERE ts >= ?",
-                        (now - secs,),
-                    ).fetchone()
-                    out["windows"][label] = r["c"] or 0
-
-                lat = [
-                    int(r["ocr_latency_ms"])
-                    for r in conn.execute(
-                        "SELECT ocr_latency_ms FROM events"
-                        " WHERE ocr_latency_ms IS NOT NULL"
-                        " ORDER BY ts DESC LIMIT 500"
-                    )
-                ]
-                if lat:
-                    out["ocr"]["samples"] = len(lat)
-                    out["ocr"]["avg_ms"] = sum(lat) // len(lat)
-                    out["ocr"]["p50_ms"] = _percentile(lat, 50)
-                    out["ocr"]["p95_ms"] = _percentile(lat, 95)
-
-                out["ocr"]["engines"] = [
-                    (r["ocr_engine"] or "(unknown)", r["c"])
-                    for r in conn.execute(
-                        "SELECT ocr_engine, COUNT(*) AS c FROM events"
-                        " GROUP BY ocr_engine ORDER BY c DESC"
-                    )
-                ]
-        except Exception:
-            logger.exception("analytics: summary failed")
-            return out
+            out["ocr"]["engines"] = [
+                (r["ocr_engine"] or "(unknown)", r["c"])
+                for r in conn.execute(
+                    "SELECT ocr_engine, COUNT(*) AS c FROM events"
+                    " GROUP BY ocr_engine ORDER BY c DESC"
+                )
+            ]
+    except Exception:
+        logger.exception("analytics: summary query failed")
+        return out
 
     p = _resolve_path()
     if p is not None and p.exists():
@@ -513,3 +585,58 @@ def summary() -> dict:
         except OSError:
             pass
     return out
+
+
+def summary() -> dict:
+    """Return a snapshot summary used by the /status stats page.
+
+    Results are cached for ``ANALYTICS_SUMMARY_TTL`` seconds (default 30)
+    to avoid re-running ~7 SQL queries on every /status page refresh.
+    Writes (``record_verification``, ``delete_member_data``) invalidate the
+    cache immediately.  Call ``invalidate_summary_cache()`` to force a fresh
+    read at any time.
+    """
+    global _summary_cache, _summary_cache_ts
+
+    # Fast path: serve the cached snapshot without acquiring any lock.
+    cached = _summary_cache
+    if cached is not None and (time.time() - _summary_cache_ts) < ANALYTICS_SUMMARY_TTL:
+        return cached
+
+    if _disabled:
+        return {
+            "available": False,
+            "total": 0,
+            "by_outcome": {},
+            "by_clan": [],
+            "windows": {},
+            "ocr": {"engines": [], "avg_ms": 0, "p50_ms": 0, "p95_ms": 0, "samples": 0},
+            "first_ts": None,
+            "last_ts": None,
+            "db_path": str(_db_path) if _db_path else DEFAULT_DB_PATH,
+            "db_size_bytes": 0,
+        }
+
+    # Slow path: recompute under the write lock, then update the cache.
+    with _lock:
+        _init()
+        if _disabled:
+            return {
+                "available": False,
+                "total": 0,
+                "by_outcome": {},
+                "by_clan": [],
+                "windows": {},
+                "ocr": {"engines": [], "avg_ms": 0, "p50_ms": 0, "p95_ms": 0, "samples": 0},
+                "first_ts": None,
+                "last_ts": None,
+                "db_path": str(_db_path) if _db_path else DEFAULT_DB_PATH,
+                "db_size_bytes": 0,
+            }
+        # Double-check under the lock in case another thread already refreshed.
+        if _summary_cache is not None and (time.time() - _summary_cache_ts) < ANALYTICS_SUMMARY_TTL:
+            return _summary_cache
+        result = _compute_summary()
+        _summary_cache = result
+        _summary_cache_ts = time.time()
+        return result

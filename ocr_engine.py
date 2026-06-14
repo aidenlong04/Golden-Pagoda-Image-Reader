@@ -5,20 +5,40 @@ supplement pass that recovers the PlayerName#NNN token OCR.space tends to
 drop. Sync primitives only — the async orchestrator (`_ocr_profile_fields`)
 stays in bot.py because it drives these through the shared `_run_heavy`
 concurrency gate. Imports nothing from bot (which is `__main__` in prod);
-the env-parse helper comes from config.py.
+the env-parse helpers come from config.py.
+
+Performance enhancements (all tunable via env vars):
+- Exponential back-off with jitter on OCR.space API retries
+  (OCR_RETRY_MAX_ATTEMPTS, OCR_RETRY_BASE_DELAY, OCR_RETRY_MAX_DELAY).
+- Circuit breaker that opens after OCR_CIRCUIT_BREAKER_THRESHOLD consecutive
+  failures and stays open for OCR_CIRCUIT_BREAKER_RECOVERY seconds.
+- In-memory LRU cache of OCR results keyed by SHA-256 of the image bytes
+  (OCR_CACHE_SIZE entries, default 32).  A cache hit skips both the HTTP
+  round-trip *and* the Tesseract fall-through entirely.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import os
 import re
+import threading
 import time
+from collections import OrderedDict
 
 import requests
 from PIL import Image, ImageOps
 
 from config import _int_env
+from utils.retry import (
+    CircuitOpenError,
+    OCR_RETRY_BASE_DELAY,
+    OCR_RETRY_MAX_ATTEMPTS,
+    OCR_RETRY_MAX_DELAY,
+    exponential_backoff,
+    ocr_circuit_breaker,
+)
 
 try:
     import pytesseract  # optional local fallback
@@ -38,6 +58,40 @@ TESSERACT_CONFIG = "--oem 3 --psm 6"
 # JPEG before sending so large PNG screenshots still get verified.
 OCR_MAX_UPLOAD_BYTES = _int_env("OCR_MAX_UPLOAD_BYTES", 900_000)
 OCR_RECOMPRESS_QUALITY = _int_env("OCR_RECOMPRESS_QUALITY", 70)
+
+# ---------------------------------------------------------------------------
+# In-memory OCR result cache (keyed by SHA-256 of the original image bytes)
+# ---------------------------------------------------------------------------
+# Avoids redundant OCR round-trips when the same screenshot is submitted
+# multiple times (re-uploads, catch-up retries).  LRU eviction via
+# OrderedDict.  Cache is never persisted — it resets on container restart.
+OCR_CACHE_SIZE = _int_env("OCR_CACHE_SIZE", 32)
+_ocr_cache: "OrderedDict[str, tuple[str, list[tuple[str, tuple[int, int, int, int]]], str]]" = OrderedDict()
+_ocr_cache_lock = threading.Lock()
+
+
+def _cache_key(image_bytes: bytes) -> str:
+    return hashlib.sha256(image_bytes).hexdigest()
+
+
+def _cache_get(key: str) -> "tuple[str, list[tuple[str, tuple[int, int, int, int]]], str] | None":
+    with _ocr_cache_lock:
+        if key not in _ocr_cache:
+            return None
+        # Move to end (most-recently used).
+        _ocr_cache.move_to_end(key)
+        return _ocr_cache[key]
+
+
+def _cache_put(
+    key: str,
+    value: "tuple[str, list[tuple[str, tuple[int, int, int, int]]], str]",
+) -> None:
+    with _ocr_cache_lock:
+        _ocr_cache[key] = value
+        _ocr_cache.move_to_end(key)
+        while len(_ocr_cache) > OCR_CACHE_SIZE:
+            _ocr_cache.popitem(last=False)
 
 
 def _shrink_for_ocr(
@@ -69,12 +123,27 @@ def _ocr_via_api(
     *,
     engine: str | None = None,
 ) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]]:
+    """Call the OCR.space API with exponential back-off retries and circuit
+    breaker protection.
+
+    Raises :exc:`~utils.retry.CircuitOpenError` immediately when the circuit
+    is open (too many recent failures) so the caller can fall through to the
+    Tesseract backend without consuming a full 60-second timeout.
+    """
+    if not ocr_circuit_breaker.allow_request():
+        raise CircuitOpenError(
+            f"OCR.space circuit is open — skipping API call "
+            f"({ocr_circuit_breaker.snapshot()})"
+        )
+
     image_bytes, filename, content_type = _shrink_for_ocr(
         image_bytes, filename, content_type
     )
-    # OCR.space returns transient 5xx; one quick retry usually clears it.
+
+    payload: dict | None = None
     last_err: Exception | None = None
-    for attempt in (1, 2):
+
+    for attempt in range(1, OCR_RETRY_MAX_ATTEMPTS + 1):
         try:
             response = requests.post(
                 OCR_API_URL,
@@ -90,23 +159,57 @@ def _ocr_via_api(
                 files={"file": (filename, image_bytes, content_type or "image/png")},
                 timeout=60,
             )
-            if 500 <= response.status_code < 600 and attempt == 1:
-                logger.info("OCR.space %d on attempt 1; retrying once", response.status_code)
-                time.sleep(1.0)
-                continue
+            if 500 <= response.status_code < 600:
+                exc = requests.HTTPError(
+                    f"OCR.space returned {response.status_code}", response=response
+                )
+                last_err = exc
+                if attempt < OCR_RETRY_MAX_ATTEMPTS:
+                    delay = exponential_backoff(
+                        attempt,
+                        base=OCR_RETRY_BASE_DELAY,
+                        cap=OCR_RETRY_MAX_DELAY,
+                    )
+                    logger.info(
+                        "OCR.space %d on attempt %d/%d; retrying in %.1fs",
+                        response.status_code,
+                        attempt,
+                        OCR_RETRY_MAX_ATTEMPTS,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                ocr_circuit_breaker.record_failure()
+                raise exc
             response.raise_for_status()
             payload = response.json()
             break
-        except (requests.HTTPError, requests.ConnectionError, requests.Timeout) as e:
-            last_err = e
-            if attempt == 1:
-                logger.info("OCR.space %s on attempt 1; retrying once", e.__class__.__name__)
-                time.sleep(1.0)
+        except (requests.HTTPError, requests.ConnectionError, requests.Timeout) as exc:
+            last_err = exc
+            if attempt < OCR_RETRY_MAX_ATTEMPTS:
+                delay = exponential_backoff(
+                    attempt,
+                    base=OCR_RETRY_BASE_DELAY,
+                    cap=OCR_RETRY_MAX_DELAY,
+                )
+                logger.info(
+                    "OCR.space %s on attempt %d/%d; retrying in %.1fs",
+                    exc.__class__.__name__,
+                    attempt,
+                    OCR_RETRY_MAX_ATTEMPTS,
+                    delay,
+                )
+                time.sleep(delay)
                 continue
+            ocr_circuit_breaker.record_failure()
             raise
-    else:
+
+    if payload is None:
+        ocr_circuit_breaker.record_failure()
         raise last_err if last_err else RuntimeError("OCR.space failed")
+
     if payload.get("IsErroredOnProcessing"):
+        ocr_circuit_breaker.record_failure()
         raise RuntimeError(f"OCR API error: {payload.get('ErrorMessage') or payload}")
     parsed = payload.get("ParsedResults") or []
     text = "\n".join(item.get("ParsedText", "") for item in parsed)
@@ -127,6 +230,7 @@ def _ocr_via_api(
                 words.append(
                     (str(word.get("WordText", "")), (left, top, left + width, top + height))
                 )
+    ocr_circuit_breaker.record_success()
     return text, words
 
 
@@ -169,6 +273,21 @@ def _ocr_via_tesseract(
 # an accurate analytics tag without relying on shared mutable state
 # (concurrent _ocr() invocations would otherwise race).
 def _ocr(
+    image_bytes: bytes, filename: str, content_type: str
+) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]], str]:
+    # Fast path: return a previously cached result for the same image bytes.
+    key = _cache_key(image_bytes)
+    cached = _cache_get(key)
+    if cached is not None:
+        logger.debug("OCR cache hit for %s (%d bytes)", filename, len(image_bytes))
+        return cached
+
+    result = _ocr_uncached(image_bytes, filename, content_type)
+    _cache_put(key, result)
+    return result
+
+
+def _ocr_uncached(
     image_bytes: bytes, filename: str, content_type: str
 ) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]], str]:
     if OCR_API_KEY:
