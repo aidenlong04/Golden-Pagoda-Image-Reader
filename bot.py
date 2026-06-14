@@ -76,6 +76,7 @@ from cards import (  # noqa: F401  (test-facing re-exports resolved as bot.*)
     _render_progress_card_png,
     _vignette,
 )
+from utils.metrics import heavy_semaphore_metrics, metrics_snapshot, ocr_latency
 
 # Single root handler — discord.py's own setup_logging is disabled in
 # client.run() below (log_handler=None) so every record is emitted exactly
@@ -292,17 +293,85 @@ _BG_TASKS: set[asyncio.Task] = set()
 # Caps how many heavy image jobs (supersampled card renders + OCR upscales)
 # run concurrently. On the CX22 (512MB / 2-3 cores) several simultaneous
 # verifications could otherwise each allocate tens of MB of RGBA buffers at
-# once and spike toward the memory limit. Two in flight keeps it bounded
-# while still overlapping one render with one OCR.
-_HEAVY_JOB_SEMAPHORE = asyncio.Semaphore(2)
+# once and spike toward the memory limit.
+# Tunable via HEAVY_JOB_CONCURRENCY (default 2). Raise to 3-4 only after
+# profiling confirms memory headroom; the semaphore_metrics snapshot on
+# /status will show if requests are queuing.
+HEAVY_JOB_CONCURRENCY: int = _int_env("HEAVY_JOB_CONCURRENCY", 2)
+_HEAVY_JOB_SEMAPHORE = asyncio.Semaphore(HEAVY_JOB_CONCURRENCY)
 
 
 async def _run_heavy(func, /, *args, **kwargs):
     """Run a CPU/memory-heavy callable in a worker thread, bounded by
     ``_HEAVY_JOB_SEMAPHORE`` so concurrent renders/OCR can't pile up and
-    blow the 512MB container budget."""
+    blow the 512MB container budget.
+
+    Instruments ``heavy_semaphore_metrics`` (from utils.metrics) so the
+    /status page can surface current/peak/queued counts and average wait.
+    """
+    enqueue_ts = heavy_semaphore_metrics.record_enqueue()
     async with _HEAVY_JOB_SEMAPHORE:
-        return await asyncio.to_thread(func, *args, **kwargs)
+        heavy_semaphore_metrics.record_acquire(enqueue_ts)
+        try:
+            return await asyncio.to_thread(func, *args, **kwargs)
+        finally:
+            heavy_semaphore_metrics.record_release()
+
+
+# ---------------------------------------------------------------------------
+# Discord API retry helper
+# ---------------------------------------------------------------------------
+# discord.py surfaces rate-limit errors as discord.HTTPException with status
+# 429 and populates `retry_after`. The helper below wraps role-assignment /
+# removal calls (the most common API calls in the hot path) with exponential
+# back-off and jitter so a transient rate-limit never loses a role assignment.
+
+_DISCORD_RETRY_MAX = _int_env("DISCORD_RETRY_MAX", 3)
+_DISCORD_RETRY_BASE = 1.0
+_DISCORD_RETRY_MAX_DELAY = 30.0
+
+
+async def _discord_call_with_retry(coro_factory, /, *, label: str = "discord call") -> None:
+    """Retry a Discord API call with exponential back-off.
+
+    Parameters
+    ----------
+    coro_factory:
+        Zero-argument async callable that creates the coroutine on each
+        attempt (needed because a consumed coroutine cannot be re-awaited).
+    label:
+        Human-readable description for logging.
+    """
+    from utils.retry import exponential_backoff
+    last: Exception | None = None
+    for attempt in range(1, _DISCORD_RETRY_MAX + 1):
+        try:
+            await coro_factory()
+            return
+        except discord.HTTPException as exc:
+            last = exc
+            if exc.status == 429:
+                # Respect the Retry-After header when Discord provides it.
+                retry_after = getattr(exc, "retry_after", None)
+                if retry_after and isinstance(retry_after, (int, float)) and retry_after > 0:
+                    delay = min(float(retry_after), _DISCORD_RETRY_MAX_DELAY)
+                else:
+                    delay = exponential_backoff(
+                        attempt,
+                        base=_DISCORD_RETRY_BASE,
+                        cap=_DISCORD_RETRY_MAX_DELAY,
+                    )
+                if attempt < _DISCORD_RETRY_MAX:
+                    logger.warning(
+                        "%s: rate-limited (attempt %d/%d); sleeping %.1fs",
+                        label, attempt, _DISCORD_RETRY_MAX, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+            # Non-429 or final attempt — propagate.
+            raise
+    if last is not None:
+        raise last
 
 # Sliding-window error tracking for the healthcheck. When >= 3 errors
 # occur in a 60s window, the health-tick task stops writing the signal
@@ -698,6 +767,8 @@ async def _ocr_profile_fields(
             int((time.monotonic() - started) * 1000),
         )
     latency_ms = int((time.monotonic() - started) * 1000)
+    # Record to in-process metrics for the /status Latency page.
+    ocr_latency.record(latency_ms)
 
     # OCR.space often drops the small title-bar text; rerun Tesseract on the
     # top strip to recover the PlayerName#NNN token when it's missing.
@@ -1191,7 +1262,10 @@ async def _add_role(
     if role in member.roles:
         return False, f"already has **{role.name}**"
     try:
-        await member.add_roles(role, reason=reason)
+        await _discord_call_with_retry(
+            lambda: member.add_roles(role, reason=reason),
+            label=f"add_role:{role.name}",
+        )
         return True, f"assigned **{role.name}**"
     except discord.Forbidden:
         return False, f"missing permission to assign **{role.name}**"
@@ -2523,6 +2597,59 @@ def _status_page_clans(interaction: discord.Interaction, _snap: dict) -> str:
     return "\n".join(lines)
 
 
+def _status_page_latency(_interaction: discord.Interaction, _snap: dict) -> str:
+    """Render the live performance metrics page for /status."""
+    from utils.retry import ocr_circuit_breaker
+    snap = metrics_snapshot()
+
+    sem = snap["semaphore"]
+    ocr = snap["ocr_latency"]
+    ana = snap["analytics_latency"]
+
+    cb = ocr_circuit_breaker.snapshot()
+    cb_state = cb["state"]
+    cb_icon = {"closed": "\u2705", "open": "\u274C", "half_open": "\u26a0\ufe0f"}.get(cb_state, "\u2753")
+
+    lines = [
+        "**Heavy-job semaphore**",
+        f"-# Concurrency limit: `{HEAVY_JOB_CONCURRENCY}`",
+        f"-# Current / Peak: `{sem['current']}` / `{sem['peak']}`",
+        f"-# Queued now: `{sem['queued']}`",
+        f"-# Total acquired: `{sem['total_acquired']}`",
+        f"-# Avg queue wait: `{sem['avg_queue_wait_ms']:.0f} ms`",
+        "",
+        "**OCR latency** (session)",
+    ]
+    if ocr["samples"]:
+        lines += [
+            f"-# Samples: `{ocr['samples']}`",
+            f"-# Avg: `{ocr['avg_ms']:.0f} ms`",
+            f"-# p50: `{ocr['p50_ms']:.0f} ms` \u2022 p95: `{ocr['p95_ms']:.0f} ms` \u2022 p99: `{ocr['p99_ms']:.0f} ms`",
+        ]
+    else:
+        lines.append("-# No samples yet.")
+    lines += [
+        "",
+        "**Analytics query latency** (session)",
+    ]
+    if ana["samples"]:
+        lines += [
+            f"-# Samples: `{ana['samples']}`",
+            f"-# Avg: `{ana['avg_ms']:.0f} ms`",
+            f"-# p95: `{ana['p95_ms']:.0f} ms`",
+        ]
+    else:
+        lines.append("-# No samples yet.")
+    lines += [
+        "",
+        "**OCR.space circuit breaker**",
+        f"-# State: {cb_icon} `{cb_state}`",
+        f"-# Failures: `{cb['failures']}` / `{cb['threshold']}`",
+        f"-# Recovery window: `{cb['recovery_seconds']:.0f}s`",
+    ]
+    return "\n".join(lines)
+
+
 # Each entry: (key, title, builder). Builders take (interaction, snap) and
 # return a Markdown body. The "roles" page is special-cased in
 # `_status_components` to wedge the Emblems button between sections, so its
@@ -2535,6 +2662,7 @@ _STATUS_PAGES: list[tuple[str, str, _StatusBuilder | None]] = [
     ("ocr",      "OCR",       _status_page_ocr),
     ("stats",    "Stats",     _status_page_stats),
     ("clans",    "Clans",     _status_page_clans),
+    ("latency",  "Latency",   _status_page_latency),
 ]
 
 # Pages that consume `analytics.summary()`. Computing the snapshot fires
@@ -2697,10 +2825,12 @@ async def _interaction_edit_original_v2(
 
 async def _send_status_page(interaction: discord.Interaction, page: int) -> None:
     try:
-        snap = (
-            await asyncio.to_thread(analytics.summary)
-            if _status_page_needs_snapshot(page) else None
-        )
+        snap = None
+        if _status_page_needs_snapshot(page):
+            t0 = time.monotonic()
+            snap = await asyncio.to_thread(analytics.summary)
+            from utils.metrics import analytics_query_latency
+            analytics_query_latency.record((time.monotonic() - t0) * 1000)
         components = _status_components(interaction, page, snap)
         await _interaction_callback(interaction, 4, components)
     except Exception:
@@ -4186,10 +4316,12 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         page = int(parts[1])
     except ValueError:
         return
-    snap = (
-        await asyncio.to_thread(analytics.summary)
-        if _status_page_needs_snapshot(page) else None
-    )
+    snap = None
+    if _status_page_needs_snapshot(page):
+        t0 = time.monotonic()
+        snap = await asyncio.to_thread(analytics.summary)
+        from utils.metrics import analytics_query_latency
+        analytics_query_latency.record((time.monotonic() - t0) * 1000)
     components = _status_components(interaction, page, snap)
     try:
         await _interaction_callback(interaction, 7, components)  # UPDATE_MESSAGE
