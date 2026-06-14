@@ -54,13 +54,22 @@ _MASTERY_HEADER_RE = re.compile(r"MASTERY\s*RANK", re.IGNORECASE)
 _THOUSANDS_RE = re.compile(r"\d[\d,\s\.]*\d{3}\b")
 _LONG_DIGITS_RE = re.compile(r"\b\d{4,}\b")
 _SMALL_INT_RE = re.compile(r"\b(\d{1,3})\b")
+# Legendary ranks (post-MR30) render a "LEGENDARY" badge instead of a plain
+# number. The label may carry the rank inline ("LEGENDARY RANK 3" / "LEGENDARY
+# 3") or split the number onto the following line. Either way the downstream
+# stack expects the canonical "LR <n>" form (see _format_mastery_display).
+_LEGENDARY_INLINE_RE = re.compile(r"LEGENDARY(?:\s*RANK)?\s*(\d{1,2})\b", re.IGNORECASE)
+_LEGENDARY_RE = re.compile(r"LEGENDARY", re.IGNORECASE)
 
 
 def parse_mastery_rank(ocr_text: str) -> str | None:
-    """Return the mastery rank as a display string (e.g. 'MR 12' or 'Unranked').
+    """Return the mastery rank as a display string (e.g. 'MR 12', 'LR 3' or
+    'Unranked').
 
-    Looks below a 'MASTERY RANK' header for the first non-empty line. Accepts
-    either a numeric rank or the literal 'UNRANKED'. Returns None if absent.
+    Looks below a 'MASTERY RANK' header for the first non-empty line. Accepts a
+    numeric rank, a Legendary rank ("LEGENDARY RANK 3" -> 'LR 3', whether the
+    number is inline or on the following line), or the literal 'UNRANKED'.
+    Returns None if absent.
     """
     if not ocr_text:
         return None
@@ -72,10 +81,20 @@ def parse_mastery_rank(ocr_text: str) -> str | None:
         # an offset HUD), the credit count from the top bar can leak onto
         # the line right after the header, pushing the actual badge
         # number a few lines further down.
+        legendary_seen = False
         for candidate in lines[index + 1 : index + 10]:
             if not candidate:
                 continue
             upper = candidate.upper()
+            # Legendary badge with the rank number on the same line.
+            inline = _LEGENDARY_INLINE_RE.search(candidate)
+            if inline:
+                return f"LR {int(inline.group(1))}"
+            # Legendary badge whose number landed on a following line; remember
+            # we saw the word so the next small int reads as Legendary.
+            if _LEGENDARY_RE.search(upper):
+                legendary_seen = True
+                continue
             if "UNRANKED" in upper:
                 return "Unranked"
             # Skip lines that look like XP / credit totals; the MR badge
@@ -91,7 +110,7 @@ def parse_mastery_rank(ocr_text: str) -> str | None:
                 # anything above 50 as a stray match and keep scanning.
                 if value > 50:
                     continue
-                return f"MR {value}"
+                return f"LR {value}" if legendary_seen else f"MR {value}"
     return None
 
 

@@ -73,6 +73,22 @@ class ParseMasteryRankTests(unittest.TestCase):
         text = "MASTERY RANK\n200\n14\nCLAN\n"
         self.assertEqual(parse_mastery_rank(text), "MR 14")
 
+    def test_extracts_legendary_rank_on_following_line(self) -> None:
+        text = "MASTERY RANK\nLEGENDARY RANK\n3\nCLAN\nGolden Pagoda"
+        self.assertEqual(parse_mastery_rank(text), "LR 3")
+
+    def test_extracts_legendary_rank_inline(self) -> None:
+        text = "MASTERY RANK\nLEGENDARY RANK 5\nCLAN\n"
+        self.assertEqual(parse_mastery_rank(text), "LR 5")
+
+    def test_extracts_legendary_rank_bare_word_inline(self) -> None:
+        text = "MASTERY RANK\nLEGENDARY 2\nCLAN\n"
+        self.assertEqual(parse_mastery_rank(text), "LR 2")
+
+    def test_legendary_skips_leaked_credits(self) -> None:
+        text = "MASTERY RANK\n3,837,977\nLEGENDARY RANK\n4\nMASTER\n"
+        self.assertEqual(parse_mastery_rank(text), "LR 4")
+
 
 class FindClanSlotTests(unittest.TestCase):
     def test_matches_case_insensitively(self) -> None:
