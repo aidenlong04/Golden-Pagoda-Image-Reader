@@ -94,9 +94,7 @@ pytest tests/
 
 ## Performance improvements
 
-The following improvements were made in the `performance-issues-tuning` branch
-to address latency, reliability, and observability issues identified during
-review.
+The following improvements were added to address latency, reliability, and observability issues identified during review.
 
 ### New modules
 

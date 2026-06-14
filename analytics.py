@@ -55,15 +55,16 @@ _read_lock = threading.Lock()
 _read_conn: sqlite3.Connection | None = None
 
 # Summary snapshot cache — avoids re-running ~7 SQL queries on every
-# /status refresh.  Invalidated after writes and on TTL expiry.
-_summary_cache: dict | None = None
-_summary_cache_ts: float = 0.0
+# /status refresh.  Stored as a single ``(result, timestamp)`` tuple so
+# the fast-path read is one atomic reference load (no split between cache
+# object and its timestamp).  Invalidated after writes and on TTL expiry.
+_summary_snapshot: tuple[dict, float] | None = None
 
 
 def invalidate_summary_cache() -> None:
     """Force the next ``summary()`` call to recompute from the database."""
-    global _summary_cache
-    _summary_cache = None
+    global _summary_snapshot
+    _summary_snapshot = None
 
 
 def _resolve_path() -> Path | None:
@@ -596,12 +597,13 @@ def summary() -> dict:
     cache immediately.  Call ``invalidate_summary_cache()`` to force a fresh
     read at any time.
     """
-    global _summary_cache, _summary_cache_ts
+    global _summary_snapshot
 
-    # Fast path: serve the cached snapshot without acquiring any lock.
-    cached = _summary_cache
-    if cached is not None and (time.time() - _summary_cache_ts) < ANALYTICS_SUMMARY_TTL:
-        return cached
+    # Fast path: one atomic reference load — both cache result and timestamp
+    # are read from the same tuple, eliminating the split-read race condition.
+    snap = _summary_snapshot
+    if snap is not None and (time.time() - snap[1]) < ANALYTICS_SUMMARY_TTL:
+        return snap[0]
 
     if _disabled:
         return {
@@ -634,9 +636,9 @@ def summary() -> dict:
                 "db_size_bytes": 0,
             }
         # Double-check under the lock in case another thread already refreshed.
-        if _summary_cache is not None and (time.time() - _summary_cache_ts) < ANALYTICS_SUMMARY_TTL:
-            return _summary_cache
+        snap = _summary_snapshot
+        if snap is not None and (time.time() - snap[1]) < ANALYTICS_SUMMARY_TTL:
+            return snap[0]
         result = _compute_summary()
-        _summary_cache = result
-        _summary_cache_ts = time.time()
+        _summary_snapshot = (result, time.time())
         return result

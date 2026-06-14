@@ -354,7 +354,7 @@ async def _discord_call_with_retry(coro_factory, /, *, label: str = "discord cal
                 # Respect the Retry-After header when Discord provides it.
                 retry_after = getattr(exc, "retry_after", None)
                 if retry_after and isinstance(retry_after, (int, float)) and retry_after > 0:
-                    delay = float(retry_after)
+                    delay = min(float(retry_after), _DISCORD_RETRY_MAX_DELAY)
                 else:
                     delay = exponential_backoff(
                         attempt,

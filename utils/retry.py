@@ -46,7 +46,7 @@ def exponential_backoff(
     interval, which prevents thundering herds when many workers retry
     simultaneously.
     """
-    interval = min(cap, base * (2 ** (attempt - 1)))
+    interval = min(cap, base * (2 ** min(attempt - 1, 30)))
     factor = 1.0 + random.uniform(-jitter, jitter)
     return max(0.0, min(cap, interval * factor))
 
