@@ -2448,8 +2448,12 @@ def _onboarding_welcome_components(member_id: int) -> list[dict]:
     ]
 
 
-async def _post_onboarding_welcome(member: discord.Member) -> None:
-    """Post a public welcome prompt in ONBOARDING_CHANNEL_ID and record it in the DB."""
+async def _post_onboarding_welcome(member: discord.Member) -> bool:
+    """Post a public welcome prompt in ONBOARDING_CHANNEL_ID and record it in the DB.
+
+    Returns True when the welcome was posted (and the prompt recorded), False
+    on any failure so callers (e.g. the admin /onboard trigger) can surface it.
+    """
     components = _onboarding_welcome_components(member.id)
     try:
         msg_id = await _post_channel_v2(
@@ -2459,10 +2463,10 @@ async def _post_onboarding_welcome(member: discord.Member) -> None:
         )
     except Exception:
         logger.exception("onboarding: failed to post welcome for %s", member.id)
-        return
+        return False
     if msg_id is None:
         logger.warning("onboarding: welcome post returned no message id for %s", member.id)
-        return
+        return False
     await asyncio.to_thread(
         analytics.upsert_onboarding_prompt,
         guild_id=member.guild.id,
@@ -2475,6 +2479,7 @@ async def _post_onboarding_welcome(member: discord.Member) -> None:
         "onboarding: posted welcome for %s (msg=%s) in guild %s",
         member.id, msg_id, member.guild.id,
     )
+    return True
 
 
 @client.event
@@ -4107,6 +4112,10 @@ def _manage_components(
                  "label": "Update from screenshot",
                  "emoji": {"name": "\U0001F4F7"},
                  "custom_id": f"manage:{member_id}:update"},
+                {"type": 2, "style": 2,
+                 "label": "Start onboarding",
+                 "emoji": {"name": "\U0001F44B"},
+                 "custom_id": f"manage:{member_id}:onboard"},
             ]})
         container_components.append(nav_row)
     elif key == "titles":
@@ -4302,6 +4311,59 @@ async def _handle_manage_interaction(
             )
         except Exception:
             logger.exception("manage: send screenshot modal failed")
+        return
+
+    if action == "onboard":
+        if member is None:
+            # Raced: the member left between render and click. The welcome
+            # prompt @-mentions the member, so there's nothing to onboard.
+            with contextlib.suppress(Exception):
+                await _interaction_callback(
+                    interaction, 4,
+                    [{"type": 10, "content": "### \U0001F44B  Onboarding"},
+                     {"type": 17, "accent_color": ACCENT_FAIL,
+                      "components": [{"type": 10, "content": (
+                          "-# That member is no longer in the server, so the "
+                          "onboarding welcome can't be posted."
+                      )}]}],
+                )
+            return
+        if ONBOARDING_CHANNEL_ID <= 0:
+            with contextlib.suppress(Exception):
+                await _interaction_callback(
+                    interaction, 4,
+                    [{"type": 10, "content": "### \U0001F44B  Onboarding"},
+                     {"type": 17, "accent_color": ACCENT_FAIL,
+                      "components": [{"type": 10, "content": (
+                          "-# No onboarding channel is configured "
+                          "(`ONBOARDING_CHANNEL_ID`)."
+                      )}]}],
+                )
+            return
+        posted = await _post_onboarding_welcome(member)
+        logger.info(
+            "manage: admin %s triggered onboarding for %s in guild %s (posted=%s)",
+            user.id, member_id, guild.id, posted,
+        )
+        if posted:
+            body = (
+                f"-# \u2705 Posted the onboarding welcome for "
+                f"**{member.display_name}** in <#{ONBOARDING_CHANNEL_ID}>."
+            )
+            accent_color = ACCENT_PASS
+        else:
+            body = (
+                "-# \u274C Couldn't post the onboarding welcome \u2014 check "
+                "my access to the onboarding channel and try again."
+            )
+            accent_color = ACCENT_FAIL
+        with contextlib.suppress(Exception):
+            await _interaction_callback(
+                interaction, 4,
+                [{"type": 10, "content": "### \U0001F44B  Onboarding"},
+                 {"type": 17, "accent_color": accent_color,
+                  "components": [{"type": 10, "content": body}]}],
+            )
         return
 
     # --- Per-field editors (the Edit page) --------------------------------
@@ -5403,6 +5465,62 @@ async def titles_cmd(
                 f"**{title}**."
             )
     await interaction.response.send_message(
+        msg, ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@tree.command(
+    name="onboard",
+    description="Post the onboarding welcome prompt for a member.",
+)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(
+    member="The member to (re-)onboard with a welcome prompt.",
+)
+async def onboard_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member,
+) -> None:
+    """Admin trigger for the onboarding pipeline.
+
+    Posts the public Components V2 welcome prompt (clan buttons + screenshot
+    verification) in ONBOARDING_CHANNEL_ID for ``member`` and records the
+    prompt in the durable store — the same entry point used by on_member_join,
+    but invoked on demand for members who joined while the bot was offline or
+    who need a fresh prompt. Mirrored by the /manage Overview "Start
+    onboarding" button.
+    """
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "\u274C /onboard can only be used in a server.", ephemeral=True
+        )
+        return
+    if ONBOARDING_CHANNEL_ID <= 0:
+        await interaction.response.send_message(
+            "\u274C No onboarding channel is configured "
+            "(`ONBOARDING_CHANNEL_ID`).",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    posted = await _post_onboarding_welcome(member)
+    logger.info(
+        "onboard: admin %s triggered onboarding for %s in guild %s (posted=%s)",
+        interaction.user.id, member.id, guild.id, posted,
+    )
+    if posted:
+        msg = (
+            f"\u2705 Posted the onboarding welcome for "
+            f"**{member.display_name}** in <#{ONBOARDING_CHANNEL_ID}>."
+        )
+    else:
+        msg = (
+            "\u274C Couldn't post the onboarding welcome \u2014 check my "
+            "access to the onboarding channel and try again."
+        )
+    await interaction.followup.send(
         msg, ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
