@@ -3,7 +3,8 @@
 Discord bot ("Oda Helper") that OCRs Warframe profile screenshots posted to a
 configured channel, parses the in-game name + clan, and assigns the matching
 platform / clan roles. Replies use Components V2 (containers, sections, gold
-gradient progress card).
+gradient progress card). New members get a guided onboarding experience with
+clan buttons, screenshot upload, and automatic re-prompts.
 
 ## What it does
 
@@ -17,6 +18,33 @@ gradient progress card).
   then sends a Components V2 reply with a gold progress card.
 - On startup, scans the last `CATCHUP_LOOKBACK_HOURS` hours of channel
   history for screenshots that were missed while offline.
+
+### Member onboarding flow
+
+When a new member joins the server:
+
+1. The bot posts a **public welcome** in `TARGET_CHANNEL_ID` that @-mentions
+   the member and shows **dynamic clan buttons** (from the live 7-slot clan
+   configuration) plus a **"Not listed / No"** button.
+2. Clicking a **clan button** opens a screenshot upload modal. The screenshot
+   is OCR-verified: the clan the member *claims* must match what the OCR reads
+   before any clan role is granted.
+3. **"Not listed / No"** assigns the `INCOMPLETE_ROLE_ID` (pending-review role),
+   notifies the staff channel (`HELP_CHANNEL_ID`), and acknowledges ephemerally.
+4. If the member **hasn't completed onboarding within `ONBOARDING_REPROMPT_HOURS`
+   hours** (default 5), the bot re-posts a fresh welcome and deletes the old one.
+   A configurable cap (`ONBOARDING_MAX_REPROMPTS`, default 3) prevents pinging
+   forever.
+5. All onboarding state is persisted in the `onboarding_prompts` SQLite table
+   and reconciled on startup so restarts/redeploys never lose or duplicate a
+   prompt.
+6. The passive screenshot detection + catch-up scan remain as a **self-healing
+   fallback** so a member who pastes a screenshot directly (no button) is still
+   processed, and joins missed while the bot was offline are recovered on the
+   next startup.
+
+Existing members and re-verifications can use the `/verify` slash command to
+submit a fresh screenshot at any time.
 
 ## Stack
 
@@ -41,6 +69,8 @@ full env reference.
 
 ## Slash commands
 
+- `/verify` — self-service (re-)verify your Warframe profile by uploading a
+  screenshot. Updates clan / mastery / IGN. Available to all members.
 - `/clan-emblems role:<role> emoji:<:name:id>` — set the per-clan emoji at
   runtime. Updates in-memory state, `os.environ`, and rewrites the server's
   `.env`. Requires **Manage Server**.
@@ -61,6 +91,9 @@ full env reference.
   emojis come from the live clan slots, like `/status`), and syndicates
   (multi-select that syncs the syndicate roles). A Titles button points you at
   `/titles`. Requires **Manage Server**.
+- `/profile [user] [ephemeral] [edit_mastery]` — render a member's profile card.
+  Defaults to caller; ephemeral by default. Requires the configured access role
+  or Manage Server.
 
 ## Data retention / on-leave clear
 
@@ -68,13 +101,14 @@ The bot keeps a small durable per-member store (`member_profiles` +
 `member_titles` in the analytics SQLite DB) so profile cards survive restarts.
 When a member **leaves, is kicked, or is banned**, `on_member_remove` fires an
 automatic "on-leave data clear": their stored profile and awarded titles are
-deleted and their verification telemetry is anonymised (the rows stay for
-aggregate stats, but `user_id` is set to `NULL`). The clear is scoped strictly
-to that `(guild_id, user_id)` pair, runs off the event loop, and is fail-soft
-(a gateway event can never crash the bot). The rendered profile/progress cards
-hold no persisted state of their own, so clearing the store leaves nothing to
-reference. `/manage` is the manual backup for cases the automatic clear can't
-cover. Roles are never touched by either path.
+deleted, their onboarding prompt state is removed, and their verification
+telemetry is anonymised (the rows stay for aggregate stats, but `user_id` is
+set to `NULL`). The clear is scoped strictly to that `(guild_id, user_id)` pair,
+runs off the event loop, and is fail-soft (a gateway event can never crash the
+bot). The rendered profile/progress cards hold no persisted state of their own,
+so clearing the store leaves nothing to reference. `/manage` is the manual
+backup for cases the automatic clear can't cover. Roles are never touched by
+either path.
 
 ## Deployment
 

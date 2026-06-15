@@ -196,6 +196,22 @@ def _init() -> None:
                     awarded_ts INTEGER NOT NULL,
                     PRIMARY KEY (guild_id, user_id, title_key)
                 );
+
+                CREATE TABLE IF NOT EXISTS onboarding_prompts (
+                    id INTEGER PRIMARY KEY,
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    posted_ts INTEGER NOT NULL,
+                    completed INTEGER NOT NULL DEFAULT 0,
+                    reprompt_count INTEGER NOT NULL DEFAULT 0,
+                    ocr_fail_count INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE (guild_id, user_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_onboarding_pending
+                    ON onboarding_prompts(completed, posted_ts)
+                    WHERE completed = 0;
                 """
             )
             conn.commit()
@@ -442,12 +458,14 @@ def delete_member_data(*, guild_id: int, user_id: int) -> dict:
     every awarded title, then anonymises their verification telemetry by
     NULLing ``user_id`` on the ``events`` rows (the aggregate /status stats
     only ever group by outcome/clan, so the counts stay exact while the
-    personal reference is gone). Fail-soft like the rest of the module.
+    personal reference is gone). Also deletes any pending onboarding prompt.
+    Fail-soft like the rest of the module.
 
-    Returns a small audit dict ``{"profiles", "titles", "events_anonymized"}``
-    with the number of rows touched in each table (all zero when disabled).
+    Returns a small audit dict ``{"profiles", "titles", "events_anonymized",
+    "onboarding"}`` with the number of rows touched in each table (all zero
+    when disabled).
     """
-    out = {"profiles": 0, "titles": 0, "events_anonymized": 0}
+    out = {"profiles": 0, "titles": 0, "events_anonymized": 0, "onboarding": 0}
     if _disabled:
         return out
     with _lock:
@@ -480,6 +498,12 @@ def delete_member_data(*, guild_id: int, user_id: int) -> dict:
                         (guild_id, user_id),
                     )
                     events = cur.rowcount or 0
+                    cur = conn.execute(
+                        "DELETE FROM onboarding_prompts"
+                        " WHERE guild_id=? AND user_id=?",
+                        (guild_id, user_id),
+                    )
+                    onboarding = cur.rowcount or 0
                     conn.execute("COMMIT")
                 except Exception:
                     conn.execute("ROLLBACK")
@@ -488,11 +512,175 @@ def delete_member_data(*, guild_id: int, user_id: int) -> dict:
                 out["profiles"] = profiles
                 out["titles"] = titles
                 out["events_anonymized"] = events
+                out["onboarding"] = onboarding
             if out["events_anonymized"] or out["profiles"] or out["titles"]:
                 invalidate_summary_cache()
         except Exception:
             logger.exception("analytics: delete_member_data failed")
         return out
+
+
+def upsert_onboarding_prompt(
+    *,
+    guild_id: int,
+    user_id: int,
+    channel_id: int,
+    message_id: int,
+    posted_ts: int,
+) -> None:
+    """Insert or replace an onboarding prompt row.
+
+    On conflict (same guild+user) the existing row is replaced so a
+    re-prompt always reflects the latest message_id and posted_ts while
+    resetting ``completed`` to 0 and incrementing ``reprompt_count``.
+    Fail-soft like :func:`record_verification`.
+    """
+    if _disabled:
+        return
+    with _lock:
+        _init()
+        if _disabled:
+            return
+        try:
+            with _connect() as conn:
+                conn.execute(
+                    "INSERT INTO onboarding_prompts"
+                    " (guild_id, user_id, channel_id, message_id, posted_ts,"
+                    "  completed, reprompt_count, ocr_fail_count)"
+                    " VALUES (?, ?, ?, ?, ?, 0, 0, 0)"
+                    " ON CONFLICT(guild_id, user_id) DO UPDATE SET"
+                    "  channel_id=excluded.channel_id,"
+                    "  message_id=excluded.message_id,"
+                    "  posted_ts=excluded.posted_ts,"
+                    "  completed=0,"
+                    "  reprompt_count=reprompt_count + 1,"
+                    "  ocr_fail_count=0",
+                    (guild_id, user_id, channel_id, message_id, posted_ts),
+                )
+                conn.commit()
+        except Exception:
+            logger.exception("analytics: upsert_onboarding_prompt failed")
+
+
+def get_onboarding_prompt(guild_id: int, user_id: int) -> dict | None:
+    """Return the active onboarding prompt row as a dict, or None."""
+    if _disabled:
+        return None
+    with _lock:
+        _init()
+        if _disabled:
+            return None
+        try:
+            with _connect() as conn:
+                row = conn.execute(
+                    "SELECT guild_id, user_id, channel_id, message_id,"
+                    " posted_ts, completed, reprompt_count, ocr_fail_count"
+                    " FROM onboarding_prompts"
+                    " WHERE guild_id=? AND user_id=?",
+                    (guild_id, user_id),
+                ).fetchone()
+                return dict(row) if row is not None else None
+        except Exception:
+            logger.exception("analytics: get_onboarding_prompt failed")
+            return None
+
+
+def complete_onboarding_prompt(guild_id: int, user_id: int) -> None:
+    """Mark an onboarding prompt as completed. Fail-soft."""
+    if _disabled:
+        return
+    with _lock:
+        _init()
+        if _disabled:
+            return
+        try:
+            with _connect() as conn:
+                conn.execute(
+                    "UPDATE onboarding_prompts SET completed=1"
+                    " WHERE guild_id=? AND user_id=?",
+                    (guild_id, user_id),
+                )
+                conn.commit()
+        except Exception:
+            logger.exception("analytics: complete_onboarding_prompt failed")
+
+
+def delete_onboarding_prompt(guild_id: int, user_id: int) -> None:
+    """Delete an onboarding prompt row. Fail-soft."""
+    if _disabled:
+        return
+    with _lock:
+        _init()
+        if _disabled:
+            return
+        try:
+            with _connect() as conn:
+                conn.execute(
+                    "DELETE FROM onboarding_prompts"
+                    " WHERE guild_id=? AND user_id=?",
+                    (guild_id, user_id),
+                )
+                conn.commit()
+        except Exception:
+            logger.exception("analytics: delete_onboarding_prompt failed")
+
+
+def list_pending_onboarding_prompts() -> list[dict]:
+    """Return all incomplete onboarding prompt rows as dicts.
+
+    Fail-soft: returns an empty list when analytics is disabled or errors.
+    """
+    if _disabled:
+        return []
+    with _lock:
+        _init()
+        if _disabled:
+            return []
+        try:
+            with _connect() as conn:
+                rows = conn.execute(
+                    "SELECT guild_id, user_id, channel_id, message_id,"
+                    " posted_ts, completed, reprompt_count, ocr_fail_count"
+                    " FROM onboarding_prompts"
+                    " WHERE completed=0"
+                    " ORDER BY posted_ts ASC",
+                ).fetchall()
+                return [dict(r) for r in rows]
+        except Exception:
+            logger.exception("analytics: list_pending_onboarding_prompts failed")
+            return []
+
+
+def increment_onboarding_ocr_fail(guild_id: int, user_id: int) -> int:
+    """Increment the OCR fail counter for an onboarding prompt.
+
+    Returns the new fail count, or 0 on error / when the row is gone.
+    Fail-soft.
+    """
+    if _disabled:
+        return 0
+    with _lock:
+        _init()
+        if _disabled:
+            return 0
+        try:
+            with _connect() as conn:
+                conn.execute(
+                    "UPDATE onboarding_prompts"
+                    " SET ocr_fail_count=ocr_fail_count+1"
+                    " WHERE guild_id=? AND user_id=?",
+                    (guild_id, user_id),
+                )
+                conn.commit()
+                row = conn.execute(
+                    "SELECT ocr_fail_count FROM onboarding_prompts"
+                    " WHERE guild_id=? AND user_id=?",
+                    (guild_id, user_id),
+                ).fetchone()
+                return int(row[0]) if row else 0
+        except Exception:
+            logger.exception("analytics: increment_onboarding_ocr_fail failed")
+            return 0
 
 
 def _percentile(values: list[int], pct: float) -> int:
