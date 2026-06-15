@@ -76,6 +76,11 @@ full env reference.
   `.env`. Requires **Manage Server**.
 - `/titles action:<add|remove> member:<member> title:<text> [reason]` — grant
   or remove a member's cosmetic profile title. Requires **Manage Server**.
+- `/onboard member:<member>` — post the onboarding welcome prompt for a member
+  on demand (the same pipeline as the automatic join welcome — clan buttons +
+  screenshot verification). Useful for members who joined while the bot was
+  offline or who need a fresh prompt. Mirrored by the **Start onboarding**
+  button on the `/manage` Overview page. Requires **Manage Server**.
 - `/status` — paginated ephemeral status panel (bot, roles, channels, OCR,
   stats, clans, latency). Surfaces uvloop, RSS, BG tasks, the pooled HTTP
   session and the analytics SQLite WAL state. Requires **Manage Server**.
@@ -83,7 +88,10 @@ full env reference.
   `/status`, with Prev/Next/Refresh). The **Overview**, **Titles** and
   **Data & Clear** pages inspect a member's stored profile + titles and let
   you **clear** them behind a confirm step (the manual backup of the automatic
-  on-leave clear below; works for members who have already left). The **Edit**
+  on-leave clear below; works for members who have already left). The Overview
+  page also offers an **Update from screenshot** button (admin OCR re-verify)
+  and a **Start onboarding** button (re-posts the welcome prompt, same as
+  `/onboard`). The **Edit**
   page edits a present member's verification data — Discord roles **and** the
   durable store are updated together: in-game name (text modal), platform
   (assigns the platform role), mastery rank incl. Legendary (swaps the MR

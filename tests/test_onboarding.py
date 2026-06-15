@@ -288,6 +288,30 @@ class OnboardingComponentsTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# /onboard admin command — triggers the onboarding pipeline on demand
+# ---------------------------------------------------------------------------
+
+class OnboardCommandTests(unittest.TestCase):
+    """The admin /onboard slash command + its /manage Overview mirror."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.bot = bot_module
+
+    def test_onboard_command_registered(self):
+        names = {c.name for c in self.bot.tree.get_commands()}
+        self.assertIn("onboard", names)
+
+    def test_onboard_command_requires_manage_guild(self):
+        cmd = next(
+            c for c in self.bot.tree.get_commands() if c.name == "onboard"
+        )
+        perms = cmd.default_permissions
+        self.assertIsNotNone(perms)
+        self.assertTrue(perms.manage_guild)
+
+
+# ---------------------------------------------------------------------------
 # Interaction ownership gating — unit test via mock interaction
 # ---------------------------------------------------------------------------
 

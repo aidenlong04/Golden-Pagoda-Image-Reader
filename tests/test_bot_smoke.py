@@ -682,6 +682,18 @@ class ManagePanelTests(unittest.TestCase):
         ids = {b.get("custom_id") for b in self._buttons(self._container(comps))}
         self.assertNotIn("manage:5:update", ids)
 
+    def test_overview_page_offers_onboarding_for_present_member(self):
+        snap = {"profile": {"in_game_name": "Tenno"}, "titles": []}
+        comps = self.b._manage_components(5, Mock(display_name="Tenno"), 0, snap)
+        ids = {b.get("custom_id") for b in self._buttons(self._container(comps))}
+        self.assertIn("manage:5:onboard", ids)
+
+    def test_overview_page_hides_onboarding_for_departed_member(self):
+        snap = {"profile": {"in_game_name": "GhostTenno"}, "titles": []}
+        comps = self.b._manage_components(5, None, 0, snap)
+        ids = {b.get("custom_id") for b in self._buttons(self._container(comps))}
+        self.assertNotIn("manage:5:onboard", ids)
+
     def test_manage_screenshot_modal_constructs(self):
         """The /manage admin screenshot modal builds cleanly and carries a
         single file-upload component for the target member's screenshot."""
