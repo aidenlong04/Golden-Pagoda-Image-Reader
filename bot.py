@@ -2727,7 +2727,7 @@ def _build_member_record_components(
     - gold-accented type-17 container with the verification summary
     """
     # Heading (outside the container, like /status "### 📊 Status — Title")
-    heading = f"### \U0001F4CB  Member Record \u2014 {member.display_name}"
+    heading = f"### \U0001F4CB Member Record \u2014 {member.display_name}"
 
     # Body text inside the container — same line format as summary_lines
     # from _verify_member_from_screenshot (e.g. "Clan: assigned", "Mastery Rank: MR 12")

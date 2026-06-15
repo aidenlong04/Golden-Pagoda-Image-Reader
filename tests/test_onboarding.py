@@ -19,19 +19,7 @@ import pytest
 # Fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture()
-def analytics_module(tmp_path, monkeypatch):
-    db = tmp_path / "a.db"
-    monkeypatch.setenv("ANALYTICS_DB_PATH", str(db))
-    import analytics
-    old_conn = getattr(analytics, "_conn", None)
-    if old_conn is not None:
-        try:
-            old_conn.close()
-        except Exception:
-            pass
-    importlib.reload(analytics)
-    return analytics
+# analytics_module fixture is defined in conftest.py (shared with test_analytics.py)
 
 
 # ---------------------------------------------------------------------------
