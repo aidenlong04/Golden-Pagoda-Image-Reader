@@ -2869,7 +2869,48 @@ _MANAGE_PAGES: list[tuple[str, str]] = [
     ("overview", "Overview"),
     ("titles",   "Titles"),
     ("data",     "Data & Clear"),
+    ("edit",     "Edit"),
 ]
+
+# Index of the "Edit" page — the hub for the per-field editors. Kept as a
+# lookup (rather than a literal) so reordering _MANAGE_PAGES can't desync the
+# Back buttons that return to it.
+_MANAGE_EDIT_PAGE = next(
+    i for i, (k, _t) in enumerate(_MANAGE_PAGES) if k == "edit"
+)
+
+# The fields the /manage Edit page can mutate. Each opens its own sub-editor
+# (a modal for the in-game name, an inline select/buttons sub-view for the
+# rest). Order drives the button layout on the Edit page.
+_MANAGE_EDIT_FIELDS: list[tuple[str, str, str]] = [
+    # (field key, button label, button emoji unicode)
+    ("ign",       "In-game name", "\U0001F3F7\uFE0F"),   # 🏷️
+    ("platform",  "Platform",     "\U0001F3AE"),         # 🎮
+    ("mastery",   "Mastery Rank", "\U0001F3C5"),         # 🏅
+    ("clan",      "Clan",         "\U0001F6E1\uFE0F"),   # 🛡️
+    ("syndicate", "Syndicates",   "\U0001F516"),         # 🔖
+    ("titles",    "Titles",       "\U0001F451"),         # 👑
+]
+
+
+def _button_emoji_from_literal(raw: str | None) -> dict | None:
+    """Convert an emoji literal into a Components V2 emoji dict.
+
+    Accepts a custom-emoji literal (``<:name:id>`` / ``<a:name:id>``) →
+    ``{"id", "name", "animated"}`` or a bare unicode emoji → ``{"name": ...}``.
+    Returns None for empty input so callers can omit the key.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    m = _CUSTOM_EMOJI_RE.match(raw)
+    if m:
+        return {
+            "id": m.group(3),
+            "name": m.group(2),
+            "animated": m.group(1) == "a",
+        }
+    return {"name": raw}
 
 
 async def _manage_snapshot(guild_id: int, user_id: int) -> dict:
@@ -2897,6 +2938,387 @@ def _manage_nav_row(member_id: int, page: int) -> dict:
     )
 
 
+# ---------- /manage role-derived state (the Edit page reads roles) ----------
+
+# Discord roles are the source of truth for a member's platform / clan /
+# mastery bucket / syndicates; the durable store only carries the exact
+# in-game name + the fine-grained Mastery Rank override. These helpers read
+# the current role state synchronously (member.roles) so the Edit page can
+# show "what they hold right now" and pre-select the editor controls.
+
+
+def _member_current_platform(member: discord.Member) -> str | None:
+    """Return the platform key (e.g. ``"PC"``) for the first configured
+    platform role the member holds, or None."""
+    role_ids = {r.id for r in member.roles}
+    for platform, rid in PLATFORM_ROLE_IDS.items():
+        if rid and rid in role_ids:
+            return platform
+    return None
+
+
+def _member_current_clan_slot(member: discord.Member) -> "ClanSlot | None":
+    """Return the configured clan slot whose role the member holds, or None."""
+    role_ids = {r.id for r in member.roles}
+    return next(
+        (s for s in CLAN_SLOTS if s.role_id and s.role_id in role_ids),
+        None,
+    )
+
+
+def _member_current_syndicate_ids(member: discord.Member) -> set[int]:
+    """Return the configured syndicate role IDs the member currently holds."""
+    syn_ids = set(SYNDICATE_ROLE_IDS)
+    return {r.id for r in member.roles if r.id in syn_ids}
+
+
+def _member_current_mr_role(member: discord.Member) -> "discord.Role | None":
+    """Return the configured MR bucket role the member currently holds (the
+    coarse Discord role), or None."""
+    mr_ids = set(MR_ROLE_IDS)
+    return next((r for r in member.roles if r.id in mr_ids), None)
+
+
+async def _apply_platform_role(
+    member: discord.Member, platform: str
+) -> str:
+    """Assign ``member`` the configured role for ``platform`` (removing any
+    other configured platform roles) and persist the platform to the store.
+
+    Returns ``"assigned"``, ``"no_match"`` (platform not configured), or
+    ``"error"`` (role edit failed).
+    """
+    target_id = PLATFORM_ROLE_IDS.get(platform)
+    target = member.guild.get_role(target_id) if target_id else None
+    if target is None:
+        return "no_match"
+    plat_ids = {rid for rid in PLATFORM_ROLE_IDS.values() if rid}
+    have_ids = {r.id for r in member.roles}
+    to_remove = [
+        r for r in member.roles if r.id in plat_ids and r.id != target.id
+    ]
+    try:
+        if to_remove:
+            await member.remove_roles(*to_remove, reason="Manage: platform edit")
+        if target.id not in have_ids:
+            await member.add_roles(target, reason="Manage: platform edit")
+    except discord.HTTPException:
+        logger.exception("manage: platform role swap failed")
+        return "error"
+    await asyncio.to_thread(
+        analytics.upsert_member_profile,
+        guild_id=member.guild.id,
+        user_id=member.id,
+        platform=platform,
+    )
+    return "assigned"
+
+
+async def _apply_clan_slot(member: discord.Member, slot: "ClanSlot") -> str:
+    """Assign ``member`` the role for clan ``slot`` (removing any other
+    configured clan roles) and persist the clan name to the store.
+
+    Returns ``"assigned"``, ``"no_match"`` (slot has no resolvable role), or
+    ``"error"`` (role edit failed).
+    """
+    target = member.guild.get_role(slot.role_id) if slot.role_id else None
+    if target is None:
+        return "no_match"
+    clan_ids = {s.role_id for s in CLAN_SLOTS if s.role_id}
+    have_ids = {r.id for r in member.roles}
+    to_remove = [
+        r for r in member.roles if r.id in clan_ids and r.id != target.id
+    ]
+    try:
+        if to_remove:
+            await member.remove_roles(*to_remove, reason="Manage: clan edit")
+        if target.id not in have_ids:
+            await member.add_roles(target, reason="Manage: clan edit")
+    except discord.HTTPException:
+        logger.exception("manage: clan role swap failed")
+        return "error"
+    await asyncio.to_thread(
+        analytics.upsert_member_profile,
+        guild_id=member.guild.id,
+        user_id=member.id,
+        clan=_strip_clan_tag(slot.clan_name or "") or None,
+    )
+    return "assigned"
+
+
+async def _sync_syndicate_roles(
+    member: discord.Member, wanted_ids: set[int]
+) -> str:
+    """Make ``member``'s configured syndicate roles exactly match
+    ``wanted_ids`` (a subset of ``SYNDICATE_ROLE_IDS``).
+
+    Returns ``"assigned"`` (incl. no-op) or ``"error"``.
+    """
+    syn_ids = set(SYNDICATE_ROLE_IDS)
+    wanted = wanted_ids & syn_ids
+    have = {r.id for r in member.roles if r.id in syn_ids}
+    to_add = [
+        role for rid in (wanted - have)
+        if (role := member.guild.get_role(rid)) is not None
+    ]
+    to_remove = [
+        role for rid in (have - wanted)
+        if (role := member.guild.get_role(rid)) is not None
+    ]
+    try:
+        if to_add:
+            await member.add_roles(*to_add, reason="Manage: syndicate edit")
+        if to_remove:
+            await member.remove_roles(
+                *to_remove, reason="Manage: syndicate edit"
+            )
+    except discord.HTTPException:
+        logger.exception("manage: syndicate role sync failed")
+        return "error"
+    return "assigned"
+
+
+def _manage_edit_page_components(
+    member_id: int,
+    member: "discord.Member | None",
+    profile: dict | None,
+    *,
+    note: str | None = None,
+) -> list[dict]:
+    """Build the body of the /manage **Edit** page (the per-field hub).
+
+    Shows the member's current role-derived state (platform / clan / mastery
+    bucket / syndicates straight off their roles, in-game name from the store)
+    next to a button per editable field. Each button opens its own sub-editor
+    (a modal for the in-game name, an inline select/buttons sub-view for the
+    rest). For a departed member (``member is None``) there are no roles to
+    edit, so only an explanatory line is shown.
+    """
+    body: list[dict] = []
+    if member is None:
+        body.append({"type": 10, "content": (
+            "**Edit**\n-# This member has left the server, so their roles "
+            "can't be edited. Use the **Data & Clear** page to wipe their "
+            "stored data."
+        )})
+        return body
+
+    ign = (profile or {}).get("in_game_name")
+    platform = _member_current_platform(member)
+    clan_slot = _member_current_clan_slot(member)
+    clan_name = (
+        _strip_clan_tag(clan_slot.clan_name or "") if clan_slot else None
+    )
+    mr_role = _member_current_mr_role(member)
+    mastery_override = (profile or {}).get("mastery_rank")
+    if mastery_override:
+        mr_display = _format_mastery_display(mastery_override) or mastery_override
+    elif mr_role is not None:
+        mr_display = mr_role.name
+    else:
+        mr_display = None
+    syn_ids = _member_current_syndicate_ids(member)
+    syn_names = [
+        r.name for r in member.roles if r.id in syn_ids
+    ]
+
+    def _val(v: "str | None") -> str:
+        return f"`{v}`" if v else "*(unset)*"
+
+    # Current value per field key (titles is shown via its own page).
+    values: dict[str, str] = {
+        "ign": _val(ign),
+        "platform": _val(platform),
+        "mastery": _val(mr_display),
+        "clan": _val(clan_name),
+        "syndicate": (
+            ", ".join(f"`{n}`" for n in syn_names) if syn_names else "*(none)*"
+        ),
+    }
+    lines = [
+        "**Edit member data**",
+        "-# Edits update the member's Discord roles **and** the stored "
+        "profile together.",
+        "",
+    ]
+    # Drive the display rows off _MANAGE_EDIT_FIELDS so the emoji/label live
+    # in exactly one place (the same source the buttons below use).
+    for field, label, emoji in _MANAGE_EDIT_FIELDS:
+        if field in values:
+            lines.append(f"-# {emoji} {label}: {values[field]}")
+    if note:
+        lines.append("")
+        lines.append(f"-# {note}")
+    body.append({"type": 10, "content": "\n".join(lines)})
+
+    # One button per editable field. ``ign`` opens a modal; ``titles`` posts a
+    # /titles hint; the rest open inline sub-editors. Split across rows of 5.
+    field_buttons: list[dict] = []
+    for field, label, emoji in _MANAGE_EDIT_FIELDS:
+        if field == "ign":
+            cid = f"manage:{member_id}:ign"
+        elif field == "titles":
+            cid = f"manage:{member_id}:titleshint"
+        else:
+            cid = f"manage:{member_id}:editfield:{field}"
+        field_buttons.append({
+            "type": 2, "style": 2, "label": label,
+            "emoji": {"name": emoji}, "custom_id": cid,
+        })
+    for i in range(0, len(field_buttons), 5):
+        body.append({"type": 1, "components": field_buttons[i:i + 5]})
+    return body
+
+
+def _manage_editor_components(
+    member_id: int,
+    member: discord.Member,
+    field: str,
+    *,
+    note: str | None = None,
+) -> list[dict]:
+    """Build the full Components V2 payload for a single-field sub-editor.
+
+    ``field`` is one of ``"platform"``, ``"mastery"``, ``"clan"``,
+    ``"syndicate"``. Each renders the appropriate control (select(s) for
+    platform / mastery / syndicate, dynamic buttons for clan) pre-reflecting
+    the member's current roles, plus a Back button to the Edit page. The
+    in-game name and titles fields don't route here (modal / hint instead).
+    """
+    back_row = {"type": 1, "components": [
+        {"type": 2, "style": 2, "label": "\u25C0 Back",
+         "custom_id": f"manage:{member_id}:p:{_MANAGE_EDIT_PAGE}"},
+    ]}
+    container: list[dict] = []
+    title = "Edit"
+
+    if field == "platform":
+        title = "Platform"
+        configured = [
+            (p, rid) for p, rid in PLATFORM_ROLE_IDS.items() if rid
+        ]
+        current = _member_current_platform(member)
+        if not configured:
+            container.append({"type": 10, "content": (
+                "**Platform**\n-# No platform roles are configured on this "
+                "server."
+            )})
+        else:
+            options = []
+            for plat, _rid in configured:
+                opt = {"label": plat, "value": plat, "default": plat == current}
+                emoji = _button_emoji_from_literal(PLATFORM_EMOJIS.get(plat))
+                if emoji:
+                    opt["emoji"] = emoji
+                options.append(opt)
+            container.append({"type": 10, "content": (
+                "**Platform**\n-# Pick the member's platform. This assigns "
+                "the matching platform role (replacing any other) and stores "
+                "it."
+            )})
+            container.append({"type": 1, "components": [{
+                "type": 3, "custom_id": f"manage:{member_id}:setplatform",
+                "placeholder": "Select platform",
+                "min_values": 1, "max_values": 1, "options": options,
+            }]})
+
+    elif field == "mastery":
+        title = "Mastery Rank"
+        first, second = _mastery_select_options()
+        container.append({"type": 10, "content": (
+            "**Mastery Rank**\n-# Pick the member's exact rank (Legendary "
+            "ranks too). This swaps their MR bucket role and stores the exact "
+            "rank."
+        )})
+        for ph, opts, suffix in (
+            ("Set Mastery Rank (1\u201325)", first, "a"),
+            ("Set Mastery Rank 26\u201330 / Legendary 1\u20138", second, "b"),
+        ):
+            container.append({"type": 1, "components": [{
+                "type": 3, "custom_id": f"manage:{member_id}:setmr:{suffix}",
+                "placeholder": ph,
+                "min_values": 1, "max_values": 1,
+                "options": [
+                    {"label": o.label, "value": o.value} for o in opts
+                ],
+            }]})
+
+    elif field == "clan":
+        title = "Clan"
+        configured = [s for s in CLAN_SLOTS if s.clan_name and s.role_id]
+        current = _member_current_clan_slot(member)
+        if not configured:
+            container.append({"type": 10, "content": (
+                "**Clan**\n-# No clan slots are configured on this server."
+            )})
+        else:
+            container.append({"type": 10, "content": (
+                "**Clan**\n-# Pick the member's clan. This assigns the clan "
+                "role (replacing any other clan role) and stores it."
+            )})
+            # Dynamic buttons: names + emojis come straight from the live clan
+            # slots (the same data /status shows), so they update on their own
+            # whenever an emblem or clan is reconfigured.
+            buttons: list[dict] = []
+            for slot in configured:
+                is_current = bool(current and current.slot == slot.slot)
+                btn = {
+                    "type": 2,
+                    "style": 1 if is_current else 2,
+                    "label": (_strip_clan_tag(slot.clan_name or "") or "?")[:80],
+                    "custom_id": f"manage:{member_id}:setclan:{slot.slot}",
+                }
+                emoji = _button_emoji_from_literal(slot.emoji)
+                if emoji:
+                    btn["emoji"] = emoji
+                buttons.append(btn)
+            for i in range(0, len(buttons), 5):
+                container.append({"type": 1, "components": buttons[i:i + 5]})
+
+    elif field == "syndicate":
+        title = "Syndicates"
+        configured = [
+            r for rid in SYNDICATE_ROLE_IDS
+            if (r := member.guild.get_role(rid)) is not None
+        ]
+        current_ids = _member_current_syndicate_ids(member)
+        if not configured:
+            container.append({"type": 10, "content": (
+                "**Syndicates**\n-# No syndicate roles are configured on this "
+                "server."
+            )})
+        else:
+            options = []
+            for r in configured:
+                opt = {
+                    "label": r.name[:100], "value": str(r.id),
+                    "default": r.id in current_ids,
+                }
+                emoji = _button_emoji_from_literal(_syndicate_style(r.name)[1])
+                if emoji:
+                    opt["emoji"] = emoji
+                options.append(opt)
+            container.append({"type": 10, "content": (
+                "**Syndicates**\n-# Select every syndicate the member belongs "
+                "to (clear all to remove them). Roles are synced to match."
+            )})
+            container.append({"type": 1, "components": [{
+                "type": 3, "custom_id": f"manage:{member_id}:setsyn",
+                "placeholder": "Select syndicates",
+                "min_values": 0, "max_values": len(options),
+                "options": options,
+            }]})
+
+    if note:
+        container.append({"type": 10, "content": f"-# {note}"})
+    container.append(back_row)
+    return [
+        {"type": 10,
+         "content": f"### \U0001F6E0\uFE0F  Manage \u2014 Edit {title}"},
+        {"type": 17, "accent_color": ACCENT_PASS, "components": container},
+    ]
+
+
 def _manage_components(
     member_id: int,
     member: "discord.Member | None",
@@ -2905,6 +3327,7 @@ def _manage_components(
     *,
     confirm_clear: bool = False,
     cleared: dict | None = None,
+    note: str | None = None,
 ) -> list[dict]:
     """Build the Components V2 payload for one /manage page.
 
@@ -2976,6 +3399,11 @@ def _manage_components(
         container_components = [
             {"type": 10, "content": "\n".join(lines)}, nav_row,
         ]
+    elif key == "edit":
+        container_components = _manage_edit_page_components(
+            member_id, member, profile, note=note,
+        )
+        container_components.append(nav_row)
     else:  # "data"
         has_profile = "yes" if profile else "no"
         lines = [
@@ -3146,6 +3574,145 @@ async def _handle_manage_interaction(
             )
         except Exception:
             logger.exception("manage: send screenshot modal failed")
+        return
+
+    # --- Per-field editors (the Edit page) --------------------------------
+    # These all need the member present (they mutate roles). For a departed
+    # member just refresh the panel, which renders the "left the server" note.
+    _EDIT_ACTIONS = {
+        "editfield", "ign", "titleshint",
+        "setplatform", "setmr", "setclan", "setsyn",
+    }
+    if action in _EDIT_ACTIONS and member is None:
+        snap = await _manage_snapshot(guild.id, member_id)
+        components = _manage_components(
+            member_id, None, _MANAGE_EDIT_PAGE, snap
+        )
+        with contextlib.suppress(Exception):
+            await _interaction_callback(interaction, 7, components)
+        return
+
+    if action == "ign":
+        try:
+            stored = await asyncio.to_thread(
+                analytics.get_member_profile, guild.id, member_id
+            )
+            await interaction.response.send_modal(_ManageIGNModal(
+                member=member, current=(stored or {}).get("in_game_name"),
+            ))
+        except Exception:
+            logger.exception("manage: send IGN modal failed")
+        return
+
+    if action == "titleshint":
+        cmd_id = _COMMAND_IDS.get("titles")
+        mention = f"</titles:{cmd_id}>" if cmd_id else "`/titles`"
+        with contextlib.suppress(Exception):
+            await _interaction_callback(
+                interaction, 4,
+                [{"type": 10, "content": "### \U0001F451  Titles"},
+                 {"type": 17, "accent_color": ACCENT_PASS, "components": [
+                     {"type": 10, "content": (
+                         f"Use {mention} to add or remove a member's cosmetic "
+                         "profile titles."
+                     )}]}],
+            )
+        return
+
+    if action == "editfield":
+        field = parts[3] if len(parts) > 3 else ""
+        components = _manage_editor_components(member_id, member, field)
+        with contextlib.suppress(Exception):
+            await _interaction_callback(interaction, 7, components)
+        return
+
+    if action == "setplatform":
+        values = (interaction.data or {}).get("values") or []
+        note = "No platform selected."
+        if values:
+            status = await _apply_platform_role(member, values[0])
+            note = {
+                "assigned": f"\u2705 Platform set to **{values[0]}**.",
+                "no_match": "That platform role isn't configured here.",
+                "error": "Couldn't change the role \u2014 check my Manage "
+                         "Roles permission and role position.",
+            }.get(status, "Updated.")
+        components = _manage_editor_components(
+            member_id, member, "platform", note=note
+        )
+        with contextlib.suppress(Exception):
+            await _interaction_callback(interaction, 7, components)
+        return
+
+    if action == "setmr":
+        values = (interaction.data or {}).get("values") or []
+        note = "No rank selected."
+        kind, _, num = (values[0].partition(":") if values else ("", "", ""))
+        if kind in ("MR", "LR") and num.isdigit() and int(num) > 0:
+            value = int(num)
+            status = await _apply_mastery_bucket(member, kind, value)
+            await asyncio.to_thread(
+                analytics.upsert_member_profile,
+                guild_id=guild.id, user_id=member_id,
+                mastery_rank=f"{kind} {value}",
+            )
+            disp = _format_mastery_display(f"{kind} {value}")
+            note = {
+                "assigned": f"\u2705 Mastery Rank set to **{disp}**.",
+                "no_match": f"Saved **{disp}**, but no matching MR bucket "
+                            "role is configured here.",
+                "error": f"Saved **{disp}**, but I couldn't change the role "
+                         "\u2014 check my Manage Roles permission.",
+            }.get(status, "Updated.")
+        elif values:
+            # Malformed select value — don't store a bogus rank.
+            logger.warning("manage: ignoring malformed setmr value %r", values[0])
+            note = "Couldn't read that rank \u2014 try again."
+        components = _manage_editor_components(
+            member_id, member, "mastery", note=note
+        )
+        with contextlib.suppress(Exception):
+            await _interaction_callback(interaction, 7, components)
+        return
+
+    if action == "setclan":
+        note = "No clan selected."
+        try:
+            slot_no = int(parts[3])
+        except (IndexError, ValueError):
+            slot_no = 0
+        slot = next((s for s in CLAN_SLOTS if s.slot == slot_no), None)
+        if slot is not None:
+            status = await _apply_clan_slot(member, slot)
+            label = _strip_clan_tag(slot.clan_name or "") or "?"
+            note = {
+                "assigned": f"\u2705 Clan set to **{label}**.",
+                "no_match": "That clan slot has no resolvable role.",
+                "error": "Couldn't change the role \u2014 check my Manage "
+                         "Roles permission and role position.",
+            }.get(status, "Updated.")
+        components = _manage_editor_components(
+            member_id, member, "clan", note=note
+        )
+        with contextlib.suppress(Exception):
+            await _interaction_callback(interaction, 7, components)
+        return
+
+    if action == "setsyn":
+        values = (interaction.data or {}).get("values") or []
+        wanted = {int(v) for v in values if str(v).isdigit()}
+        status = await _sync_syndicate_roles(member, wanted)
+        note = (
+            f"\u2705 Syndicates updated ({len(wanted)} selected)."
+            if status == "assigned"
+            else "Couldn't update the roles \u2014 check my Manage Roles "
+                 "permission and role position."
+        )
+        components = _manage_editor_components(
+            member_id, member, "syndicate", note=note
+        )
+        with contextlib.suppress(Exception):
+            await _interaction_callback(interaction, 7, components)
         return
 
     try:
@@ -3611,6 +4178,60 @@ class _ScreenshotVerifyButton(discord.ui.Button):
             source_view=self.view,
         )
         await interaction.response.send_modal(modal)
+
+
+class _ManageIGNModal(discord.ui.Modal):
+    """Admin modal opened from the /manage Edit page to set a member's stored
+    in-game name by hand (no OCR). Writes ``in_game_name`` to the durable
+    store and refreshes the Edit page in place.
+    """
+
+    def __init__(
+        self, *, member: discord.Member, current: str | None = None
+    ) -> None:
+        super().__init__(title="Set In-game Name", timeout=600)
+        self._gp_member = member
+        self.ign = discord.ui.TextInput(
+            label="In-game name",
+            placeholder="PlayerName#123",
+            default=current or None,
+            required=True,
+            max_length=64,
+        )
+        self.add_item(self.ign)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        user = interaction.user
+        if not (
+            isinstance(user, discord.Member)
+            and user.guild_permissions.manage_guild
+        ):
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "Operator, you can't use this.", ephemeral=True
+                )
+            return
+        member = self._gp_member
+        value = (self.ign.value or "").strip()
+        if value:
+            await asyncio.to_thread(
+                analytics.upsert_member_profile,
+                guild_id=member.guild.id,
+                user_id=member.id,
+                in_game_name=value,
+            )
+        # Refresh the Edit page in place (the modal submit is a fresh
+        # interaction, so ack as a deferred update then PATCH @original).
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.defer()
+        with contextlib.suppress(Exception):
+            snap = await _manage_snapshot(member.guild.id, member.id)
+            components = _manage_components(
+                member.id, member, _MANAGE_EDIT_PAGE, snap,
+                note=f"\u2705 In-game name set to **{_strip_clan_tag(value)}**."
+                if value else "No name entered.",
+            )
+            await _interaction_edit_original_v2(interaction, components)
 
 
 class _ManageScreenshotModal(discord.ui.Modal):
