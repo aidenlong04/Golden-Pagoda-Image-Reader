@@ -3125,18 +3125,27 @@ def _manage_edit_page_components(
     def _val(v: "str | None") -> str:
         return f"`{v}`" if v else "*(unset)*"
 
+    # Current value per field key (titles is shown via its own page).
+    values: dict[str, str] = {
+        "ign": _val(ign),
+        "platform": _val(platform),
+        "mastery": _val(mr_display),
+        "clan": _val(clan_name),
+        "syndicate": (
+            ", ".join(f"`{n}`" for n in syn_names) if syn_names else "*(none)*"
+        ),
+    }
     lines = [
         "**Edit member data**",
         "-# Edits update the member's Discord roles **and** the stored "
         "profile together.",
         "",
-        f"-# \U0001F3F7\uFE0F In-game name: {_val(ign)}",
-        f"-# \U0001F3AE Platform: {_val(platform)}",
-        f"-# \U0001F3C5 Mastery Rank: {_val(mr_display)}",
-        f"-# \U0001F6E1\uFE0F Clan: {_val(clan_name)}",
-        "-# \U0001F516 Syndicates: "
-        + (", ".join(f"`{n}`" for n in syn_names) if syn_names else "*(none)*"),
     ]
+    # Drive the display rows off _MANAGE_EDIT_FIELDS so the emoji/label live
+    # in exactly one place (the same source the buttons below use).
+    for field, label, emoji in _MANAGE_EDIT_FIELDS:
+        if field in values:
+            lines.append(f"-# {emoji} {label}: {values[field]}")
     if note:
         lines.append("")
         lines.append(f"-# {note}")
@@ -3638,12 +3647,9 @@ async def _handle_manage_interaction(
     if action == "setmr":
         values = (interaction.data or {}).get("values") or []
         note = "No rank selected."
-        if values:
-            kind, _, num = values[0].partition(":")
-            try:
-                value = int(num)
-            except ValueError:
-                value = 0
+        kind, _, num = (values[0].partition(":") if values else ("", "", ""))
+        if kind in ("MR", "LR") and num.isdigit() and int(num) > 0:
+            value = int(num)
             status = await _apply_mastery_bucket(member, kind, value)
             await asyncio.to_thread(
                 analytics.upsert_member_profile,
@@ -3658,6 +3664,10 @@ async def _handle_manage_interaction(
                 "error": f"Saved **{disp}**, but I couldn't change the role "
                          "\u2014 check my Manage Roles permission.",
             }.get(status, "Updated.")
+        elif values:
+            # Malformed select value — don't store a bogus rank.
+            logger.warning("manage: ignoring malformed setmr value %r", values[0])
+            note = "Couldn't read that rank \u2014 try again."
         components = _manage_editor_components(
             member_id, member, "mastery", note=note
         )
