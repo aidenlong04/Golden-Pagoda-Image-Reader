@@ -609,7 +609,9 @@ class ManagePanelTests(unittest.TestCase):
 
     def test_data_page_shows_clear_button(self):
         snap = {"profile": {"in_game_name": "X"}, "titles": []}
-        comps = self.b._manage_components(5, Mock(display_name="X"), 2, snap)
+        comps = self.b._manage_components(
+            5, Mock(display_name="X"), self.b._MANAGE_DATA_PAGE, snap
+        )
         buttons = self._buttons(self._container(comps))
         clear = next(
             (b for b in buttons if b.get("custom_id") == "manage:5:clear"),
@@ -620,7 +622,9 @@ class ManagePanelTests(unittest.TestCase):
 
     def test_data_page_no_clear_button_when_empty(self):
         snap = {"profile": None, "titles": []}
-        comps = self.b._manage_components(5, Mock(display_name="X"), 2, snap)
+        comps = self.b._manage_components(
+            5, Mock(display_name="X"), self.b._MANAGE_DATA_PAGE, snap
+        )
         buttons = self._buttons(self._container(comps))
         self.assertFalse(
             any(b.get("custom_id", "").endswith(":clear") for b in buttons)
@@ -629,19 +633,22 @@ class ManagePanelTests(unittest.TestCase):
     def test_confirm_clear_uses_fail_accent_and_confirm_buttons(self):
         snap = {"profile": {"in_game_name": "X"}, "titles": []}
         comps = self.b._manage_components(
-            5, Mock(display_name="X"), 2, snap, confirm_clear=True
+            5, Mock(display_name="X"), self.b._MANAGE_DATA_PAGE, snap,
+            confirm_clear=True,
         )
         container = self._container(comps)
         self.assertEqual(container["accent_color"], self.b.ACCENT_FAIL)
         ids = {b.get("custom_id") for b in self._buttons(container)}
         self.assertIn("manage:5:clearok", ids)
-        self.assertIn("manage:5:p:2", ids)  # Cancel -> back to data page
+        # Cancel -> back to data page
+        self.assertIn(f"manage:5:p:{self.b._MANAGE_DATA_PAGE}", ids)
 
     def test_cleared_state_reports_counts_and_drops_clear(self):
         snap = {"profile": None, "titles": []}
         cleared = {"profiles": 1, "titles": 2, "events_anonymized": 3}
         comps = self.b._manage_components(
-            5, Mock(display_name="X"), 2, snap, cleared=cleared
+            5, Mock(display_name="X"), self.b._MANAGE_DATA_PAGE, snap,
+            cleared=cleared,
         )
         container = self._container(comps)
         body = container["components"][0]["content"]
@@ -1179,22 +1186,27 @@ class ManageComponentsCharacterizationTests(unittest.TestCase):
         self.assertNotIn("manage:42:update", self._ids(result))
 
     def test_data_page_default_offers_clear(self):
-        result = self.b._manage_components(42, self.member, 2, self.snap)
+        result = self.b._manage_components(
+            42, self.member, self.b._MANAGE_DATA_PAGE, self.snap
+        )
         self.assertIn("manage:42:clear", self._ids(result))
 
     def test_data_page_confirm_is_fail_accent_with_confirm_cancel(self):
         result = self.b._manage_components(
-            42, self.member, 2, self.snap, confirm_clear=True,
+            42, self.member, self.b._MANAGE_DATA_PAGE, self.snap,
+            confirm_clear=True,
         )
         self.assertEqual(result[1]["accent_color"], self.b.ACCENT_FAIL)
         ids = self._ids(result)
         self.assertIn("manage:42:clearok", ids)
-        self.assertIn("manage:42:p:2", ids)  # Cancel returns to the data page.
+        # Cancel returns to the data page.
+        self.assertIn(f"manage:42:p:{self.b._MANAGE_DATA_PAGE}", ids)
 
     def test_data_page_cleared_shows_no_action_buttons(self):
         cleared = {"profiles": 1, "titles": 1, "events_anonymized": 3}
         result = self.b._manage_components(
-            42, self.member, 2, self.snap, cleared=cleared,
+            42, self.member, self.b._MANAGE_DATA_PAGE, self.snap,
+            cleared=cleared,
         )
         ids = self._ids(result)
         self.assertNotIn("manage:42:clear", ids)
@@ -1202,7 +1214,9 @@ class ManageComponentsCharacterizationTests(unittest.TestCase):
 
     def test_data_page_empty_store_has_no_clear(self):
         empty = {"profile": None, "titles": []}
-        result = self.b._manage_components(42, self.member, 2, empty)
+        result = self.b._manage_components(
+            42, self.member, self.b._MANAGE_DATA_PAGE, empty
+        )
         self.assertNotIn("manage:42:clear", self._ids(result))
 
     def test_all_nav_custom_ids_use_manage_prefix(self):
@@ -1218,8 +1232,8 @@ class ManageComponentsCharacterizationTests(unittest.TestCase):
     def test_page_index_clamps(self):
         low = self.b._manage_components(42, self.member, -3, self.snap)
         high = self.b._manage_components(42, self.member, 99, self.snap)
-        self.assertIn("Overview", low[0]["content"])
-        self.assertIn("Edit", high[0]["content"])
+        self.assertIn(self.b._MANAGE_PAGES[0][1], low[0]["content"])
+        self.assertIn(self.b._MANAGE_PAGES[-1][1], high[0]["content"])
 
 
 class ManageEditPanelTests(unittest.TestCase):

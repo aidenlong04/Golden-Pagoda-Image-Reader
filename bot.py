@@ -2867,9 +2867,9 @@ async def status_cmd(interaction: discord.Interaction) -> None:
 # `_manage_components` because each one needs the gathered snapshot + member.
 _MANAGE_PAGES: list[tuple[str, str]] = [
     ("overview", "Overview"),
+    ("edit",     "Edit"),
     ("titles",   "Titles"),
     ("data",     "Data & Clear"),
-    ("edit",     "Edit"),
 ]
 
 # Index of the "Edit" page — the hub for the per-field editors. Kept as a
@@ -2877,6 +2877,12 @@ _MANAGE_PAGES: list[tuple[str, str]] = [
 # Back buttons that return to it.
 _MANAGE_EDIT_PAGE = next(
     i for i, (k, _t) in enumerate(_MANAGE_PAGES) if k == "edit"
+)
+
+# Index of the "Data & Clear" page — used by the clear/confirm flow (and the
+# Cancel button) so reordering _MANAGE_PAGES can't desync them.
+_MANAGE_DATA_PAGE = next(
+    i for i, (k, _t) in enumerate(_MANAGE_PAGES) if k == "data"
 )
 
 # The fields the /manage Edit page can mutate. Each opens its own sub-editor
@@ -3136,16 +3142,18 @@ def _manage_edit_page_components(
         ),
     }
     lines = [
-        "**Edit member data**",
+        f"**Edit member data** ({len(values)} fields)",
         "-# Edits update the member's Discord roles **and** the stored "
-        "profile together.",
+        "profile together \u2014 pick a field below to change it.",
         "",
     ]
     # Drive the display rows off _MANAGE_EDIT_FIELDS so the emoji/label live
-    # in exactly one place (the same source the buttons below use).
+    # in exactly one place (the same source the buttons below use). The row
+    # layout mirrors the /status Clans page: glyph + code label + em-dash
+    # detail.
     for field, label, emoji in _MANAGE_EDIT_FIELDS:
         if field in values:
-            lines.append(f"-# {emoji} {label}: {values[field]}")
+            lines.append(f"-# {emoji} `{label}` \u2014 {values[field]}")
     if note:
         lines.append("")
         lines.append(f"-# {note}")
@@ -3432,7 +3440,7 @@ def _manage_components(
                 {"type": 2, "style": 4, "label": "Confirm clear",
                  "custom_id": f"manage:{member_id}:clearok"},
                 {"type": 2, "style": 2, "label": "Cancel",
-                 "custom_id": f"manage:{member_id}:p:2"},
+                 "custom_id": f"manage:{member_id}:p:{_MANAGE_DATA_PAGE}"},
             ]}
         else:
             lines.append(
@@ -3524,7 +3532,7 @@ async def _handle_manage_interaction(
     if action == "clear":
         snap = await _manage_snapshot(guild.id, member_id)
         components = _manage_components(
-            member_id, member, 2, snap, confirm_clear=True
+            member_id, member, _MANAGE_DATA_PAGE, snap, confirm_clear=True
         )
         with contextlib.suppress(Exception):
             await _interaction_callback(interaction, 7, components)
@@ -3546,7 +3554,7 @@ async def _handle_manage_interaction(
         )
         snap = await _manage_snapshot(guild.id, member_id)
         components = _manage_components(
-            member_id, member, 2, snap, cleared=result
+            member_id, member, _MANAGE_DATA_PAGE, snap, cleared=result
         )
         with contextlib.suppress(Exception):
             await _interaction_callback(interaction, 7, components)
