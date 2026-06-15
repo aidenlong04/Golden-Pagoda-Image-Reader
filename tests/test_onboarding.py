@@ -579,3 +579,92 @@ class RepromptSweepTests(unittest.IsolatedAsyncioTestCase):
 
             mock_post.assert_not_awaited()
             mock_delete.assert_called_once_with(1, 400)
+
+
+# ---------------------------------------------------------------------------
+# Member record card components
+# ---------------------------------------------------------------------------
+
+class MemberRecordComponentsTests(unittest.TestCase):
+    """Tests for _build_member_record_components structure."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.bot = bot_module
+
+    def _make_member(self, display_name: str = "Tenno", uid: int = 9999) -> MagicMock:
+        m = MagicMock()
+        m.id = uid
+        m.display_name = display_name
+        m.mention = f"<@{uid}>"
+        m.__str__ = MagicMock(return_value=f"Tenno#{uid}")
+        m.joined_at = None
+        return m
+
+    def test_components_has_heading_text(self):
+        """First component is a type-10 text block with 'Member Record' in it."""
+        member = self._make_member("TestUser")
+        comps = self.bot._build_member_record_components(member, ["Clan: Golden Pagoda"])
+        self.assertTrue(comps, "component list must not be empty")
+        self.assertEqual(comps[0]["type"], 10)
+        self.assertIn("Member Record", comps[0]["content"])
+        self.assertIn("TestUser", comps[0]["content"])
+
+    def test_components_has_media_gallery(self):
+        """A type-12 media gallery referencing 'attachment://record.png' is present."""
+        member = self._make_member()
+        comps = self.bot._build_member_record_components(member, [])
+        gallery_types = [c for c in comps if c.get("type") == 12]
+        self.assertTrue(gallery_types, "must have at least one type-12 gallery")
+        items = gallery_types[0].get("items", [])
+        self.assertTrue(
+            any("attachment://record.png" in str(i) for i in items),
+            "gallery must reference attachment://record.png",
+        )
+
+    def test_components_has_gold_container(self):
+        """A type-17 container with accent_color == ACCENT_PASS is present."""
+        member = self._make_member()
+        comps = self.bot._build_member_record_components(member, ["Mastery Rank: MR 10"])
+        containers = [c for c in comps if c.get("type") == 17]
+        self.assertTrue(containers, "must have at least one type-17 container")
+        container = containers[0]
+        self.assertEqual(container.get("accent_color"), self.bot.ACCENT_PASS)
+
+    def test_summary_lines_appear_in_container(self):
+        """Summary lines from verification are included in the container text."""
+        member = self._make_member()
+        summary = ["Clan: Golden Pagoda", "Mastery Rank: MR 15"]
+        comps = self.bot._build_member_record_components(member, summary)
+        containers = [c for c in comps if c.get("type") == 17]
+        self.assertTrue(containers)
+        body = str(containers[0])
+        self.assertIn("Golden Pagoda", body)
+        self.assertIn("MR 15", body)
+
+    def test_member_id_appears_in_container(self):
+        """The member ID is always embedded in the record."""
+        member = self._make_member(uid=123456789)
+        comps = self.bot._build_member_record_components(member, [])
+        body = str(comps)
+        self.assertIn("123456789", body)
+
+
+# ---------------------------------------------------------------------------
+# Channel constant defaults
+# ---------------------------------------------------------------------------
+
+class ChannelConstantTests(unittest.TestCase):
+    """Tests for ONBOARDING_CHANNEL_ID / MEMBER_RECORDS_CHANNEL_ID defaults."""
+
+    def test_onboarding_channel_defaults_to_target_channel_when_not_set(self):
+        """ONBOARDING_CHANNEL_ID falls back to TARGET_CHANNEL_ID when unset."""
+        import bot as bot_module
+        # When TARGET_CHANNEL_ID is set (done by test env) and ONBOARDING_CHANNEL_ID
+        # is not separately configured, both must be > 0.
+        self.assertGreater(bot_module.ONBOARDING_CHANNEL_ID, 0)
+
+    def test_member_records_channel_is_int(self):
+        """MEMBER_RECORDS_CHANNEL_ID is an integer (0 when unset)."""
+        import bot as bot_module
+        self.assertIsInstance(bot_module.MEMBER_RECORDS_CHANNEL_ID, int)

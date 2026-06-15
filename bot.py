@@ -114,6 +114,14 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 
 TARGET_CHANNEL_ID = _int_env("TARGET_CHANNEL_ID")
 
+# Dedicated onboarding channel where the join-welcome prompt is posted.
+# Defaults to TARGET_CHANNEL_ID when unset (backwards-compatible).
+ONBOARDING_CHANNEL_ID = _int_env("ONBOARDING_CHANNEL_ID") or _int_env("TARGET_CHANNEL_ID")
+
+# Channel where a V2 profile-card record is posted after a member completes
+# onboarding verification. 0 disables the record post.
+MEMBER_RECORDS_CHANNEL_ID = _int_env("MEMBER_RECORDS_CHANNEL_ID")
+
 # Platform name → list of acceptable Discord role-name aliases (case-insensitive).
 PLATFORM_ROLE_ALIASES: dict[str, tuple[str, ...]] = {
     "PC": ("PC", "Windows", "Steam"),
@@ -2249,7 +2257,50 @@ async def _post_channel_v2(
     return None
 
 
-@client.event
+async def _post_channel_v2_with_file(
+    channel_id: int,
+    components: list[dict],
+    *,
+    file_bytes: bytes,
+    file_name: str = "record.png",
+    file_content_type: str = "image/png",
+) -> int | None:
+    """POST a standalone Components V2 message with a file attachment.
+
+    Like ``_post_channel_v2`` but sends multipart so a top-level type-12
+    media gallery referencing ``attachment://<file_name>`` resolves to the
+    attached file.  Returns the posted message ID or None on failure.
+    """
+    api_base = "https://discord.com/api/v10"
+    url = f"{api_base}/channels/{channel_id}/messages"
+    payload: dict = {
+        "flags": COMPONENTS_V2_FLAG,
+        "components": components,
+        "allowed_mentions": {"parse": []},
+    }
+    try:
+        data = await _v2_multipart_request(
+            "POST", url,
+            payload=payload,
+            file_bytes=file_bytes,
+            file_name=file_name,
+            file_content_type=file_content_type,
+        )
+        if isinstance(data, dict):
+            raw_id = data.get("id")
+            if isinstance(raw_id, (str, int)):
+                try:
+                    return int(raw_id)
+                except (TypeError, ValueError):
+                    pass
+    except discord.HTTPException:
+        logger.exception(
+            "_post_channel_v2_with_file: failed to post to channel %s", channel_id
+        )
+    return None
+
+
+
 async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
     """When the original screenshot post is deleted, also delete our reply.
 
@@ -2398,11 +2449,11 @@ def _onboarding_welcome_components(member_id: int) -> list[dict]:
 
 
 async def _post_onboarding_welcome(member: discord.Member) -> None:
-    """Post a public welcome prompt in TARGET_CHANNEL_ID and record it in the DB."""
+    """Post a public welcome prompt in ONBOARDING_CHANNEL_ID and record it in the DB."""
     components = _onboarding_welcome_components(member.id)
     try:
         msg_id = await _post_channel_v2(
-            TARGET_CHANNEL_ID,
+            ONBOARDING_CHANNEL_ID,
             components,
             mention_user_ids=[member.id],
         )
@@ -2416,7 +2467,7 @@ async def _post_onboarding_welcome(member: discord.Member) -> None:
         analytics.upsert_onboarding_prompt,
         guild_id=member.guild.id,
         user_id=member.id,
-        channel_id=TARGET_CHANNEL_ID,
+        channel_id=ONBOARDING_CHANNEL_ID,
         message_id=msg_id,
         posted_ts=int(time.time()),
     )
@@ -2429,7 +2480,7 @@ async def _post_onboarding_welcome(member: discord.Member) -> None:
 @client.event
 async def on_member_join(member: discord.Member) -> None:
     """Post a public welcome prompt when a member joins the server."""
-    if TARGET_CHANNEL_ID <= 0:
+    if ONBOARDING_CHANNEL_ID <= 0:
         return
     # Debounce: skip if another welcome was posted in this guild within the
     # last _JOIN_DEBOUNCE_SECONDS to prevent a raid from hammering the channel.
@@ -2441,7 +2492,7 @@ async def on_member_join(member: discord.Member) -> None:
             "onboarding: debouncing join for %s in guild %s (%.1fs since last)",
             member.id, guild_id, now - last,
         )
-        await asyncio.sleep(_JOIN_DEBOUNCE_SECONDS - (now - last))
+        await asyncio.sleep(max(0.0, _JOIN_DEBOUNCE_SECONDS - (now - last)))
     _JOIN_LAST_POST[guild_id] = time.monotonic()
     _spawn_bg_task(_post_onboarding_welcome(member))
 
@@ -2582,18 +2633,13 @@ class _OnboardingVerifyModal(discord.ui.Modal):
         claimed = self._gp_claimed_slot
         claimed_name = _strip_clan_tag(claimed.clan_name or "")
 
-        # Extract the clan line from the summary (summary entries start with "Clan: " or similar).
-        ocr_clan_matched = False
-        for line in summary:
-            if line.lower().startswith("clan:"):
-                # _verify_member_from_screenshot already found + assigned the
-                # role for the OCR clan. We also need to confirm it matches the
-                # claimed slot.
-                ocr_clan_matched = True
-                break
-
-        if not ocr_clan_matched:
-            # OCR ran but found no clan (or clan not configured on this server).
+        # Validate by checking whether _verify_member_from_screenshot assigned
+        # the claimed clan role.  The OCR pipeline assigns clan roles
+        # automatically when it detects a matching clan; if the claimed role
+        # wasn't granted, the screenshot belongs to a different clan.
+        clan_role_id = getattr(claimed, "role_id", 0) or 0
+        if clan_role_id and member.get_role(clan_role_id) is None:
+            # Role not assigned → OCR found a different (or no) clan.
             fail_count = await asyncio.to_thread(
                 analytics.increment_onboarding_ocr_fail,
                 guild.id, member.id,
@@ -2601,18 +2647,46 @@ class _OnboardingVerifyModal(discord.ui.Modal):
             if fail_count >= ONBOARDING_MAX_OCR_FAILS:
                 await _onboarding_route_manual_review(
                     interaction, member,
-                    f"clan not detectable after {fail_count} attempt(s)",
+                    f"clan mismatch after {fail_count} attempt(s)",
                 )
                 return
             remaining = ONBOARDING_MAX_OCR_FAILS - fail_count
             retry_text = (
                 f"\u26A0\uFE0F I couldn't confirm **{claimed_name}** from your screenshot.\n"
-                "-# Make sure the **CLAN** section is clearly visible.\n"
+                "-# Your screenshot shows a different clan, or the **CLAN** "
+                "section wasn't clearly visible.\n"
                 f"-# You have **{remaining}** attempt(s) remaining."
             )
             with contextlib.suppress(discord.HTTPException):
                 await interaction.followup.send(retry_text, ephemeral=True)
             return
+
+        # Fallback: if the role wasn't configured, at least confirm any clan
+        # was found in the OCR summary.
+        if not clan_role_id:
+            clan_line_found = any(
+                line.lower().startswith("clan:") for line in summary
+            )
+            if not clan_line_found:
+                fail_count = await asyncio.to_thread(
+                    analytics.increment_onboarding_ocr_fail,
+                    guild.id, member.id,
+                )
+                if fail_count >= ONBOARDING_MAX_OCR_FAILS:
+                    await _onboarding_route_manual_review(
+                        interaction, member,
+                        f"clan not detectable after {fail_count} attempt(s)",
+                    )
+                    return
+                remaining = ONBOARDING_MAX_OCR_FAILS - fail_count
+                retry_text = (
+                    f"\u26A0\uFE0F I couldn't confirm **{claimed_name}** from your screenshot.\n"
+                    "-# Make sure the **CLAN** section is clearly visible.\n"
+                    f"-# You have **{remaining}** attempt(s) remaining."
+                )
+                with contextlib.suppress(discord.HTTPException):
+                    await interaction.followup.send(retry_text, ephemeral=True)
+                return
 
         # Success — mark onboarding complete and confirm to the member.
         await asyncio.to_thread(
@@ -2637,6 +2711,112 @@ class _OnboardingVerifyModal(discord.ui.Modal):
         )
         with contextlib.suppress(discord.HTTPException):
             await interaction.followup.send(body, ephemeral=True)
+        # Post a profile-card record to the member-records channel (fire-and-forget).
+        _spawn_bg_task(_post_member_record(member, summary))
+
+
+def _build_member_record_components(
+    member: discord.Member,
+    summary_lines: list[str],
+) -> list[dict]:
+    """Build a /status-style V2 payload for the member-records channel.
+
+    Structure mirrors ``_status_components``:
+    - top-level text heading
+    - type-12 media gallery referencing ``attachment://record.png``
+    - gold-accented type-17 container with the verification summary
+    """
+    # Heading (outside the container, like /status "### 📊 Status — Title")
+    heading = f"### \U0001F4CB  Member Record \u2014 {member.display_name}"
+
+    # Body text inside the container — same line format as summary_lines
+    # from _verify_member_from_screenshot (e.g. "Clan: assigned", "Mastery Rank: MR 12")
+    # plus the member mention + join timestamp.
+    joined_str = ""
+    if member.joined_at:
+        joined_str = f"\n-# Joined: <t:{int(member.joined_at.timestamp())}:R>"
+    info_lines = [f"-# {line}" for line in summary_lines] if summary_lines else []
+    body_text = (
+        f"**{member.mention}** (`{member.id}`)"
+        + (f"  •  {member.display_name}" if member.display_name != str(member) else "")
+        + joined_str
+        + ("\n" + "\n".join(info_lines) if info_lines else "")
+    )
+
+    return [
+        {"type": 10, "content": heading},
+        {
+            "type": 12,
+            "items": [{"media": {"url": "attachment://record.png"}}],
+        },
+        {
+            "type": 17,
+            "accent_color": ACCENT_PASS,
+            "components": [
+                {"type": 10, "content": body_text},
+            ],
+        },
+    ]
+
+
+async def _post_member_record(
+    member: discord.Member,
+    summary_lines: list[str],
+) -> None:
+    """Render a profile card and post it to MEMBER_RECORDS_CHANNEL_ID.
+
+    Fail-soft: exceptions are logged but never propagate (this is called as a
+    background task from the onboarding success path).
+    """
+    if not MEMBER_RECORDS_CHANNEL_ID:
+        return
+    try:
+        # Fetch avatar for the profile card.
+        avatar_asset = member.display_avatar or member.default_avatar
+        avatar_url = avatar_asset.replace(size=256, format="png").url
+        avatar_bytes: bytes | None = None
+        try:
+            avatar_bytes = await _fetch_avatar_bytes(avatar_url)
+        except Exception:
+            logger.debug("member record: avatar fetch failed for %s", member.id)
+
+        # Gather profile info lines (roles-derived: clan, platform, mastery, etc.)
+        info = await _member_profile_info_lines(member)
+        in_game_name = await _member_in_game_name(member)
+        display_name = member.display_name
+
+        # Render the profile card via the shared renderer.
+        card_bytes: bytes | None = None
+        try:
+            card_bytes = await _run_heavy(
+                _render_profile_card_png,
+                avatar_bytes=avatar_bytes,
+                display_name=display_name,
+                info_lines=info,
+                in_game_name=in_game_name,
+            )
+        except Exception:
+            logger.debug("member record: profile card render failed for %s", member.id)
+
+        components = _build_member_record_components(member, summary_lines)
+
+        if card_bytes:
+            await _post_channel_v2_with_file(
+                MEMBER_RECORDS_CHANNEL_ID,
+                components,
+                file_bytes=card_bytes,
+                file_name="record.png",
+            )
+        else:
+            # No card available; strip the media gallery and post text-only.
+            text_components = [c for c in components if c.get("type") != 12]
+            await _post_channel_v2(MEMBER_RECORDS_CHANNEL_ID, text_components)
+        logger.info(
+            "onboarding: posted member record for %s to channel %s",
+            member.id, MEMBER_RECORDS_CHANNEL_ID,
+        )
+    except Exception:
+        logger.exception("onboarding: _post_member_record failed for %s", member.id)
 
 
 async def _handle_onboarding_interaction(
@@ -2785,7 +2965,7 @@ async def _onboarding_reprompt_sweep() -> None:
         # Post fresh welcome.
         components = _onboarding_welcome_components(user_id)
         new_msg_id = await _post_channel_v2(
-            TARGET_CHANNEL_ID,
+            ONBOARDING_CHANNEL_ID,
             components,
             mention_user_ids=[user_id],
         )
@@ -2799,7 +2979,7 @@ async def _onboarding_reprompt_sweep() -> None:
             analytics.upsert_onboarding_prompt,
             guild_id=guild_id,
             user_id=user_id,
-            channel_id=TARGET_CHANNEL_ID,
+            channel_id=ONBOARDING_CHANNEL_ID,
             message_id=new_msg_id,
             posted_ts=int(now),
         )
