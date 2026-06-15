@@ -6,23 +6,6 @@ import sqlite3
 import pytest
 
 
-@pytest.fixture()
-def analytics_module(tmp_path, monkeypatch):
-    db = tmp_path / "a.db"
-    monkeypatch.setenv("ANALYTICS_DB_PATH", str(db))
-    import analytics
-    # Close any stale connection cached from a previous test fixture
-    # before reload, otherwise the old sqlite handle leaks until GC.
-    old_conn = getattr(analytics, "_conn", None)
-    if old_conn is not None:
-        try:
-            old_conn.close()
-        except Exception:
-            pass
-    importlib.reload(analytics)
-    return analytics
-
-
 def test_record_and_summary_roundtrip(analytics_module):
     a = analytics_module
     a.record_verification(
@@ -282,7 +265,7 @@ def test_delete_member_data_scoped_to_user_and_guild(analytics_module):
 
 def test_delete_member_data_missing_is_zero(analytics_module):
     result = analytics_module.delete_member_data(guild_id=2, user_id=999)
-    assert result == {"profiles": 0, "titles": 0, "events_anonymized": 0}
+    assert result == {"profiles": 0, "titles": 0, "events_anonymized": 0, "onboarding": 0}
 
 
 def test_delete_member_data_fail_soft_when_disabled(tmp_path, monkeypatch):
@@ -291,7 +274,7 @@ def test_delete_member_data_fail_soft_when_disabled(tmp_path, monkeypatch):
     importlib.reload(analytics)
     # Must not raise; returns the zeroed audit dict.
     result = analytics.delete_member_data(guild_id=2, user_id=5)
-    assert result == {"profiles": 0, "titles": 0, "events_anonymized": 0}
+    assert result == {"profiles": 0, "titles": 0, "events_anonymized": 0, "onboarding": 0}
 
 
 def test_delete_member_data_is_atomic_on_failure(analytics_module, monkeypatch):
@@ -327,7 +310,7 @@ def test_delete_member_data_is_atomic_on_failure(analytics_module, monkeypatch):
     # connection; re-validate over a fresh real connection.
 
     # The whole purge must roll back: nothing reported, nothing deleted.
-    assert result == {"profiles": 0, "titles": 0, "events_anonymized": 0}
+    assert result == {"profiles": 0, "titles": 0, "events_anonymized": 0, "onboarding": 0}
     assert a.get_member_profile(2, 5)["mastery_rank"] == "MR 12"
     assert [t["title"] for t in a.list_member_titles(2, 5)] == ["keep me"]
     with a._connect() as conn:

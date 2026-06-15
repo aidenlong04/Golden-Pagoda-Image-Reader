@@ -114,6 +114,14 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 
 TARGET_CHANNEL_ID = _int_env("TARGET_CHANNEL_ID")
 
+# Dedicated onboarding channel where the join-welcome prompt is posted.
+# Defaults to TARGET_CHANNEL_ID when unset (backwards-compatible).
+ONBOARDING_CHANNEL_ID = _int_env("ONBOARDING_CHANNEL_ID") or _int_env("TARGET_CHANNEL_ID")
+
+# Channel where a V2 profile-card record is posted after a member completes
+# onboarding verification. 0 disables the record post.
+MEMBER_RECORDS_CHANNEL_ID = _int_env("MEMBER_RECORDS_CHANNEL_ID")
+
 # Platform name → list of acceptable Discord role-name aliases (case-insensitive).
 PLATFORM_ROLE_ALIASES: dict[str, tuple[str, ...]] = {
     "PC": ("PC", "Windows", "Steam"),
@@ -195,6 +203,17 @@ VERIFY_REMOVE_ROLE_ID = _int_env("VERIFY_REMOVE_ROLE_ID", 1459326361968574555)
 CATCHUP_LOOKBACK_HOURS = _int_env("CATCHUP_LOOKBACK_HOURS", 24)
 CATCHUP_STATE_PATH = Path(os.getenv("CATCHUP_STATE_PATH", "/app/data/catchup_state.json"))
 CATCHUP_DELAY_SECONDS = _float_env("CATCHUP_DELAY_SECONDS", 1.0)
+
+# Onboarding flow: welcome prompt + screenshot verification for new joins.
+# Hours before a pending welcome prompt triggers a re-prompt (default: 5h).
+ONBOARDING_REPROMPT_HOURS = _float_env("ONBOARDING_REPROMPT_HOURS", 5.0)
+# Maximum number of re-prompts before giving up and leaving the member to
+# use /verify or the passive detection fallback (default: 3).
+ONBOARDING_MAX_REPROMPTS = _int_env("ONBOARDING_MAX_REPROMPTS", 3)
+# OCR submission failures before routing to manual review (default: 3).
+ONBOARDING_MAX_OCR_FAILS = _int_env("ONBOARDING_MAX_OCR_FAILS", 3)
+# How often (in seconds) the background reprompt loop polls for expired prompts.
+ONBOARDING_POLL_SECONDS = _int_env("ONBOARDING_POLL_SECONDS", 600)
 
 # Role IDs that count as "has MR verified" / "has joined a syndicate" for
 # the progress completion check. Both accept a comma-separated list — a
@@ -524,6 +543,23 @@ async def on_ready() -> None:
     if not getattr(client, "_catchup_done", False):
         client._catchup_done = True  # type: ignore[attr-defined]
         _spawn_bg_task(_catchup_scan())
+
+    # Onboarding reprompt loop: start once. On startup it also handles
+    # prompts whose 5-hour window elapsed while the bot was offline.
+    if not getattr(client, "_reprompt_started", False):
+        client._reprompt_started = True  # type: ignore[attr-defined]
+        # Run an immediate reconciliation sweep before entering the loop
+        # so offline-elapsed prompts are handled within seconds of boot.
+        _spawn_bg_task(_onboarding_reprompt_task_startup())
+
+
+async def _onboarding_reprompt_task_startup() -> None:
+    """Run an immediate sweep then hand off to the periodic loop."""
+    try:
+        await _onboarding_reprompt_sweep()
+    except Exception:
+        logger.exception("onboarding: startup reprompt sweep failed")
+    await _onboarding_reprompt_task()
 
 
 def _sync_platform_roles_from_guilds() -> list[str]:
@@ -2181,7 +2217,90 @@ async def _delete_after(channel_id: int, message_id: int, delay: float) -> None:
     await _delete_message(channel_id, message_id)
 
 
-@client.event
+async def _post_channel_v2(
+    channel_id: int,
+    components: list[dict],
+    *,
+    mention_user_ids: list[int] | None = None,
+) -> int | None:
+    """POST a standalone Components V2 message to ``channel_id``.
+
+    Unlike ``_send_v2`` (which posts as a reply), this sends a plain channel
+    message with no ``message_reference``. Returns the posted message ID, or
+    None on failure. ``mention_user_ids`` controls which user IDs Discord
+    actually pings when they appear as ``<@uid>`` inside component text.
+    """
+    from discord.http import Route
+
+    users: list[str] = [str(uid) for uid in (mention_user_ids or [])]
+    payload: dict = {
+        "flags": COMPONENTS_V2_FLAG,
+        "components": components,
+        "allowed_mentions": {"parse": [], "users": users},
+    }
+    route = Route(
+        "POST",
+        "/channels/{channel_id}/messages",
+        channel_id=channel_id,
+    )
+    try:
+        data = await client.http.request(route, json=payload)
+        if isinstance(data, dict):
+            raw_id = data.get("id")
+            if isinstance(raw_id, (str, int)):
+                try:
+                    return int(raw_id)
+                except (TypeError, ValueError):
+                    pass
+    except discord.HTTPException:
+        logger.exception("_post_channel_v2: failed to post to channel %s", channel_id)
+    return None
+
+
+async def _post_channel_v2_with_file(
+    channel_id: int,
+    components: list[dict],
+    *,
+    file_bytes: bytes,
+    file_name: str = "record.png",
+    file_content_type: str = "image/png",
+) -> int | None:
+    """POST a standalone Components V2 message with a file attachment.
+
+    Like ``_post_channel_v2`` but sends multipart so a top-level type-12
+    media gallery referencing ``attachment://<file_name>`` resolves to the
+    attached file.  Returns the posted message ID or None on failure.
+    """
+    api_base = "https://discord.com/api/v10"
+    url = f"{api_base}/channels/{channel_id}/messages"
+    payload: dict = {
+        "flags": COMPONENTS_V2_FLAG,
+        "components": components,
+        "allowed_mentions": {"parse": []},
+    }
+    try:
+        data = await _v2_multipart_request(
+            "POST", url,
+            payload=payload,
+            file_bytes=file_bytes,
+            file_name=file_name,
+            file_content_type=file_content_type,
+        )
+        if isinstance(data, dict):
+            raw_id = data.get("id")
+            if isinstance(raw_id, (str, int)):
+                try:
+                    return int(raw_id)
+                except (TypeError, ValueError):
+                    pass
+    except discord.HTTPException:
+        logger.exception(
+            "_post_channel_v2_with_file: failed to post to channel %s", channel_id
+        )
+    return None
+
+
+
 async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
     """When the original screenshot post is deleted, also delete our reply.
 
@@ -2270,7 +2389,608 @@ async def on_member_remove(member: discord.Member) -> None:
     )
 
 
+# ---------- Member onboarding flow ------------------------------------------
+
+# Timestamp of the last welcome posted per guild to debounce join storms.
+# Maps guild_id → last-post timestamp. Cleared after ONBOARDING_POLL_SECONDS.
+_JOIN_LAST_POST: dict[int, float] = {}
+# Minimum seconds between welcomes in the same guild (join-storm guard).
+_JOIN_DEBOUNCE_SECONDS = 2.0
+
+
+def _onboarding_welcome_components(member_id: int) -> list[dict]:
+    """Build the Components V2 welcome payload for a new member.
+
+    Includes one button per active clan slot (custom_id encodes the slot and
+    the target member's user id so clicks survive bot restarts) plus a
+    "Not listed / No" button. Buttons are grouped into action rows of ≤5.
+    """
+    active_slots = [s for s in CLAN_SLOTS if s.clan_name and s.role_id]
+    buttons: list[dict] = []
+    for slot in active_slots:
+        emoji_dict = _button_emoji_from_literal(slot.emoji)
+        btn: dict = {
+            "type": 2,
+            "style": 1,
+            "label": _strip_clan_tag(slot.clan_name or "")[:80],
+            "custom_id": f"onboard:{member_id}:clan:{slot.slot}",
+        }
+        if emoji_dict:
+            btn["emoji"] = emoji_dict
+        buttons.append(btn)
+    buttons.append({
+        "type": 2,
+        "style": 2,
+        "label": "Not listed / No",
+        "custom_id": f"onboard:{member_id}:none",
+        "emoji": {"name": "\u274C"},
+    })
+    action_rows = [
+        {"type": 1, "components": buttons[i: i + 5]}
+        for i in range(0, len(buttons), 5)
+    ]
+
+    welcome_text = (
+        f"### Welcome, <@{member_id}>! \U0001F3AF\n"
+        "Are you associated with any of the groups below?\n"
+        "-# Click your clan to begin verification, or **Not listed / No** "
+        "if none of these apply to you."
+    )
+    return [
+        {
+            "type": 17,
+            "accent_color": ACCENT_PASS,
+            "components": [
+                {"type": 10, "content": welcome_text},
+                *action_rows,
+            ],
+        }
+    ]
+
+
+async def _post_onboarding_welcome(member: discord.Member) -> None:
+    """Post a public welcome prompt in ONBOARDING_CHANNEL_ID and record it in the DB."""
+    components = _onboarding_welcome_components(member.id)
+    try:
+        msg_id = await _post_channel_v2(
+            ONBOARDING_CHANNEL_ID,
+            components,
+            mention_user_ids=[member.id],
+        )
+    except Exception:
+        logger.exception("onboarding: failed to post welcome for %s", member.id)
+        return
+    if msg_id is None:
+        logger.warning("onboarding: welcome post returned no message id for %s", member.id)
+        return
+    await asyncio.to_thread(
+        analytics.upsert_onboarding_prompt,
+        guild_id=member.guild.id,
+        user_id=member.id,
+        channel_id=ONBOARDING_CHANNEL_ID,
+        message_id=msg_id,
+        posted_ts=int(time.time()),
+    )
+    logger.info(
+        "onboarding: posted welcome for %s (msg=%s) in guild %s",
+        member.id, msg_id, member.guild.id,
+    )
+
+
+@client.event
+async def on_member_join(member: discord.Member) -> None:
+    """Post a public welcome prompt when a member joins the server."""
+    if ONBOARDING_CHANNEL_ID <= 0:
+        return
+    # Debounce: skip if another welcome was posted in this guild within the
+    # last _JOIN_DEBOUNCE_SECONDS to prevent a raid from hammering the channel.
+    guild_id = member.guild.id
+    now = time.monotonic()
+    last = _JOIN_LAST_POST.get(guild_id, 0.0)
+    if now - last < _JOIN_DEBOUNCE_SECONDS:
+        logger.debug(
+            "onboarding: debouncing join for %s in guild %s (%.1fs since last)",
+            member.id, guild_id, now - last,
+        )
+        await asyncio.sleep(max(0.0, _JOIN_DEBOUNCE_SECONDS - (now - last)))
+    _JOIN_LAST_POST[guild_id] = time.monotonic()
+    _spawn_bg_task(_post_onboarding_welcome(member))
+
+
+async def _onboarding_route_manual_review(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str,
+) -> None:
+    """Assign the incomplete review role, notify the help channel, and ack."""
+    await _add_incomplete_role(member)
+    await asyncio.to_thread(
+        analytics.record_verification,
+        outcome="incomplete",
+        guild_id=member.guild.id,
+        user_id=member.id,
+    )
+    # Mark the onboarding prompt complete so the reprompt loop stops.
+    await asyncio.to_thread(
+        analytics.complete_onboarding_prompt,
+        guild_id=member.guild.id,
+        user_id=member.id,
+    )
+    # Notify staff channel.
+    if HELP_CHANNEL_ID:
+        channel = client.get_channel(HELP_CHANNEL_ID)
+        if isinstance(channel, discord.TextChannel):
+            with contextlib.suppress(discord.HTTPException):
+                await channel.send(
+                    f"\U0001F6E1\uFE0F Manual review needed: <@{member.id}> "
+                    f"(`{member.id}`) — {reason}"
+                )
+    ephemeral_text = (
+        "\u2705 Got it — you've been placed in a manual review queue.\n"
+        "-# A staff member will assign your roles. This may take a little while."
+    )
+    with contextlib.suppress(discord.HTTPException):
+        await _interaction_callback(
+            interaction, 4,
+            [{"type": 17, "accent_color": ACCENT_INCOMPLETE,
+              "components": [{"type": 10, "content": ephemeral_text}]}],
+        )
+
+
+class _OnboardingVerifyModal(discord.ui.Modal):
+    """Modal opened from the onboarding welcome prompt when a member clicks a
+    clan button. Accepts a Warframe profile screenshot, OCRs it, and validates
+    that the OCR-detected clan matches the one the member claimed via the button.
+
+    Differs from ``_ScreenshotVerifyModal`` in that it:
+    - Has no source profile card to refresh.
+    - Validates the claimed clan vs. the OCR clan before assigning roles.
+    - On repeated failures routes to the manual-review branch.
+    - Posts ephemeral results so screenshots never appear publicly.
+    """
+
+    def __init__(
+        self, *, member: discord.Member, claimed_slot: "ClanSlot",
+    ) -> None:
+        super().__init__(title="Submit Profile Screenshot", timeout=600)
+        self._gp_member = member
+        self._gp_claimed_slot = claimed_slot
+        self.screenshot = discord.ui.FileUpload(
+            min_values=1, max_values=1, required=True,
+        )
+        self.add_item(discord.ui.Label(
+            text="Profile screenshot",
+            description=(
+                "Upload a screenshot of your Warframe profile "
+                "(title bar + CLAN section visible)."
+            ),
+            component=self.screenshot,
+        ))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        files = list(self.screenshot.values or [])
+        if not files:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.defer()
+            return
+        attachment = files[0]
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.defer(ephemeral=True)
+
+        member = self._gp_member
+        guild = member.guild
+
+        try:
+            image_bytes = await attachment.read()
+        except Exception:
+            logger.warning("onboarding OCR: attachment read failed", exc_info=True)
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.followup.send(
+                    "Couldn't read that upload \u2014 try again.", ephemeral=True
+                )
+            return
+
+        # Re-fetch member to get fresh roles after potential concurrent changes.
+        with contextlib.suppress(discord.HTTPException):
+            member = await guild.fetch_member(member.id)
+
+        summary = await _verify_member_from_screenshot(
+            member,
+            image_bytes=image_bytes,
+            filename=attachment.filename or "profile.png",
+            content_type=attachment.content_type or "image/png",
+        )
+
+        if not summary:
+            # OCR failed entirely — couldn't read the screenshot.
+            fail_count = await asyncio.to_thread(
+                analytics.increment_onboarding_ocr_fail,
+                guild.id, member.id,
+            )
+            if fail_count >= ONBOARDING_MAX_OCR_FAILS:
+                logger.info(
+                    "onboarding: %s hit OCR fail limit (%d), routing to manual review",
+                    member.id, fail_count,
+                )
+                await _onboarding_route_manual_review(
+                    interaction, member,
+                    f"screenshot unreadable after {fail_count} attempt(s)",
+                )
+                return
+            remaining = ONBOARDING_MAX_OCR_FAILS - fail_count
+            retry_text = (
+                "\u26A0\uFE0F I couldn't read that screenshot.\n"
+                "-# Make sure your Warframe **profile** page is fully visible "
+                "(title bar with PlayerName#NNN + CLAN section).\n"
+                f"-# You have **{remaining}** attempt(s) remaining before "
+                "I'll route you to a staff member."
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.followup.send(retry_text, ephemeral=True)
+            return
+
+        # OCR succeeded — now validate the claimed clan.
+        claimed = self._gp_claimed_slot
+        claimed_name = _strip_clan_tag(claimed.clan_name or "")
+
+        # Validate by checking whether _verify_member_from_screenshot assigned
+        # the claimed clan role.  The OCR pipeline assigns clan roles
+        # automatically when it detects a matching clan; if the claimed role
+        # wasn't granted, the screenshot belongs to a different clan.
+        clan_role_id = getattr(claimed, "role_id", 0) or 0
+        if clan_role_id and member.get_role(clan_role_id) is None:
+            # Role not assigned → OCR found a different (or no) clan.
+            fail_count = await asyncio.to_thread(
+                analytics.increment_onboarding_ocr_fail,
+                guild.id, member.id,
+            )
+            if fail_count >= ONBOARDING_MAX_OCR_FAILS:
+                await _onboarding_route_manual_review(
+                    interaction, member,
+                    f"clan mismatch after {fail_count} attempt(s)",
+                )
+                return
+            remaining = ONBOARDING_MAX_OCR_FAILS - fail_count
+            retry_text = (
+                f"\u26A0\uFE0F I couldn't confirm **{claimed_name}** from your screenshot.\n"
+                "-# Your screenshot shows a different clan, or the **CLAN** "
+                "section wasn't clearly visible.\n"
+                f"-# You have **{remaining}** attempt(s) remaining."
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.followup.send(retry_text, ephemeral=True)
+            return
+
+        # Fallback: if the role wasn't configured, at least confirm any clan
+        # was found in the OCR summary.
+        if not clan_role_id:
+            clan_line_found = any(
+                line.lower().startswith("clan:") for line in summary
+            )
+            if not clan_line_found:
+                fail_count = await asyncio.to_thread(
+                    analytics.increment_onboarding_ocr_fail,
+                    guild.id, member.id,
+                )
+                if fail_count >= ONBOARDING_MAX_OCR_FAILS:
+                    await _onboarding_route_manual_review(
+                        interaction, member,
+                        f"clan not detectable after {fail_count} attempt(s)",
+                    )
+                    return
+                remaining = ONBOARDING_MAX_OCR_FAILS - fail_count
+                retry_text = (
+                    f"\u26A0\uFE0F I couldn't confirm **{claimed_name}** from your screenshot.\n"
+                    "-# Make sure the **CLAN** section is clearly visible.\n"
+                    f"-# You have **{remaining}** attempt(s) remaining."
+                )
+                with contextlib.suppress(discord.HTTPException):
+                    await interaction.followup.send(retry_text, ephemeral=True)
+                return
+
+        # Success — mark onboarding complete and confirm to the member.
+        await asyncio.to_thread(
+            analytics.complete_onboarding_prompt,
+            guild.id, member.id,
+        )
+        await _remove_unverified_role(member)
+        await asyncio.to_thread(
+            analytics.record_verification,
+            outcome="pass",
+            clan=claimed_name,
+            guild_id=guild.id,
+            user_id=member.id,
+        )
+        logger.info(
+            "onboarding: %s verified via welcome prompt (clan=%s)",
+            member.id, claimed_name,
+        )
+        body = (
+            "\u2705 Verified! Your data has been recorded.\n"
+            + "\n".join(f"-# {line}" for line in summary)
+        )
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.followup.send(body, ephemeral=True)
+        # Post a profile-card record to the member-records channel (fire-and-forget).
+        _spawn_bg_task(_post_member_record(member, summary))
+
+
+def _build_member_record_components(
+    member: discord.Member,
+    summary_lines: list[str],
+) -> list[dict]:
+    """Build a /status-style V2 payload for the member-records channel.
+
+    Structure mirrors ``_status_components``:
+    - top-level text heading
+    - type-12 media gallery referencing ``attachment://record.png``
+    - gold-accented type-17 container with the verification summary
+    """
+    # Heading (outside the container, like /status "### 📊 Status — Title")
+    heading = f"### \U0001F4CB Member Record \u2014 {member.display_name}"
+
+    # Body text inside the container — same line format as summary_lines
+    # from _verify_member_from_screenshot (e.g. "Clan: assigned", "Mastery Rank: MR 12")
+    # plus the member mention + join timestamp.
+    joined_str = ""
+    if member.joined_at:
+        joined_str = f"\n-# Joined: <t:{int(member.joined_at.timestamp())}:R>"
+    info_lines = [f"-# {line}" for line in summary_lines] if summary_lines else []
+    body_text = (
+        f"**{member.mention}** (`{member.id}`)"
+        + (f"  •  {member.display_name}" if member.display_name != str(member) else "")
+        + joined_str
+        + ("\n" + "\n".join(info_lines) if info_lines else "")
+    )
+
+    return [
+        {"type": 10, "content": heading},
+        {
+            "type": 12,
+            "items": [{"media": {"url": "attachment://record.png"}}],
+        },
+        {
+            "type": 17,
+            "accent_color": ACCENT_PASS,
+            "components": [
+                {"type": 10, "content": body_text},
+            ],
+        },
+    ]
+
+
+async def _post_member_record(
+    member: discord.Member,
+    summary_lines: list[str],
+) -> None:
+    """Render a profile card and post it to MEMBER_RECORDS_CHANNEL_ID.
+
+    Fail-soft: exceptions are logged but never propagate (this is called as a
+    background task from the onboarding success path).
+    """
+    if not MEMBER_RECORDS_CHANNEL_ID:
+        return
+    try:
+        # Fetch avatar for the profile card.
+        avatar_asset = member.display_avatar or member.default_avatar
+        avatar_url = avatar_asset.replace(size=256, format="png").url
+        avatar_bytes: bytes | None = None
+        try:
+            avatar_bytes = await _fetch_avatar_bytes(avatar_url)
+        except Exception:
+            logger.debug("member record: avatar fetch failed for %s", member.id)
+
+        # Gather profile info lines (roles-derived: clan, platform, mastery, etc.)
+        info = await _member_profile_info_lines(member)
+        in_game_name = await _member_in_game_name(member)
+        display_name = member.display_name
+
+        # Render the profile card via the shared renderer.
+        card_bytes: bytes | None = None
+        try:
+            card_bytes = await _run_heavy(
+                _render_profile_card_png,
+                avatar_bytes=avatar_bytes,
+                display_name=display_name,
+                info_lines=info,
+                in_game_name=in_game_name,
+            )
+        except Exception:
+            logger.debug("member record: profile card render failed for %s", member.id)
+
+        components = _build_member_record_components(member, summary_lines)
+
+        if card_bytes:
+            await _post_channel_v2_with_file(
+                MEMBER_RECORDS_CHANNEL_ID,
+                components,
+                file_bytes=card_bytes,
+                file_name="record.png",
+            )
+        else:
+            # No card available; strip the media gallery and post text-only.
+            text_components = [c for c in components if c.get("type") != 12]
+            await _post_channel_v2(MEMBER_RECORDS_CHANNEL_ID, text_components)
+        logger.info(
+            "onboarding: posted member record for %s to channel %s",
+            member.id, MEMBER_RECORDS_CHANNEL_ID,
+        )
+    except Exception:
+        logger.exception("onboarding: _post_member_record failed for %s", member.id)
+
+
+async def _handle_onboarding_interaction(
+    interaction: discord.Interaction, custom_id: str
+) -> None:
+    """Dispatch interactions from the onboarding welcome prompt.
+
+    ``custom_id`` format: ``onboard:<user_id>:<action>[:<slot>]``
+    Actions: ``clan:<slot_number>`` | ``none``.
+
+    Ownership check: only the target member may interact.
+    """
+    parts = custom_id.split(":")
+    # parts[0] = "onboard", parts[1] = user_id, parts[2] = action
+    try:
+        target_id = int(parts[1])
+    except (IndexError, ValueError):
+        return
+
+    action = parts[2] if len(parts) > 2 else ""
+    user = interaction.user
+    guild = interaction.guild
+
+    # Ownership gate — reject any other user with an ephemeral.
+    if user.id != target_id:
+        with contextlib.suppress(Exception):
+            await _interaction_callback(
+                interaction, 4,
+                [{"type": 17, "accent_color": ACCENT_FAIL,
+                  "components": [{"type": 10, "content": (
+                      "-# This prompt isn't for you, Operator."
+                  )}]}],
+            )
+        return
+
+    if guild is None:
+        return
+
+    member = guild.get_member(target_id)
+    if member is None:
+        # Member left between join and click.
+        with contextlib.suppress(Exception):
+            await _interaction_callback(
+                interaction, 4,
+                [{"type": 17, "accent_color": ACCENT_INCOMPLETE,
+                  "components": [{"type": 10, "content": (
+                      "-# Your session has expired. Please re-join the server."
+                  )}]}],
+            )
+        return
+
+    if action == "none":
+        await _onboarding_route_manual_review(
+            interaction, member, "selected 'Not listed / No'"
+        )
+        return
+
+    if action == "clan":
+        try:
+            slot_no = int(parts[3])
+        except (IndexError, ValueError):
+            return
+        slot = next((s for s in CLAN_SLOTS if s.slot == slot_no), None)
+        if slot is None or not slot.clan_name:
+            with contextlib.suppress(Exception):
+                await _interaction_callback(
+                    interaction, 4,
+                    [{"type": 17, "accent_color": ACCENT_FAIL,
+                      "components": [{"type": 10, "content": (
+                          "-# That clan slot is no longer configured. "
+                          "Please contact a staff member."
+                      )}]}],
+                )
+            return
+        try:
+            await interaction.response.send_modal(
+                _OnboardingVerifyModal(member=member, claimed_slot=slot)
+            )
+        except Exception:
+            logger.exception("onboarding: failed to send verify modal")
+
+
+async def _onboarding_reprompt_task() -> None:
+    """Background loop: re-post welcome prompts for members who haven't
+    completed onboarding within ONBOARDING_REPROMPT_HOURS. Deletes the
+    previous prompt message, posts a fresh one, and updates the DB.
+
+    Also reconciles on startup: accounts for prompts whose window elapsed
+    while the bot was offline, and cleans up completed / stale rows.
+    """
+    while True:
+        try:
+            await asyncio.sleep(ONBOARDING_POLL_SECONDS)
+        except asyncio.CancelledError:
+            return
+        try:
+            await _onboarding_reprompt_sweep()
+        except Exception:
+            logger.exception("onboarding reprompt sweep failed")
+
+
+async def _onboarding_reprompt_sweep() -> None:
+    """Single sweep: check all pending prompts and re-post those overdue."""
+    pending = await asyncio.to_thread(analytics.list_pending_onboarding_prompts)
+    if not pending:
+        return
+    now = time.time()
+    window_secs = ONBOARDING_REPROMPT_HOURS * 3600
+    for row in pending:
+        guild_id = row["guild_id"]
+        user_id = row["user_id"]
+        channel_id = row["channel_id"]
+        message_id = row["message_id"]
+        posted_ts = row["posted_ts"]
+        reprompt_count = row["reprompt_count"]
+
+        elapsed = now - posted_ts
+        if elapsed < window_secs:
+            continue
+
+        guild = client.get_guild(guild_id)
+        if guild is None:
+            continue
+        member = guild.get_member(user_id)
+        if member is None:
+            # Member left; clean up.
+            await asyncio.to_thread(
+                analytics.delete_onboarding_prompt, guild_id, user_id
+            )
+            continue
+
+        if reprompt_count >= ONBOARDING_MAX_REPROMPTS:
+            logger.info(
+                "onboarding: %s in guild %s hit max reprompts (%d); stopping",
+                user_id, guild_id, ONBOARDING_MAX_REPROMPTS,
+            )
+            await asyncio.to_thread(
+                analytics.complete_onboarding_prompt, guild_id, user_id
+            )
+            continue
+
+        # Delete old prompt message (best-effort; already-deleted is fine).
+        if message_id and channel_id:
+            await _delete_message(channel_id, message_id)
+
+        # Post fresh welcome.
+        components = _onboarding_welcome_components(user_id)
+        new_msg_id = await _post_channel_v2(
+            ONBOARDING_CHANNEL_ID,
+            components,
+            mention_user_ids=[user_id],
+        )
+        if new_msg_id is None:
+            logger.warning(
+                "onboarding reprompt: post failed for %s in guild %s",
+                user_id, guild_id,
+            )
+            continue
+        await asyncio.to_thread(
+            analytics.upsert_onboarding_prompt,
+            guild_id=guild_id,
+            user_id=user_id,
+            channel_id=ONBOARDING_CHANNEL_ID,
+            message_id=new_msg_id,
+            posted_ts=int(now),
+        )
+        logger.info(
+            "onboarding: re-prompted %s in guild %s (reprompt #%d, msg=%s)",
+            user_id, guild_id, reprompt_count + 1, new_msg_id,
+        )
+
+
 # ---------- Slash commands --------------------------------------------------
+
 
 # Stricter than the module-level `_CUSTOM_EMOJI_RE` used for reaction parsing:
 # this one is the validator for user-supplied `/clan-emblems` input, so it
@@ -4688,6 +5408,49 @@ async def titles_cmd(
     )
 
 
+@tree.command(
+    name="verify",
+    description="(Re-)verify your Warframe profile by uploading a screenshot.",
+)
+async def verify_cmd(interaction: discord.Interaction) -> None:
+    """Self-service re-verification entry point.
+
+    Opens the profile screenshot modal so any member (new or existing) can
+    submit a screenshot and have their clan / mastery / IGN updated without
+    needing to post in the entry channel or wait for a welcome prompt.
+    Useful for members who joined while the bot was offline, or who want to
+    update their clan/rank after switching.
+    """
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "\u274C /verify can only be used in a server.", ephemeral=True
+        )
+        return
+    member = interaction.user
+    avatar_asset = member.display_avatar or member.default_avatar
+    avatar_url = avatar_asset.replace(size=256, format="png").url
+    avatar_bytes: bytes | None = None
+    try:
+        avatar_bytes = await _run_heavy(_fetch_avatar_bytes, avatar_url)
+    except Exception:
+        pass
+    modal = _ScreenshotVerifyModal(
+        member=member,
+        owner_id=member.id,
+        avatar_bytes=avatar_bytes,
+        display_name=member.display_name,
+        source_view=None,
+    )
+    try:
+        await interaction.response.send_modal(modal)
+    except Exception:
+        logger.exception("/verify: send_modal failed")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "\u274C Failed to open the verify panel.", ephemeral=True
+            )
+
+
 async def _handle_nick_interaction(
     interaction: discord.Interaction, custom_id: str
 ) -> None:
@@ -4906,6 +5669,9 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         return
     if custom_id.startswith("manage:"):
         await _handle_manage_interaction(interaction, custom_id)
+        return
+    if custom_id.startswith("onboard:"):
+        await _handle_onboarding_interaction(interaction, custom_id)
         return
     if not custom_id.startswith("status:"):
         return
