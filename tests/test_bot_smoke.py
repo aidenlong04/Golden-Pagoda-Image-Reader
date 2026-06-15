@@ -1139,6 +1139,7 @@ class ManageComponentsCharacterizationTests(unittest.TestCase):
         self.b = bot_module
         self.member = Mock()
         self.member.display_name = "TestUser"
+        self.member.roles = []
         self.snap = {
             "profile": {
                 "in_game_name": "GoldenTenno",
@@ -1218,7 +1219,174 @@ class ManageComponentsCharacterizationTests(unittest.TestCase):
         low = self.b._manage_components(42, self.member, -3, self.snap)
         high = self.b._manage_components(42, self.member, 99, self.snap)
         self.assertIn("Overview", low[0]["content"])
-        self.assertIn("Data", high[0]["content"])
+        self.assertIn("Edit", high[0]["content"])
+
+
+class ManageEditPanelTests(unittest.TestCase):
+    """The /manage Edit page + per-field sub-editors (roles + store sync)."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+        self._saved = {
+            "PLATFORM_ROLE_IDS": dict(self.b.PLATFORM_ROLE_IDS),
+            "SYNDICATE_ROLE_IDS": list(self.b.SYNDICATE_ROLE_IDS),
+            "MR_ROLE_IDS": list(self.b.MR_ROLE_IDS),
+            "CLAN_SLOTS": list(self.b.CLAN_SLOTS),
+        }
+        self.b.PLATFORM_ROLE_IDS.clear()
+        self.b.PLATFORM_ROLE_IDS.update({"PC": 111, "Xbox": 222})
+        self.b.SYNDICATE_ROLE_IDS[:] = [501, 502]
+        self.b.MR_ROLE_IDS[:] = [601]
+        self.b.CLAN_SLOTS[:] = [
+            self.b.ClanSlot(slot=1, clan_name="Golden Pagoda",
+                            role_id=701, emoji="<:gp:123>"),
+            self.b.ClanSlot(slot=2, clan_name="Silver Lotus",
+                            role_id=702, emoji="\U0001F337"),
+        ]
+        self.member = self._make_member([111, 501, 601, 701])
+
+    def tearDown(self):
+        self.b.PLATFORM_ROLE_IDS.clear()
+        self.b.PLATFORM_ROLE_IDS.update(self._saved["PLATFORM_ROLE_IDS"])
+        self.b.SYNDICATE_ROLE_IDS[:] = self._saved["SYNDICATE_ROLE_IDS"]
+        self.b.MR_ROLE_IDS[:] = self._saved["MR_ROLE_IDS"]
+        self.b.CLAN_SLOTS[:] = self._saved["CLAN_SLOTS"]
+
+    def _make_member(self, role_ids):
+        names = {
+            111: "PC", 222: "Xbox", 501: "Red Veil", 502: "New Loka",
+            601: "MR 21-30", 701: "Golden Pagoda", 702: "Silver Lotus",
+        }
+
+        def role(rid):
+            r = Mock()
+            r.id = rid
+            r.name = names.get(rid, str(rid))
+            c = Mock()
+            c.value = 0
+            c.to_rgb = lambda: (1, 2, 3)
+            r.color = c
+            return r
+
+        roles = {rid: role(rid) for rid in names}
+        guild = Mock()
+        guild.get_role = lambda rid: roles.get(rid)
+        member = Mock()
+        member.id = 42
+        member.display_name = "Tenno"
+        member.guild = guild
+        member.roles = [roles[rid] for rid in role_ids]
+        return member
+
+    @staticmethod
+    def _selects(payload):
+        out = []
+        for child in payload[1]["components"]:
+            if child.get("type") == 1:
+                out.extend(
+                    s for s in child["components"] if s.get("type") == 3
+                )
+        return out
+
+    @staticmethod
+    def _buttons(payload):
+        out = []
+        for child in payload[1]["components"]:
+            if child.get("type") == 1:
+                out.extend(
+                    b for b in child["components"] if b.get("type") == 2
+                )
+        return out
+
+    def test_button_emoji_from_literal(self):
+        self.assertEqual(
+            self.b._button_emoji_from_literal("<:gp:123>"),
+            {"id": "123", "name": "gp", "animated": False},
+        )
+        self.assertEqual(
+            self.b._button_emoji_from_literal("<a:gp:123>"),
+            {"id": "123", "name": "gp", "animated": True},
+        )
+        self.assertEqual(
+            self.b._button_emoji_from_literal("\U0001F337"),
+            {"name": "\U0001F337"},
+        )
+        self.assertIsNone(self.b._button_emoji_from_literal(""))
+        self.assertIsNone(self.b._button_emoji_from_literal(None))
+
+    def test_edit_page_lists_fields_and_buttons(self):
+        snap = {"profile": {"in_game_name": "Tenno#1",
+                            "mastery_rank": "MR 28"}, "titles": []}
+        comps = self.b._manage_components(
+            42, self.member, self.b._MANAGE_EDIT_PAGE, snap
+        )
+        body = comps[1]["components"][0]["content"]
+        self.assertIn("Tenno#1", body)
+        self.assertIn("PC", body)
+        self.assertIn("Golden Pagoda", body)
+        self.assertIn("Red Veil", body)
+        ids = {b.get("custom_id") for b in self._buttons(comps)}
+        self.assertIn("manage:42:ign", ids)
+        self.assertIn("manage:42:editfield:platform", ids)
+        self.assertIn("manage:42:editfield:mastery", ids)
+        self.assertIn("manage:42:editfield:clan", ids)
+        self.assertIn("manage:42:editfield:syndicate", ids)
+        self.assertIn("manage:42:titleshint", ids)
+
+    def test_edit_page_for_departed_member_has_no_field_buttons(self):
+        comps = self.b._manage_components(
+            42, None, self.b._MANAGE_EDIT_PAGE,
+            {"profile": None, "titles": []},
+        )
+        ids = {b.get("custom_id") for b in self._buttons(comps)}
+        self.assertNotIn("manage:42:ign", ids)
+        self.assertNotIn("manage:42:editfield:platform", ids)
+
+    def test_platform_editor_preselects_current(self):
+        payload = self.b._manage_editor_components(42, self.member, "platform")
+        sel = self._selects(payload)[0]
+        self.assertEqual(sel["custom_id"], "manage:42:setplatform")
+        defaults = [o["value"] for o in sel["options"] if o.get("default")]
+        self.assertEqual(defaults, ["PC"])
+
+    def test_mastery_editor_has_two_unique_selects(self):
+        payload = self.b._manage_editor_components(42, self.member, "mastery")
+        sels = self._selects(payload)
+        self.assertEqual(len(sels), 2)
+        self.assertNotEqual(sels[0]["custom_id"], sels[1]["custom_id"])
+        total = sum(len(s["options"]) for s in sels)
+        self.assertEqual(total, 38)  # MR 1-30 + Legendary 1-8
+
+    def test_clan_editor_uses_dynamic_buttons_with_emojis(self):
+        payload = self.b._manage_editor_components(42, self.member, "clan")
+        btns = [
+            b for b in self._buttons(payload)
+            if str(b.get("custom_id", "")).startswith("manage:42:setclan:")
+        ]
+        ids = {b["custom_id"] for b in btns}
+        self.assertEqual(ids, {"manage:42:setclan:1", "manage:42:setclan:2"})
+        gp = next(b for b in btns if b["custom_id"].endswith(":1"))
+        self.assertEqual(gp["emoji"], {"id": "123", "name": "gp",
+                                       "animated": False})
+        # Current clan (Golden Pagoda, slot 1) is highlighted (primary style).
+        self.assertEqual(gp["style"], 1)
+
+    def test_syndicate_editor_multiselect_preselects_held(self):
+        payload = self.b._manage_editor_components(42, self.member, "syndicate")
+        sel = self._selects(payload)[0]
+        self.assertEqual(sel["custom_id"], "manage:42:setsyn")
+        self.assertEqual(sel["min_values"], 0)
+        self.assertEqual(sel["max_values"], 2)
+        defaults = {o["value"] for o in sel["options"] if o.get("default")}
+        self.assertEqual(defaults, {"501"})
+
+    def test_editor_unconfigured_field_shows_notice(self):
+        self.b.PLATFORM_ROLE_IDS.clear()
+        payload = self.b._manage_editor_components(42, self.member, "platform")
+        body = payload[1]["components"][0]["content"]
+        self.assertIn("No platform roles", body)
+        self.assertEqual(self._selects(payload), [])
 
 
 class EnvRewriteRoundtripTests(unittest.TestCase):

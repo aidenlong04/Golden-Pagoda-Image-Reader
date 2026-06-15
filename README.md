@@ -50,10 +50,17 @@ full env reference.
   stats, clans, latency). Surfaces uvloop, RSS, BG tasks, the pooled HTTP
   session and the analytics SQLite WAL state. Requires **Manage Server**.
 - `/manage member:<member>` — paginated ephemeral admin console (styled like
-  `/status`, with Prev/Next/Refresh) to inspect a member's stored profile +
-  titles and, on the last page, **clear** them behind a confirm step. This is
-  the manual backup of the automatic on-leave clear below; it works for
-  members who have already left the server. Requires **Manage Server**.
+  `/status`, with Prev/Next/Refresh). The **Overview**, **Titles** and
+  **Data & Clear** pages inspect a member's stored profile + titles and let
+  you **clear** them behind a confirm step (the manual backup of the automatic
+  on-leave clear below; works for members who have already left). The **Edit**
+  page edits a present member's verification data — Discord roles **and** the
+  durable store are updated together: in-game name (text modal), platform
+  (assigns the platform role), mastery rank incl. Legendary (swaps the MR
+  bucket role + stores the exact rank), clan (dynamic buttons whose names and
+  emojis come from the live clan slots, like `/status`), and syndicates
+  (multi-select that syncs the syndicate roles). A Titles button points you at
+  `/titles`. Requires **Manage Server**.
 
 ## Data retention / on-leave clear
 
