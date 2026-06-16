@@ -3724,15 +3724,26 @@ def _status_page_clans(interaction: discord.Interaction, _snap: dict) -> str:
         return "**Clans**\n-# No clan slots configured."
 
     rows: list[tuple[str, str, int, bool]] = []
+    resolved_roles = 0
+    resolved_emojis = 0
     for slot in configured:
         role = guild.get_role(slot.role_id) if slot.role_id else None
+        if role is not None:
+            resolved_roles += 1
         members = len(role.members) if role else 0
         glyph = slot.emoji or "\u2022"
+        if slot.emoji:
+            resolved_emojis += 1
         rows.append((slot.clan_name, glyph, members, role is None))
 
     rows.sort(key=lambda r: (-r[2], r[0].lower()))
 
-    lines = [f"**Clans** ({len(rows)} configured)"]
+    lines = [
+        f"**Clans** ({len(rows)} configured; roles {resolved_roles}/{len(rows)}; "
+        f"emojis {resolved_emojis}/{len(rows)})",
+        "-# Clan role IDs and emoji literals are auto-synced from the server "
+        "and written back to the bot's local `.env` on connect.",
+    ]
     for name, glyph, members, missing in rows:
         suffix = " \u26a0\ufe0f missing role" if missing else ""
         lines.append(f"-# {glyph} `{name}` \u2014 `{members}` members{suffix}")
