@@ -2526,6 +2526,79 @@ def _onboarding_welcome_components(
     ]
 
 
+# Component types that are "select menu" variants inside a Discord action row.
+_SELECT_COMPONENT_TYPES = frozenset({3, 5, 6, 7, 8})
+
+
+def _strip_select_rows(components: list[dict]) -> list[dict]:
+    """Return ``components`` with any action row containing a select removed."""
+    out: list[dict] = []
+    for comp in components:
+        if comp.get("type") == 1 and any(
+            child.get("type") in _SELECT_COMPONENT_TYPES
+            for child in comp.get("components", [])
+        ):
+            continue
+        out.append(comp)
+    return out
+
+
+async def _remove_onboarding_dropdown(guild_id: int, user_id: int) -> None:
+    """Strip the clan-select dropdown from the member's onboarding welcome
+    message in place, preserving the rest (banner + welcome line).
+
+    Called when onboarding completes (pass) or routes to manual review so the
+    original prompt can no longer be re-submitted. Fetches the live message and
+    removes only the action row holding the select, leaving everything else
+    untouched. Fail-soft — any error just leaves the message as-is.
+    """
+    from discord.http import Route
+
+    row = await asyncio.to_thread(
+        analytics.get_onboarding_prompt, guild_id, user_id
+    )
+    if not row:
+        return
+    channel_id = row.get("channel_id")
+    message_id = row.get("message_id")
+    if not channel_id or not message_id:
+        return
+    try:
+        data = await client.http.request(Route(
+            "GET",
+            "/channels/{channel_id}/messages/{message_id}",
+            channel_id=channel_id,
+            message_id=message_id,
+        ))
+    except discord.HTTPException:
+        logger.debug(
+            "onboarding: couldn't fetch welcome message to strip dropdown",
+            exc_info=True,
+        )
+        return
+    components = data.get("components") if isinstance(data, dict) else None
+    if not isinstance(components, list):
+        return
+    stripped = _strip_select_rows(components)
+    if stripped == components:
+        return  # no select row present (already stripped)
+    try:
+        await client.http.request(
+            Route(
+                "PATCH",
+                "/channels/{channel_id}/messages/{message_id}",
+                channel_id=channel_id,
+                message_id=message_id,
+            ),
+            json={"components": stripped, "flags": COMPONENTS_V2_FLAG},
+        )
+    except discord.HTTPException:
+        logger.debug(
+            "onboarding: failed to strip dropdown from welcome message",
+            exc_info=True,
+        )
+
+
 # Hard-coded assets for the public "verified" welcome posted on a successful
 # onboarding pass / admin manual verify (mirrors the design JSON supplied by
 # the maintainer).
@@ -2716,6 +2789,9 @@ async def _onboarding_route_manual_review(
         guild_id=member.guild.id,
         user_id=member.id,
     )
+    # Drop the clan-select dropdown from the original welcome prompt so it
+    # can't be re-submitted (banner + welcome line are preserved).
+    await _remove_onboarding_dropdown(member.guild.id, member.id)
     # Member-facing response: post the public welcome card (a duplicate of the
     # onboarding-complete card, with the manual-review text variant) — it now
     # carries the staff-only "Approve & Assign Roles" button inline.
@@ -2982,6 +3058,9 @@ class _OnboardingVerifyModal(discord.ui.Modal):
             "onboarding: %s verified via welcome prompt (clan=%s)",
             member.id, claimed_name,
         )
+        # Drop the clan-select dropdown from the original welcome prompt so it
+        # can't be re-submitted (banner + welcome line are preserved).
+        await _remove_onboarding_dropdown(guild.id, member.id)
         # Welcome-only response: post the public "Welcome to the Golden Pagoda"
         # message to the server-entry channel (no ephemeral confirmation).
         await _post_onboarding_pass_welcome(member)
