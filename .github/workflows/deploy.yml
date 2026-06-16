@@ -42,42 +42,31 @@ jobs:
       - name: Update working copy + restart service
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
-          set -e
-          if [ -z "$GP_BOT_DIR" ]; then
-            echo "::error::GP_BOT_DIR machine env var is not set on this runner. Run scripts/install-service.ps1 (as admin), then restart the Actions runner so it picks up the variable."
-            exit 1
-          fi
-          # wslpath converts a Windows path (C:\...) to its WSL mount point (/mnt/c/...).
-          # When not in WSL (e.g. Git Bash) wslpath is absent; assume GP_BOT_DIR is
-          # already a POSIX-style path in that case (Git Bash uses /c/... style paths).
-          if command -v wslpath &>/dev/null; then
-            WSL_BOT_DIR="$(wslpath "$GP_BOT_DIR")"
-          else
-            WSL_BOT_DIR="$GP_BOT_DIR"
-          fi
-          if [ ! -d "$WSL_BOT_DIR" ]; then
-            echo "::error::GP_BOT_DIR points to '$GP_BOT_DIR' but that folder does not exist."
-            exit 1
-          fi
-          cd "$WSL_BOT_DIR"
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:GP_BOT_DIR) {
+            throw "GP_BOT_DIR machine env var is not set on this runner. Run scripts\install-service.ps1 (as admin), then restart the Actions runner so it picks up the variable."
+          }
+          if (-not (Test-Path $env:GP_BOT_DIR)) {
+            throw "GP_BOT_DIR points to '$env:GP_BOT_DIR' but that folder does not exist."
+          }
+          Set-Location $env:GP_BOT_DIR
+          $venvPy = Join-Path $env:GP_BOT_DIR '.venv\Scripts\python.exe'
 
-          echo '>> stopping GoldenPagoda service'
-          powershell.exe -Command "Stop-Service -Name GoldenPagoda -ErrorAction SilentlyContinue"
+          Write-Host '>> stopping GoldenPagoda service'
+          Stop-Service -Name GoldenPagoda -ErrorAction SilentlyContinue
 
-          echo '>> updating working copy to origin/main'
+          Write-Host '>> updating working copy to origin/main'
           git fetch --all --prune
           git reset --hard origin/main
 
-          # Use python.exe (Windows Python) so the venv uses Windows paths (.venv\Scripts\python.exe)
-          VENV_PY="$WSL_BOT_DIR/.venv/Scripts/python.exe"
-          if [ ! -f "$VENV_PY" ]; then
-            echo '>> creating .venv'
-            python.exe -m venv .venv
-          fi
-          echo '>> installing dependencies'
-          "$VENV_PY" -m pip install --quiet --upgrade pip
-          "$VENV_PY" -m pip install --quiet -r requirements.txt
+          if (-not (Test-Path $venvPy)) {
+            Write-Host '>> creating .venv'
+            python -m venv .venv
+          }
+          Write-Host '>> installing dependencies'
+          & $venvPy -m pip install --quiet --upgrade pip
+          & $venvPy -m pip install --quiet -r requirements.txt
 
-          echo '>> starting GoldenPagoda service'
-          powershell.exe -Command "Start-Service -Name GoldenPagoda"
-          echo '>> deploy complete'
+          Write-Host '>> starting GoldenPagoda service'
+          Start-Service -Name GoldenPagoda
+          Write-Host '>> deploy complete'
