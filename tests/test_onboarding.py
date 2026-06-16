@@ -273,7 +273,7 @@ class OnboardingComponentsTests(unittest.TestCase):
             "none", option_values, "no 'Not listed / No' option found"
         )
 
-    def test_welcome_components_clan_buttons_use_onboard_prefix(self):
+    def test_welcome_components_clan_options_use_onboard_prefix(self):
         result = self.bot._onboarding_welcome_components(12345)
         for top in result:
             for section in top.get("components", []) or []:
