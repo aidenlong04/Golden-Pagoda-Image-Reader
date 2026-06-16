@@ -1,0 +1,24 @@
+{
+  "_doc": "Layout for migrated member records. Edit 'heading' and 'lines' to change how each record looks. Text in {braces} is replaced per message. A line whose placeholders ALL resolve to empty is skipped when 'skip_empty_lines' is true.",
+  "_available_placeholders": {
+    "user_id": "Author's numeric Discord user ID (searchable key).",
+    "user_mention": "Clickable mention, e.g. <@123>.",
+    "display_name": "Author's server/display name.",
+    "author_name": "Author's full username.",
+    "sent_unix": "Original message timestamp (unix seconds) for <t:..> tags.",
+    "source_message_id": "Original message ID in the source channel.",
+    "source_channel_id": "Source channel ID.",
+    "attachment_count": "Number of attachments on the original message.",
+    "original_text": "Original message text (may be empty)."
+  },
+  "heading": "### \uD83D\uDCCB Member Record",
+  "empty_value": "\u2014",
+  "skip_empty_lines": true,
+  "lines": [
+    "**User ID:** `{user_id}`",
+    "**Member:** {user_mention}  \u00b7  {display_name}",
+    "**Sent:** <t:{sent_unix}:F>  \u00b7  <t:{sent_unix}:R>",
+    "**Source:** <#{source_channel_id}>  \u00b7  message `{source_message_id}`",
+    "{original_text}"
+  ]
+}

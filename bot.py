@@ -11,7 +11,6 @@ import re
 import sys
 import time
 import warnings
-from collections import deque
 from collections.abc import Callable, Iterable
 from datetime import timedelta
 
@@ -55,6 +54,7 @@ from logic import (
     parse_profile_name,
 )
 import analytics
+import records_index
 from config import _csv, _csv_ids, _float_env, _int_env
 from ocr_engine import OCR_API_KEY, OLLAMA_OCR_MODEL, _ocr, _supplement_title_bar_ocr
 from envstore import (  # noqa: F401  (some re-exported for tests via bot.*)
@@ -74,7 +74,6 @@ from cards import (  # noqa: F401  (test-facing re-exports resolved as bot.*)
     _pagoda_silhouette,
     _radial_gradient,
     _render_profile_card_png,
-    _render_progress_card_png,
     _vignette,
 )
 from utils.metrics import heavy_semaphore_metrics, metrics_snapshot, ocr_latency
@@ -152,18 +151,8 @@ PLATFORM_EMOJIS: dict[str, str | None] = {
 CLAN_SLOT_COUNT = 7
 
 
-# Reactions added to the original screenshot message based on verification outcome.
-PASS_REACTION_ID = _int_env("PASS_REACTION_ID", 1506744187096399882)
-FAIL_REACTION = os.getenv("FAIL_REACTION", "\U0001F6A8")  # 🚨
-# Parsed form: a PartialEmoji if FAIL_REACTION is a custom emoji literal
-# (<:name:id> or <a:name:id>), otherwise the raw unicode string.
+# Matches a custom Discord emoji literal: <:name:id> or <a:name:id>.
 _CUSTOM_EMOJI_RE = re.compile(r"^<(a?):([A-Za-z0-9_~]+):(\d+)>$")
-def _parse_reaction_emoji(raw: str):
-    m = _CUSTOM_EMOJI_RE.match((raw or "").strip())
-    if not m:
-        return raw
-    animated, name, eid = m.group(1) == "a", m.group(2), int(m.group(3))
-    return discord.PartialEmoji(name=name, id=eid, animated=animated)
 
 
 def _emoji_id_from_literal(raw: str | None) -> int | None:
@@ -177,10 +166,6 @@ def _emoji_id_from_literal(raw: str | None) -> int | None:
         return int(m.group(3))
     except ValueError:
         return None
-FAIL_REACTION_EMOJI = _parse_reaction_emoji(FAIL_REACTION)
-# Reaction cleared from the post when verification passes (e.g. a "pending"
-# marker added upstream). Set to 0 to disable.
-PENDING_REACTION_ID = _int_env("PENDING_REACTION_ID", 1459403163432910972)
 
 # Components V2 reply styling.
 COMPONENTS_V2_FLAG = 1 << 15  # 32768 — IS_COMPONENTS_V2
@@ -200,16 +185,11 @@ REPLY_TTL_SECONDS = _int_env("REPLY_TTL_SECONDS", 180)
 # gate role). Set to 0 to disable.
 VERIFY_REMOVE_ROLE_ID = _int_env("VERIFY_REMOVE_ROLE_ID", 1459326361968574555)
 
-# Catch-up scan: process missed messages from recent history on startup.
-CATCHUP_LOOKBACK_HOURS = _int_env("CATCHUP_LOOKBACK_HOURS", 24)
-CATCHUP_STATE_PATH = Path(os.getenv("CATCHUP_STATE_PATH", "./data/catchup_state.json"))
-CATCHUP_DELAY_SECONDS = _float_env("CATCHUP_DELAY_SECONDS", 1.0)
-
 # Onboarding flow: welcome prompt + screenshot verification for new joins.
 # Hours before a pending welcome prompt triggers a re-prompt (default: 5h).
 ONBOARDING_REPROMPT_HOURS = _float_env("ONBOARDING_REPROMPT_HOURS", 5.0)
-# Maximum number of re-prompts before giving up and leaving the member to
-# the passive detection fallback (default: 3).
+# Maximum number of re-prompts before giving up on a pending member
+# (default: 3).
 ONBOARDING_MAX_REPROMPTS = _int_env("ONBOARDING_MAX_REPROMPTS", 3)
 # OCR submission failures before routing to manual review (default: 3).
 ONBOARDING_MAX_OCR_FAILS = _int_env("ONBOARDING_MAX_OCR_FAILS", 3)
@@ -388,94 +368,15 @@ async def _discord_call_with_retry(coro_factory, /, *, label: str = "discord cal
     if last is not None:
         raise last
 
-# Sliding-window error tracking for the healthcheck. When >= 3 errors
-# occur in a 60s window, the health-tick task stops writing the signal
-# file so the watchdog sees the container as unhealthy and restarts it.
-# This catches systemic functional failures (e.g. every screenshot raising
-# TypeError) that the current "asyncio loop is alive" check misses.
-_ERROR_TIMESTAMPS: deque[float] = deque(maxlen=10)
-_ERROR_THRESHOLD = 3
-_ERROR_WINDOW_SECONDS = 60
-_HEALTH_STOPPED = False
-
-# Bounded source_message_id -> (channel_id, bot_reply_id) map so we can
-# tombstone the bot's verification reply when the user deletes their
-# original screenshot post. OrderedDict + popitem(last=False) gives us
-# O(1) FIFO eviction; cap is small because the only consumers are
-# moderators clicking "Delete" within a single session, and the bot
-# already auto-deletes replies after REPLY_TTL_SECONDS anyway.
-from collections import OrderedDict as _OrderedDict  # noqa: E402
-_REPLY_MAP_CAP = 512
-_REPLY_MAP: "_OrderedDict[int, tuple[int, int]]" = _OrderedDict()
-
-
-def _remember_reply(source_id: int, channel_id: int, reply_id: int) -> None:
-    _REPLY_MAP[source_id] = (channel_id, reply_id)
-    _REPLY_MAP.move_to_end(source_id)
-    while len(_REPLY_MAP) > _REPLY_MAP_CAP:
-        _REPLY_MAP.popitem(last=False)
-
-
-# ---------- Catch-up state persistence --------------------------------------
-
-
-def _load_catchup_state() -> int | None:
-    """Load the last successfully-scanned message ID from disk."""
-    try:
-        data = json.loads(CATCHUP_STATE_PATH.read_text())
-    except FileNotFoundError:
-        return None
-    except Exception:
-        logger.warning("Failed to load catch-up state from %s", CATCHUP_STATE_PATH, exc_info=True)
-        return None
-    if not isinstance(data, dict):
-        return None
-    last = data.get("last_message_id")
-    if not isinstance(last, int):
-        return None
-    return last
-
-
-def _save_catchup_state(message_id: int) -> None:
-    """Persist the last successfully-scanned message ID to disk."""
-    try:
-        CATCHUP_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = CATCHUP_STATE_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"last_message_id": message_id}))
-        os.replace(tmp, CATCHUP_STATE_PATH)
-    except Exception:
-        logger.warning("Failed to save catch-up state to %s", CATCHUP_STATE_PATH, exc_info=True)
-
-
-def _message_already_processed(message: discord.Message) -> bool:
-    """Check if a message has already been processed by looking for the bot's
-    reactions (pass/fail). Returns True if the message has any of the bot's
-    outcome reactions, meaning it was already handled."""
-    if not message.reactions or client.user is None:
-        return False
-    fail_id = FAIL_REACTION_EMOJI.id if isinstance(FAIL_REACTION_EMOJI, discord.PartialEmoji) else None
-    fail_str = FAIL_REACTION_EMOJI if isinstance(FAIL_REACTION_EMOJI, str) else None
-    for reaction in message.reactions:
-        if not reaction.me:
-            continue
-        emoji = reaction.emoji
-        if isinstance(emoji, (discord.Emoji, discord.PartialEmoji)):
-            eid = emoji.id
-            if eid is not None and eid in (PASS_REACTION_ID, fail_id):
-                return True
-        elif fail_str is not None and emoji == fail_str:
-            return True
-    return False
-
-
 async def _health_task() -> None:
+    # Liveness signal: touch HEALTH_PATH every HEALTH_INTERVAL seconds. The
+    # watchdog treats a stale (>90s) file as unhealthy.
     while True:
-        if not _HEALTH_STOPPED:
-            try:
-                with open(HEALTH_PATH, "w") as fh:
-                    fh.write(str(int(time.time())))
-            except OSError:
-                logger.exception("health write failed")
+        try:
+            with open(HEALTH_PATH, "w") as fh:
+                fh.write(str(int(time.time())))
+        except OSError:
+            logger.exception("health write failed")
         await asyncio.sleep(HEALTH_INTERVAL)
 
 
@@ -531,14 +432,6 @@ async def on_ready() -> None:
             _COMMAND_IDS[cmd.name] = cmd.id
     except Exception:
         logger.exception("Failed to sync slash commands")
-
-    # Run catch-up scan on first connect only (not on every reconnect).
-    # Spawned as a background task so on_ready returns immediately — the
-    # scan can take tens of seconds, and we don't want to block heartbeats
-    # or delay the event loop from processing live messages.
-    if not getattr(client, "_catchup_done", False):
-        client._catchup_done = True  # type: ignore[attr-defined]
-        _spawn_bg_task(_catchup_scan())
 
     # Onboarding reprompt loop: start once. On startup it also handles
     # prompts whose 5-hour window elapsed while the bot was offline.
@@ -814,12 +707,11 @@ async def _ocr_profile_fields(
     """OCR an already-decoded profile screenshot and parse the in-game name,
     clan name, and mastery rank from it.
 
-    A pure pipeline (no Discord I/O) shared by the channel verification flow
-    (``_process_screenshot_impl``) and the /profile self-service modal
-    (``_verify_member_from_screenshot``). The blocking OCR + title-bar
-    supplement run in worker threads so the event loop keeps servicing
-    heartbeats. The caller owns image validation (probe-decode) and every
-    response / role / analytics side effect.
+    A pure pipeline (no Discord I/O) shared by the modal verification flows
+    (onboarding + ``_verify_member_from_screenshot``). The blocking OCR +
+    title-bar supplement run in worker threads so the event loop keeps
+    servicing heartbeats. The caller owns image validation (probe-decode)
+    and every response / role / analytics side effect.
     """
     engine = (
         "ollama" if OLLAMA_OCR_MODEL
@@ -863,472 +755,6 @@ async def _ocr_profile_fields(
     )
 
 
-async def _build_pass_info_lines(
-    *,
-    clan_name: str | None,
-    clan_emoji: str | None,
-    member_platform: str | None,
-    mastery_rank: str | None,
-    profile_name: str | None,
-    pass_missing: list[str],
-) -> list[tuple]:
-    """Build the row-major info grid rendered beneath the progress bar on a
-    passing verification card.
-
-    Order matters: the card grid fills row-major (index 0 = top-left, 1 =
-    top-right, 2 = bottom-left, 3 = bottom-right), so this order lays out
-    as  Clan | Mastery Rank  /  Profile | Platform  — keeping Profile
-    directly under Clan in the left column. Clan + platform rows carry
-    their configured custom emoji bytes; profile / mastery / missing rows
-    reuse the operator / mastery sigil / warning emojis the text embed
-    renders, each falling back to the bullet glyph inside the renderer
-    when its emoji can't be fetched.
-    """
-    clan_emoji_bytes: bytes | None = None
-    platform_emoji_bytes: bytes | None = None
-    if clan_emoji:
-        clan_emoji_bytes = await _fetch_emoji_bytes(clan_emoji)
-    if member_platform:
-        platform_emoji_bytes = await _fetch_emoji_bytes(
-            PLATFORM_EMOJIS.get(member_platform)
-        )
-    profile_emoji_bytes = await _fetch_emoji_bytes(OPERATOR_EMOJI_RAW)
-    mastery_emoji_bytes = await _fetch_emoji_bytes(MASTERY_RANK_EMOJI_RAW)
-    missing_emoji_bytes = await _fetch_emoji_bytes(WARNING_EMOJI_RAW)
-
-    info_lines: list[tuple] = []
-    if clan_name:
-        info_lines.append(
-            ("Clan", _strip_clan_tag(clan_name), clan_emoji_bytes)
-        )
-    if mastery_rank:
-        info_lines.append(
-            (*_mastery_label_value(mastery_rank), mastery_emoji_bytes)
-        )
-    if profile_name:
-        display_profile = (
-            profile_name if profile_name.startswith("Tenno #")
-            else _strip_clan_tag(profile_name)
-        )
-        info_lines.append(
-            ("Profile", display_profile, profile_emoji_bytes)
-        )
-    if member_platform:
-        info_lines.append(
-            ("Platform", member_platform, platform_emoji_bytes)
-        )
-    if pass_missing:
-        info_lines.append(
-            ("Missing Data", ", ".join(pass_missing), missing_emoji_bytes)
-        )
-    return info_lines
-
-
-async def _process_screenshot(message: discord.Message) -> None:
-    """Core screenshot verification logic. Extracted from on_message to support
-    both live processing and catch-up scanning."""
-    global _HEALTH_STOPPED
-    try:
-        await _process_screenshot_impl(message)
-    except Exception as e:
-        # Top-level catch-all: log systemic bugs at ERROR and track them
-        # in the sliding window. Transient user errors (e.g. discord.Forbidden
-        # on role assignment) are already caught + logged deeper in the stack
-        # and don't propagate here.
-        if isinstance(e, (TypeError, AttributeError, NameError, KeyError, ValueError)):
-            logger.error(
-                "_process_screenshot: unexpected exception (systemic bug): %s",
-                e.__class__.__name__, exc_info=True,
-            )
-            _ERROR_TIMESTAMPS.append(time.time())
-            # If we have >= ERROR_THRESHOLD errors in the last ERROR_WINDOW_SECONDS,
-            # stop the health signal so the watchdog restarts the container.
-            now = _ERROR_TIMESTAMPS[-1]
-            recent = sum(1 for ts in _ERROR_TIMESTAMPS if now - ts < _ERROR_WINDOW_SECONDS)
-            if recent >= _ERROR_THRESHOLD:
-                if not _HEALTH_STOPPED:
-                    logger.critical(
-                        "_process_screenshot: %d errors in %ds window; stopping health signal",
-                        recent, _ERROR_WINDOW_SECONDS,
-                    )
-                    _HEALTH_STOPPED = True
-        else:
-            # Transient network / Discord API errors — log but don't count
-            # toward the systemic-failure threshold.
-            logger.exception("_process_screenshot: transient error")
-        raise
-
-
-async def _process_screenshot_impl(message: discord.Message) -> None:
-    """Core screenshot verification logic implementation (wrapped by error-tracking)."""
-    attachment = _first_image_attachment(message)
-    if attachment is None:
-        await _fail(message, "Not an image", "Upload a PNG/JPG screenshot of your Warframe profile.")
-        return
-    if message.guild is None:
-        await _fail(message, "Server only", "I can only assign roles in a server channel.")
-        return
-
-    try:
-        image_bytes = await attachment.read()
-        # Probe-decode to fail fast on corrupt uploads before paying OCR cost.
-        probe = Image.open(io.BytesIO(image_bytes))
-        try:
-            probe.verify()
-        finally:
-            probe.close()
-    except Exception:
-        logger.exception("Failed to read uploaded image")
-        await _fail(message, "Invalid image", "Image could not be opened. Re-upload a valid PNG/JPG.")
-        return
-
-    # OCR + title-bar supplement + field parsing is shared with the /profile
-    # self-service modal via _ocr_profile_fields.
-    fields = await _ocr_profile_fields(
-        image_bytes,
-        attachment.filename,
-        attachment.content_type or "image/png",
-    )
-    ocr_engine = fields.engine
-    ocr_latency_ms = fields.latency_ms
-    if not fields.ok:
-        _spawn_bg_task(asyncio.to_thread(
-            analytics.record_verification,
-            outcome="ocr_error",
-            ocr_engine=ocr_engine,
-            ocr_latency_ms=ocr_latency_ms,
-            user_id=message.author.id,
-            guild_id=message.guild.id,
-        ))
-        await _fail(message, "Not readable", "No text could be read. Upload a clearer screenshot.")
-        return
-
-    ocr_text = fields.ocr_text
-    profile_name = fields.profile_name
-    clan_name = fields.clan_name
-    mastery_rank = fields.mastery_rank
-
-    # Fallback name when OCR can't read the profile handle: use the
-    # guild's current member count as a pseudo-discriminator so the
-    # pass response still shows something meaningful (e.g. "Tenno #1234").
-    profile_name_fallback_used = False
-    if not profile_name:
-        member_count = getattr(message.guild, "member_count", None) or 0
-        profile_name = f"Tenno #{member_count}"
-        profile_name_fallback_used = True
-
-    if not clan_name:
-        # Without a clan name we can't assign the only role the bot
-        # auto-grants from the screenshot. Surface a clean failure.
-        snippet = " ".join(ocr_text.split())[:240]
-        logger.warning(
-            "Unreadable: engine=%s profile=%r clan=%r mastery=%r ocr=%r",
-            ocr_engine,
-            profile_name,
-            clan_name,
-            mastery_rank,
-            snippet,
-        )
-        _spawn_bg_task(asyncio.to_thread(
-            analytics.record_verification,
-            outcome="unreadable",
-            clan=clan_name,
-            ocr_engine=ocr_engine,
-            ocr_latency_ms=ocr_latency_ms,
-            user_id=message.author.id,
-            guild_id=message.guild.id,
-        ))
-        await _fail(
-            message,
-            "Profile not found",
-            "Make sure your title bar (PlayerName#NNN) and CLAN are visible at the top.",
-        )
-        return
-
-    member = message.author if isinstance(message.author, discord.Member) else None
-    if member is None:
-        await _fail(message, "Not a member", "I can only assign roles to server members.")
-        return
-
-    role_lines: list[str] = []
-    issues: list[str] = []
-    passed = True
-
-    if profile_name_fallback_used:
-        logger.info(
-            "Profile name OCR failed; using member-count fallback %r", profile_name
-        )
-
-    # Resolve which Discord role coroutines to fire concurrently. Building
-    # them up front lets us issue role-add HTTP calls in parallel via
-    # asyncio.gather instead of paying sequential Discord round-trips.
-    role_coros: list[tuple[str, "discord.Role", "asyncio.Future"]] = []
-
-    clan_emoji: str | None = None
-    slot = find_clan_slot(CLAN_SLOTS, clan_name)
-    if slot is not None:
-        clan_emoji = slot.emoji
-    role = _find_clan_role(message.guild, clan_name)
-    if role is None:
-        issues.append(f"No role for clan **{_strip_clan_tag(clan_name)}**.")
-        passed = False
-    else:
-        role_coros.append(("Clan", role, _add_role(member, role, "Screenshot clan verification")))
-
-    assigned_role_ids: set[int] = set()
-    if role_coros:
-        results = await asyncio.gather(
-            *(c for _, _, c in role_coros), return_exceptions=True
-        )
-        for (label, role_obj, _), result in zip(role_coros, results, strict=True):
-            if isinstance(result, BaseException):
-                logger.exception("%s role assignment failed", label, exc_info=result)
-                role_lines.append(f"{label}: error assigning role")
-                passed = False
-            else:
-                _, status = result
-                role_lines.append(f"{label}: {status}")
-                # discord.py's add_roles updates member.roles via a gateway
-                # event that may not have arrived yet; track the assignment
-                # locally so the post-verify role check sees fresh state.
-                assigned_role_ids.add(role_obj.id)
-
-    # Post-verify category check: list every required category the member
-    # is still missing (Platform / MR / Syndicate). These are surfaced for
-    # the user's awareness but do NOT block a pass: as long as the clan
-    # role was successfully assigned (env-recognised clan), we run the
-    # full pass procedure (reaction, unverified-role removal, pass embed)
-    # so the user is properly verified. Platform/MR/Syndicate are picked
-    # up later via the user's own self-service flow.
-    effective_role_ids = {r.id for r in member.roles} | assigned_role_ids
-    cats = _role_categories_for(effective_role_ids)
-    if passed and mastery_rank:
-        # On a pass we render the OCR-read Mastery Rank as its own row, so
-        # count it as a satisfied category here too. Otherwise the bar
-        # (driven by role possession) and the "Missing" pill (which hides
-        # MR once it's been shown) disagree — e.g. a 2/4 bar that lists
-        # only one missing field.
-        cats = [
-            (name, True if name == "Mastery Rank" else ok)
-            for name, ok in cats
-        ]
-    have = sum(1 for _, ok in cats if ok)
-    total = len(cats)
-    extra_missing = [name for name, ok in cats if not ok]
-    if extra_missing and not passed:
-        # Only surface missing categories on the incomplete embed; on a
-        # pass the user already gets the progress bar showing them.
-        issues.extend(f"Missing **{cat}** role." for cat in extra_missing)
-
-    # On a pass, "Missing Data" mirrors the bar exactly (it derives from
-    # the same cats), so the number of missing fields always equals
-    # total − have.
-    pass_missing: list[str] = list(extra_missing) if passed else []
-
-    # Build the labeled rows rendered beneath the progress bar on a
-    # passing card: profile name, platform, clan, mastery rank, missing
-    # data. Clan + platform rows carry their custom emoji bytes (fetched
-    # below) so the card renders the same icons the env defines.
-    member_platform: str | None = None
-    for plat, rid in PLATFORM_ROLE_IDS.items():
-        if rid and rid in effective_role_ids:
-            member_platform = plat
-            break
-
-    info_lines: list[tuple] = []
-    if passed:
-        info_lines = await _build_pass_info_lines(
-            clan_name=clan_name,
-            clan_emoji=clan_emoji,
-            member_platform=member_platform,
-            mastery_rank=mastery_rank,
-            profile_name=profile_name,
-            pass_missing=pass_missing,
-        )
-
-    # Render the progress card once; both pass and incomplete embeds attach it.
-    progress_png: bytes | None = None
-    try:
-        avatar_url = (member.display_avatar or member.default_avatar).replace(
-            size=256, format="png"
-        ).url
-        avatar_bytes = await _fetch_avatar_bytes(avatar_url)
-        progress_png = await _run_heavy(
-            _render_progress_card_png,
-            avatar_bytes=avatar_bytes,
-            display_name=member.display_name,
-            count=have,
-            target=total,
-            info_lines=info_lines if info_lines else None,
-        )
-    except Exception:
-        logger.warning("verify: progress card render failed", exc_info=True)
-
-    # Fan out the user-visible work concurrently: reacting, removing the
-    # opposite-state role, and posting the V2 reply all hit different
-    # Discord endpoints and never depend on each other.
-    nick_target = _nickname_suggestion(member, profile_name)
-    if passed:
-        # _pass_components owns the entire pass reply: the progress card
-        # image on top, then ONE gold container holding the call-sign
-        # choices. Hand it the nick suggestion directly rather than
-        # appending a separate prompt.
-        components = _pass_components(
-            profile_name, clan_name,
-            clan_emoji=clan_emoji,
-            mastery_rank=mastery_rank,
-            progress_attachment="progress.png" if progress_png else None,
-            nick_suggestion=nick_target,
-            user_id=member.id,
-            current_nick=member.display_name or "",
-            missing_categories=pass_missing,
-        )
-        outbound = [
-            _react(message, "pass"),
-            _remove_unverified_role(member),
-            _send_v2(
-                message, components,
-                file_bytes=progress_png,
-                file_name="progress.png",
-            ),
-        ]
-    else:
-        components = _incomplete_components(
-            " ".join(issues),
-            link_buttons=_help_link_buttons(message.guild),
-            progress_attachment="progress.png" if progress_png else None,
-        )
-        if nick_target:
-            try:
-                components.extend(_nickname_prompt_components(
-                    nick_target, member.id,
-                    current_nick=member.display_name or "",
-                ))
-            except Exception:
-                logger.exception("nick prompt build failed")
-        outbound = [
-            _react(message, "incomplete"),
-            _add_incomplete_role(member),
-            _send_v2(
-                message, components,
-                mention_user=True,
-                allow_role_mentions=True,
-                file_bytes=progress_png,
-                file_name="progress.png",
-            ),
-        ]
-    for result in await asyncio.gather(*outbound, return_exceptions=True):
-        if isinstance(result, BaseException):
-            logger.exception("post-verification action failed", exc_info=result)
-
-    # Push analytics to a background task so the SQLite write never adds to
-    # the user-visible response time. record_verification is fail-soft, so
-    # losing one event on shutdown is acceptable.
-    _spawn_bg_task(asyncio.to_thread(
-        analytics.record_verification,
-        outcome="pass" if passed else "incomplete",
-        clan=clan_name,
-        ocr_engine=ocr_engine,
-        ocr_latency_ms=ocr_latency_ms,
-        user_id=member.id,
-        guild_id=message.guild.id,
-    ))
-
-    # Durable per-member snapshot (in-game name, platform, clan, exact
-    # mastery rank, last-verified). Survives restarts + role changes and
-    # backs the /profile card. Fail-soft + off the event loop; partial
-    # (COALESCE) so unread fields don't clobber a previous good snapshot.
-    _spawn_bg_task(asyncio.to_thread(
-        analytics.upsert_member_profile,
-        guild_id=message.guild.id,
-        user_id=member.id,
-        mastery_rank=mastery_rank,
-        in_game_name=None if profile_name_fallback_used else profile_name,
-        platform=member_platform,
-        clan=_strip_clan_tag(clan_name) if clan_name else None,
-        last_verified_ts=int(time.time()),
-    ))
-
-
-# Hard cap on history fetched per scan. Guards against a corrupt state file
-# or extreme lookback values driving an unbounded API walk.
-_CATCHUP_SCAN_LIMIT = 1000
-
-
-async def _catchup_scan() -> None:
-    """Scan recent message history in TARGET_CHANNEL_ID for unprocessed
-    screenshots and verify them. Runs once on startup after on_ready."""
-    if CATCHUP_LOOKBACK_HOURS <= 0:
-        logger.info("Catch-up scan disabled (CATCHUP_LOOKBACK_HOURS=%d)", CATCHUP_LOOKBACK_HOURS)
-        return
-
-    channel = client.get_channel(TARGET_CHANNEL_ID)
-    if not isinstance(channel, discord.TextChannel):
-        logger.warning("Catch-up scan: TARGET_CHANNEL_ID=%s not found or not a text channel", TARGET_CHANNEL_ID)
-        return
-
-    last_seen_id = _load_catchup_state()
-    cutoff = discord.utils.utcnow() - timedelta(hours=CATCHUP_LOOKBACK_HOURS)
-    # Prefer resuming from last-seen snowflake; otherwise let Discord skip
-    # everything older than the lookback window server-side.
-    after: discord.Object | object
-    after = discord.Object(id=last_seen_id) if last_seen_id else cutoff
-
-    logger.info(
-        "Starting catch-up scan: channel=%s lookback=%dh last_seen=%s limit=%d",
-        channel.name, CATCHUP_LOOKBACK_HOURS, last_seen_id, _CATCHUP_SCAN_LIMIT,
-    )
-
-    allowed_types = (discord.MessageType.default, discord.MessageType.reply)
-    found = 0
-    processed = 0
-    skipped = 0
-    errors = 0
-    latest_id: int | None = None
-
-    try:
-        async for message in channel.history(
-            limit=_CATCHUP_SCAN_LIMIT,
-            after=after,
-            oldest_first=True,
-        ):
-            latest_id = message.id
-            if (
-                message.author.bot
-                or message.webhook_id is not None
-                or message.type not in allowed_types
-            ):
-                continue
-            if not _first_image_attachment(message):
-                continue
-
-            found += 1
-
-            if _message_already_processed(message):
-                skipped += 1
-                continue
-
-            try:
-                logger.info("Catch-up: processing message %s from %s", message.id, message.author)
-                await _process_screenshot(message)
-                processed += 1
-                _save_catchup_state(message.id)
-                await asyncio.sleep(CATCHUP_DELAY_SECONDS)
-            except Exception:
-                errors += 1
-                logger.exception("Catch-up: failed to process message %s", message.id)
-
-        if latest_id is not None:
-            _save_catchup_state(latest_id)
-
-        logger.info(
-            "Catch-up scan complete: found=%d processed=%d skipped=%d errors=%d",
-            found, processed, skipped, errors,
-        )
-    except Exception:
-        logger.exception("Catch-up scan failed")
-
-
 async def _add_role(
     member: discord.Member, role: discord.Role, reason: str
 ) -> tuple[bool, str]:
@@ -1345,74 +771,6 @@ async def _add_role(
     except discord.HTTPException:
         logger.exception("Failed to assign role %s", role.name)
         return False, f"error assigning **{role.name}**"
-
-
-async def _react(message: discord.Message, status: str) -> None:
-    """Add a reaction based on outcome and clear the pending marker.
-
-    ``status`` is one of ``"pass"``, ``"fail"``, or ``"incomplete"``. The
-    incomplete state intentionally adds **no** reaction and leaves the
-    upstream pending marker alone (a human still needs to follow up).
-    """
-    if status == "incomplete":
-        return
-
-    if status == "pass":
-        emoji: discord.Emoji | discord.PartialEmoji | str | None = (
-            client.get_emoji(PASS_REACTION_ID) if PASS_REACTION_ID else None
-        )
-        # Fallback when the emoji isn't in cache yet (e.g. mid-startup).
-        # Discord matches reactions by ID; "r" is a placeholder name.
-        if emoji is None and PASS_REACTION_ID:
-            emoji = discord.PartialEmoji(name="r", id=PASS_REACTION_ID)
-        if emoji is None:
-            emoji = "\U0001F44D"  # 👍 fallback
-    else:  # fail
-        emoji = FAIL_REACTION_EMOJI
-    try:
-        await message.add_reaction(emoji)
-    except discord.HTTPException:
-        logger.exception("Failed to add %s reaction", status)
-
-    # Clear the upstream "pending" marker on resolved outcomes only.
-    if PENDING_REACTION_ID:
-        pending: discord.Emoji | discord.PartialEmoji | None = client.get_emoji(
-            PENDING_REACTION_ID
-        ) or discord.PartialEmoji(name="r", id=PENDING_REACTION_ID)
-        try:
-            await message.clear_reaction(pending)
-        except discord.NotFound:
-            pass  # nothing to clear
-        except discord.Forbidden:
-            logger.warning(
-                "Missing Manage Messages permission to clear pending reaction %s",
-                PENDING_REACTION_ID,
-            )
-        except discord.HTTPException:
-            logger.exception("Failed to clear pending reaction")
-
-
-async def _fail(
-    message: discord.Message,
-    headline: str,
-    reason: str,
-    *,
-    image_url: str | None = None,
-) -> None:
-    await _react(message, "fail")
-    logger.info(
-        "_fail: sending V2 reply headline=%r reason=%r msg=%s chan=%s",
-        headline, reason, message.id, message.channel.id,
-    )
-    try:
-        await _send_v2(
-            message,
-            _fail_components(headline, reason, image_url=image_url),
-            mention_user=True,
-        )
-    except Exception:
-        logger.exception("_fail: _send_v2 raised")
-        raise
 
 
 async def _remove_unverified_role(member: discord.Member) -> None:
@@ -1498,330 +856,14 @@ def _syndicate_style(
     return color, emoji
 
 
-def _link_button(label: str, url: str) -> dict:
-    """Build a Components V2 Link button (style 5)."""
-    return {"type": 2, "style": 5, "label": label, "url": url}
-
-
-def _link_button_row(
-    link_buttons: list[tuple[str, str]] | None,
-) -> dict | None:
-    """Build a single action row (type 1) of Link buttons, capped at
-    Discord's 5-per-row limit, or None when there are none to render."""
-    if not link_buttons:
-        return None
-    return {
-        "type": 1,
-        "components": [_link_button(lbl, url) for lbl, url in link_buttons[:5]],
-    }
-
-
-def _pass_components(
-    profile: str,
-    clan: str | None,
-    *,
-    clan_emoji: str | None = None,
-    mastery_rank: str | None = None,
-    progress_attachment: str | None = None,
-    nick_suggestion: str | None = None,
-    user_id: int | None = None,
-    current_nick: str = "",
-    missing_categories: list[str] | None = None,
-) -> list[dict]:
-    emoji = (clan_emoji or "").strip() or CLAN_EMOJI
-
-    # Normal path: the profile / clan / mastery / missing bullets are
-    # rendered INTO the progress PNG, so the reply is just the image on
-    # top (a top-level media gallery, OUTSIDE any container) followed by a
-    # SINGLE gold container holding the in-game-name call-sign choices
-    # (when there's a name worth suggesting). Folding the nickname prompt
-    # in here keeps the whole pass reply to one image + one container.
-    if progress_attachment:
-        top_components: list[dict] = [{
-            "type": 12,
-            "items": [{"media": {"url": f"attachment://{progress_attachment}"}}],
-        }]
-        caption, row_buttons = _callsign_buttons(
-            nick_suggestion, user_id, current_nick
-        )
-        children = list(caption)
-        if row_buttons:
-            children.append({"type": 1, "components": row_buttons[:5]})
-        if children:
-            top_components.append({
-                "type": 17,
-                "accent_color": ACCENT_PASS,
-                "components": children,
-            })
-        return top_components
-
-    # Fallback path (progress card render failed): the bullets live in
-    # text instead of the image, but the shape stays identical — one gold
-    # container holding the bullet list and the call-sign prompt, so
-    # there's never a stray container or loose action row.
-    display_clan = _strip_clan_tag(clan) if clan else None
-    clan_part = (
-        f"> * {emoji} **`{display_clan}`**"
-        if display_clan
-        else f"> * {emoji} *Unaffiliated*"
-    )
-    # The "Tenno #<member_count>" fallback (used when OCR can't read the
-    # real handle) keeps its #NNN suffix so the response stays unique per
-    # server; real handles render without the discriminator.
-    if profile.startswith("Tenno #"):
-        display_profile = profile
-    else:
-        display_profile = _strip_clan_tag(profile)
-    inner_lines = [
-        f"> * {OPERATOR_EMOJI_RAW} **`{display_profile}`**",
-        clan_part,
-    ]
-    if mastery_rank:
-        # Legendary ranks relabel to "Legendary Rank" and drop the
-        # redundant "MR "/"LR " prefix via the shared helper (e.g.
-        # "LR 3" -> "Legendary Rank: 3", "MR 28" -> "Mastery Rank: 28").
-        mr_label, mr_value = _mastery_label_value(mastery_rank)
-        mr_prefix = f"{MASTERY_RANK_EMOJI_RAW} " if MASTERY_RANK_EMOJI_RAW else ""
-        inner_lines.append(f"> * -# {mr_prefix}{mr_label}: `{mr_value}`")
-    if missing_categories:
-        joined = ", ".join(f"**`{c}`**" for c in missing_categories)
-        warn_prefix = f"{WARNING_EMOJI_RAW} " if WARNING_EMOJI_RAW else ""
-        inner_lines.append(f"> * -# {warn_prefix}Missing Data: {joined}")
-        inner_lines.append("> -# please assign the missing roles here")
-
-    caption, row_buttons = _callsign_buttons(
-        nick_suggestion, user_id, current_nick
-    )
-    children = [{"type": 10, "content": "\n".join(inner_lines)}, *caption]
-    if row_buttons:
-        children.append({"type": 1, "components": row_buttons[:5]})
-    return [{
-        "type": 17,
-        "accent_color": ACCENT_PASS,
-        "components": children,
-    }]
-
-
-def _fail_components(headline: str, reason: str, *, image_url: str | None = None) -> list[dict]:
-    header = {
-        "type": 10,
-        "content": "> Verification Failed",
-    }
-    children: list[dict] = [
-        {"type": 10, "content": f"### {headline}\n-# {reason}"},
-    ]
-    if image_url:
-        children.append(
-            {
-                "type": 12,  # MediaGallery
-                "items": [{"media": {"url": image_url}}],
-            }
-        )
-    return [
-        header,
-        {
-            "type": 17,
-            "accent_color": ACCENT_FAIL,
-            "components": children,
-        },
-    ]
-
-
-def _incomplete_components(
-    reason: str,
-    *,
-    image_url: str | None = None,
-    link_buttons: list[tuple[str, str]] | None = None,
-    progress_attachment: str | None = None,
-) -> list[dict]:
-    warn_icon = WARNING_EMOJI_RAW or "\u26a0\ufe0f"
-    children: list[dict] = [
-        {
-            "type": 10,
-            # Custom emoji don't render inside markdown headings (Discord
-            # falls back to the `:name:` shortcode), so keep the heading
-            # plain and lead the reason subtext with the warning icon.
-            "content": (
-                f"### Please select the missing roles\n"
-                f"-# {warn_icon}  {reason}"
-            ),
-        },
-    ]
-    if image_url:
-        children.append({
-            "type": 12,
-            "items": [{"media": {"url": image_url}}],
-        })
-    button_row = _link_button_row(link_buttons)
-    if button_row:
-        children.append(button_row)
-    container = {
-        "type": 17,
-        "accent_color": ACCENT_INCOMPLETE,
-        "components": children,
-    }
-    top_level: list[dict] = []
-    if progress_attachment:
-        top_level.append({
-            "type": 12,
-            "items": [{"media": {"url": f"attachment://{progress_attachment}"}}],
-        })
-    top_level.append(container)
-    return top_level
-
-
-# ---------- Nickname suggestion --------------------------------------------
-
-
-def _nickname_suggestion(
-    member: discord.Member, profile_name: str | None
-) -> str | None:
-    """Return a cleaned in-game nickname worth suggesting, or None.
-
-    Skips the "Tenno #N" fallback (which is synthetic, not OCR'd) and
-    cases where the member's current display name already matches.
-    Discord nicknames cap at 32 characters.
-    """
-    if not profile_name or profile_name.startswith("Tenno #"):
-        return None
-    suggestion = _strip_clan_tag(profile_name).strip()[:32]
-    if not suggestion:
-        return None
-    if suggestion.lower() == (member.display_name or "").strip().lower():
-        return None
-    return suggestion
-
-
-def _nick_custom_ids(suggestion: str, user_id: int) -> tuple[str, str]:
-    """Return (yes_id, no_id) for the nick prompt, URL-encoding the
-    suggestion and truncating to fit Discord's 100-char custom_id cap.
-
-    Both IDs use the wider ``nick:y:<uid>:`` prefix length so the two
-    branches stay symmetric. Truncation is bounded by ``len(suggestion)``
-    iterations because each pass shortens ``truncated`` by one char.
-    """
-    from urllib.parse import quote
-
-    prefix_len = len(f"nick:y:{user_id}:")
-    max_encoded_len = max(0, 100 - prefix_len)
-    truncated = suggestion[:max_encoded_len]
-    encoded = quote(truncated, safe="")
-    while len(encoded) > max_encoded_len and truncated:
-        truncated = truncated[:-1]
-        encoded = quote(truncated, safe="")
-    return (
-        f"nick:y:{user_id}:{encoded}",
-        f"nick:n:{user_id}:{encoded}",
-    )
-
-
-NICK_PROMPT_INGAME_EMOJI_ID = os.getenv(
-    "NICK_PROMPT_INGAME_EMOJI_ID", "1467922510908494098"
-).strip()
-NICK_PROMPT_SERVER_EMOJI_ID = os.getenv(
-    "NICK_PROMPT_SERVER_EMOJI_ID", "1511640752424222760"
-).strip()
-
-# Caption shown above the call-sign buttons. Defined once so the pass
-# reply (which folds the prompt into its gold container) and
-# _strip_nick_prompt (which removes it after a choice is made) agree on
-# the exact text.
-_CALLSIGN_CAPTION = "-# Operator, pick your call sign!"
-
-# Accent colour of the standalone in-game-name prompt container (the
-# incomplete flow appends one). _strip_nick_prompt keys off this to drop
-# the whole prompt once the member picks a call sign. Distinct from
-# ACCENT_PASS so the pass container (which folds the prompt in) is left
-# in place and only has its call-sign bits stripped.
-_NICK_PROMPT_ACCENT = 0xD4AF37
-
-
-def _nick_button(label: str, custom_id: str, emoji_id: str) -> dict:
-    """Build a secondary (style 2) call-sign button, attaching the
-    configured custom emoji when one is provided."""
-    btn: dict = {
-        "style": 2,
-        "type": 2,
-        "label": label,
-        "custom_id": custom_id,
-    }
-    if emoji_id:
-        btn["emoji"] = {"id": emoji_id, "name": "unknown", "animated": False}
-    return btn
-
-
-def _callsign_buttons(
-    suggestion: str | None, user_id: int | None, current_nick: str,
-) -> tuple[list[dict], list[dict]]:
-    """Return ``(caption_components, callsign_buttons)`` for the in-game
-    name prompt, or ``([], [])`` when there's no suggestion worth
-    offering.
-
-    Single source of truth shared by the pass reply (which folds these
-    into its gold container) and the standalone incomplete-flow prompt,
-    so the caption text and the two ``nick:`` buttons are defined once.
-    """
-    if not (suggestion and user_id is not None):
-        return [], []
-    yes_id, no_id = _nick_custom_ids(suggestion, user_id)
-    caption = [{"type": 10, "content": _CALLSIGN_CAPTION}]
-    buttons = [
-        _nick_button(
-            (current_nick or "Current nickname")[:80],
-            no_id, NICK_PROMPT_SERVER_EMOJI_ID,
-        ),
-        _nick_button(
-            (suggestion or "In-game name")[:80],
-            yes_id, NICK_PROMPT_INGAME_EMOJI_ID,
-        ),
-    ]
-    return caption, buttons
-
-
-def _nickname_prompt_components(
-    suggestion: str, user_id: int, *, current_nick: str = "",
-) -> list[dict]:
-    """Standalone V2 message for the in-game-name selection prompt.
-
-    Layout: one gold-accent container with a "pick your call sign!"
-    caption and an action row of the server-nick + in-game-name buttons.
-
-    The two callsign buttons reuse the existing ``nick:y:<uid>:<encoded>``
-    / ``nick:n:<uid>:<encoded>`` custom_id scheme so
-    ``_handle_nick_interaction`` can edit this whole prompt message in
-    place via UPDATE_MESSAGE.
-    """
-    caption, row_buttons = _callsign_buttons(suggestion, user_id, current_nick)
-
-    # Caption AND buttons live INSIDE one gold container so the prompt
-    # reads as a single embedded block (no stray action row floating
-    # outside the container).
-    return [{
-        "type": 17,
-        "accent_color": _NICK_PROMPT_ACCENT,
-        "components": [
-            *caption,
-            {"type": 1, "components": row_buttons[:5]},
-        ],
-    }]
-
-
-def _nickname_resolved_components(text: str, accent: int) -> list[dict]:
-    return [{
-        "type": 17,
-        "accent_color": accent,
-        "components": [{"type": 10, "content": text}],
-    }]
-
-
 # ---------- Role category tracking -----------------------------------------
 
 
-# Categories that contribute to a member's verification "completion %".
-# Each tuple is (display_name, callable -> list[int] of role IDs that
-# count for that category). The list is recomputed per call because
-# CLAN_SLOTS / PLATFORM_ROLE_IDS can change at runtime via /clan-emblems
-# resync.
+# Categories whose roles make up a member's verifiable profile data. Each
+# tuple is (display_name, list[int] of role IDs that count for that
+# category). Recomputed per call because CLAN_SLOTS / PLATFORM_ROLE_IDS can
+# change at runtime via /clan-emblems resync. Drives the on_member_update
+# change detector that keeps each member's record message in sync.
 def _role_categories() -> list[tuple[str, list[int]]]:
     return [
         ("Platform", [rid for rid in PLATFORM_ROLE_IDS.values() if rid]),
@@ -1831,12 +873,19 @@ def _role_categories() -> list[tuple[str, list[int]]]:
     ]
 
 
+def _tracked_role_ids() -> set[int]:
+    """Return the flat set of every role ID that contributes to a member's
+    record (clan / platform / mastery / syndicate). Used by
+    ``on_member_update`` to decide whether a role change touched any
+    profile-relevant role."""
+    return {rid for _name, ids in _role_categories() for rid in ids}
+
+
 def _role_categories_for(role_ids: set[int]) -> list[tuple[str, bool]]:
     """Return (name, has) for each *enabled* category given a member's roles.
 
     A category is enabled when its role-id list is non-empty. Disabled
-    categories don't appear in the progress-card totals, so an unconfigured
-    server won't show 0% forever.
+    categories don't appear, so an unconfigured server won't show 0% forever.
     """
     out: list[tuple[str, bool]] = []
     for name, ids in _role_categories():
@@ -2018,21 +1067,6 @@ async def _sync_member_profile_from_roles(member: discord.Member) -> None:
     )
 
 
-def _help_link_buttons(guild: "discord.Guild | None") -> list[tuple[str, str]]:
-    """Build a Link button row pointing to the help channel.
-
-    Discord channel jump-links are ``/channels/<guild>/<channel>`` URLs.
-    Returns an empty list when either the guild or channel is unset so
-    callers can safely splat into ``link_buttons=``.
-    """
-    if not (guild and HELP_CHANNEL_ID):
-        return []
-    return [(
-        "How to get your roles",
-        f"https://discord.com/channels/{guild.id}/{HELP_CHANNEL_ID}",
-    )]
-
-
 # Categories a member can self-assign via the help channel; surfaced as
 # "Assign <category>" link buttons on a /profile card when unearned.
 _ASSIGNABLE_CATEGORIES = ("Platform", "Mastery Rank", "Syndicate")
@@ -2135,103 +1169,6 @@ async def _v2_multipart_request(
             return await resp.json()
         except (aiohttp.ContentTypeError, ValueError):
             return None
-
-
-async def _send_v2(
-    reply_to: discord.Message,
-    components: list[dict],
-    *,
-    mention_user: bool = False,
-    allow_role_mentions: bool = False,
-    file_bytes: bytes | None = None,
-    file_name: str = "attachment.png",
-    file_content_type: str = "image/png",
-) -> None:
-    """Send a Components V2 message as a reply via raw HTTP (discord.py 2.x has no native v2).
-
-    When ``file_bytes`` is provided, the message is posted as multipart so a
-    top-level media-gallery entry referencing ``attachment://<file_name>``
-    resolves to the attached file in the same Discord message.
-    """
-    from discord.http import Route
-
-    parse: list[str] = []
-    if mention_user:
-        parse.append("users")
-    if allow_role_mentions:
-        parse.append("roles")
-
-    payload: dict = {
-        "flags": COMPONENTS_V2_FLAG,
-        "components": components,
-        "allowed_mentions": {
-            "parse": parse,
-            "replied_user": mention_user,
-        },
-        "message_reference": {
-            "message_id": reply_to.id,
-            "channel_id": reply_to.channel.id,
-            "fail_if_not_exists": False,
-        },
-    }
-    if reply_to.guild is not None:
-        payload["message_reference"]["guild_id"] = reply_to.guild.id
-    if file_bytes is not None:
-        payload["attachments"] = [{"id": 0, "filename": file_name}]
-
-    route = Route(
-        "POST",
-        "/channels/{channel_id}/messages",
-        channel_id=reply_to.channel.id,
-    )
-    sent_id: int | None = None
-    try:
-        if file_bytes is not None:
-            # discord.py's HTTPClient.request can't cleanly post arbitrary
-            # multipart bodies for V2, so post directly via the shared
-            # multipart sender. Per-channel rate limits apply but a single
-            # reply is well within the bucket.
-            url = (
-                f"{_DISCORD_API_BASE}/channels/"
-                f"{reply_to.channel.id}/messages"
-            )
-            data = await _v2_multipart_request(
-                "POST", url, payload=payload,
-                file_bytes=file_bytes, file_name=file_name,
-                file_content_type=file_content_type,
-            )
-        else:
-            data = await client.http.request(route, json=payload)
-        if isinstance(data, dict):
-            raw_id = data.get("id")
-            if isinstance(raw_id, (str, int)):
-                try:
-                    sent_id = int(raw_id)
-                except (TypeError, ValueError):
-                    sent_id = None
-    except discord.HTTPException:
-        logger.exception("v2 component reply failed; falling back to plain text")
-        text = next(
-            (
-                block.get("content", "")
-                for c in components
-                for block in c.get("components", [])
-                if block.get("type") == 10
-            ),
-            "Verification update",
-        )
-        try:
-            sent = await reply_to.reply(text)
-            sent_id = sent.id
-        except discord.HTTPException:
-            logger.exception("plain-text fallback also failed")
-
-    if sent_id:
-        _remember_reply(reply_to.id, reply_to.channel.id, sent_id)
-        if REPLY_TTL_SECONDS > 0:
-            _spawn_bg_task(
-                _delete_after(reply_to.channel.id, sent_id, REPLY_TTL_SECONDS)
-            )
 
 
 async def _edit_message_v2_with_file(
@@ -2378,38 +1315,6 @@ async def _post_channel_v2_with_file(
             "_post_channel_v2_with_file: failed to post to channel %s", channel_id
         )
     return None
-
-
-
-async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
-    """When the original screenshot post is deleted, also delete our reply.
-
-    Uses the raw event so this still fires when the source message isn't
-    cached (e.g. older than the bot's start). Scoped to TARGET_CHANNEL_ID
-    so we never touch messages in unrelated channels.
-    """
-    if payload.channel_id != TARGET_CHANNEL_ID:
-        return
-    entry = _REPLY_MAP.pop(payload.message_id, None)
-    if entry is None:
-        return
-    channel_id, reply_id = entry
-    _spawn_bg_task(_delete_message(channel_id, reply_id))
-
-
-@client.event
-async def on_message(message: discord.Message) -> None:
-    if (
-        message.author.bot
-        or (client.user is not None and message.author.id == client.user.id)
-        or message.webhook_id is not None
-        or message.type not in (discord.MessageType.default, discord.MessageType.reply)
-    ):
-        return
-    if message.channel.id != TARGET_CHANNEL_ID:
-        return
-
-    await _process_screenshot(message)
 
 
 async def _clear_member_data_on_leave(
@@ -2860,7 +1765,8 @@ async def _onboarding_route_manual_review(
     # channel so staff have a record of the pending case.
     _spawn_bg_task(
         _post_member_record(
-            member, [f"Manual review pending — {reason}"],
+            member,
+            extra_lines=[f"Manual review pending — {reason}"],
             image_bytes=image_bytes,
         )
     )
@@ -3019,12 +1925,13 @@ class _OnboardingVerifyModal(discord.ui.Modal):
         # roles. Only the cache is consulted, so there's no extra latency.
         member = guild.get_member(member.id) or member
 
-        summary = await _verify_member_from_screenshot(
+        result = await _verify_member_from_screenshot(
             member,
             image_bytes=image_bytes,
             filename=attachment.filename or "profile.png",
             content_type=attachment.content_type or "image/png",
         )
+        summary = result.summary
 
         if not summary:
             # OCR failed entirely — couldn't read the screenshot.
@@ -3139,9 +2046,75 @@ class _OnboardingVerifyModal(discord.ui.Modal):
         # Welcome-only response: post the public "Welcome to the Golden Pagoda"
         # message to the server-entry channel (no ephemeral confirmation).
         await _post_onboarding_pass_welcome(member)
-        # Post a member record (the uploaded screenshot) to the records
-        # channel (fire-and-forget).
-        _spawn_bg_task(_post_member_record(member, summary, image_bytes=image_bytes))
+        # Post a member record (the member's full profile) to the records
+        # ("profile-log") channel (fire-and-forget).
+        _spawn_bg_task(_post_member_record(
+            member,
+            in_game_name=result.in_game_name,
+            mastery_rank=result.mastery_rank,
+            image_bytes=image_bytes,
+        ))
+
+
+def _member_record_profile_lines(
+    member: discord.Member,
+    *,
+    in_game_name: str | None = None,
+    mastery_rank: str | None = None,
+) -> list[str]:
+    """Derive the full member-profile body for the records ("profile-log")
+    channel.
+
+    The records channel is the source of truth for member profile data, so
+    each record carries the complete profile as stable, parseable
+    ``Key: **Value**`` lines. In-game name + exact Mastery Rank are OCR-only
+    (passed in); Clan, Platform, the Mastery bucket and Syndicate are read
+    live from the member's current roles. Categories with no value are
+    omitted.
+    """
+    role_ids = {r.id for r in member.roles}
+    lines: list[str] = []
+
+    if in_game_name and in_game_name.strip():
+        lines.append(f"In-game name: **{in_game_name.strip()}**")
+
+    slot = next(
+        (s for s in CLAN_SLOTS if s.role_id and s.role_id in role_ids),
+        None,
+    )
+    if slot is not None and slot.clan_name:
+        clan = _strip_clan_tag(slot.clan_name)
+        if clan:
+            lines.append(f"Clan: **{clan}**")
+
+    member_platform = next(
+        (
+            p for p, rid in PLATFORM_ROLE_IDS.items()
+            if rid and rid in role_ids
+        ),
+        None,
+    )
+    if member_platform:
+        lines.append(f"Platform: **{member_platform}**")
+
+    mr_value: str | None = None
+    if mastery_rank and mastery_rank.strip():
+        mr_value = mastery_rank.strip()
+    elif MR_ROLE_IDS:
+        mr_ids = set(MR_ROLE_IDS)
+        mr_names = [r.name for r in member.roles if r.id in mr_ids]
+        if mr_names:
+            mr_value = ", ".join(mr_names)
+    if mr_value:
+        lines.append(f"Mastery Rank: **{mr_value}**")
+
+    if SYNDICATE_ROLE_IDS:
+        syn_ids = set(SYNDICATE_ROLE_IDS)
+        syn_names = [r.name for r in member.roles if r.id in syn_ids]
+        if syn_names:
+            lines.append(f"Syndicate: **{', '.join(syn_names)}**")
+
+    return lines
 
 
 def _build_member_record_components(
@@ -3158,9 +2131,9 @@ def _build_member_record_components(
     # Heading (outside the container, like /status "### 📊 Status — Title")
     heading = f"### \U0001F4CB Member Record \u2014 {member.display_name}"
 
-    # Body text inside the container — same line format as summary_lines
-    # from _verify_member_from_screenshot (e.g. "Clan: assigned", "Mastery Rank: MR 12")
-    # plus the member mention + join timestamp.
+    # Body text inside the container — the member's full profile lines from
+    # _member_record_profile_lines (e.g. "Clan: **Golden Tenno**", "Mastery
+    # Rank: **MR 12**") plus the member mention + join timestamp.
     joined_str = ""
     if member.joined_at:
         joined_str = f"\n-# Joined: <t:{int(member.joined_at.timestamp())}:R>"
@@ -3190,16 +2163,23 @@ def _build_member_record_components(
 
 async def _post_member_record(
     member: discord.Member,
-    summary_lines: list[str],
     *,
+    in_game_name: str | None = None,
+    mastery_rank: str | None = None,
+    extra_lines: list[str] | None = None,
     image_bytes: bytes | None = None,
 ) -> None:
-    """Post a member record to MEMBER_RECORDS_CHANNEL_ID.
+    """Post a member record (the member's full profile) to
+    MEMBER_RECORDS_CHANNEL_ID — the records ("profile-log") channel that is
+    the source of truth for member profile data.
 
-    Uses the screenshot the member uploaded to the verification modal as the
-    record image (``image_bytes``). When no screenshot is available (e.g. the
-    "Not Affiliated" path), posts a text-only record with the media gallery
-    stripped.
+    The body is the member's complete profile (in-game name + clan + platform
+    + mastery + syndicate), derived from their current roles plus the OCR-only
+    fields (``in_game_name`` / ``mastery_rank``), with any ``extra_lines``
+    (e.g. a manual-review note) appended. Uses the screenshot the member
+    uploaded as the record image (``image_bytes``); when none is available
+    (e.g. the manual-review path), posts a text-only record with the media
+    gallery stripped.
 
     Fail-soft: exceptions are logged but never propagate (this is called as a
     background task from the onboarding success / manual-review paths).
@@ -3207,9 +2187,14 @@ async def _post_member_record(
     if not MEMBER_RECORDS_CHANNEL_ID:
         return
     try:
+        summary_lines = _member_record_profile_lines(
+            member, in_game_name=in_game_name, mastery_rank=mastery_rank,
+        )
+        if extra_lines:
+            summary_lines = summary_lines + list(extra_lines)
         components = _build_member_record_components(member, summary_lines)
         if image_bytes:
-            await _post_channel_v2_with_file(
+            message_id = await _post_channel_v2_with_file(
                 MEMBER_RECORDS_CHANNEL_ID,
                 components,
                 file_bytes=image_bytes,
@@ -3218,13 +2203,48 @@ async def _post_member_record(
         else:
             # No screenshot; strip the media gallery and post text-only.
             text_components = [c for c in components if c.get("type") != 12]
-            await _post_channel_v2(MEMBER_RECORDS_CHANNEL_ID, text_components)
+            message_id = await _post_channel_v2(
+                MEMBER_RECORDS_CHANNEL_ID, text_components
+            )
         logger.info(
             "onboarding: posted member record for %s to channel %s",
             member.id, MEMBER_RECORDS_CHANNEL_ID,
         )
+        # Keep the user_id -> record message_ids index fresh for fast
+        # lookups (records_index). File IO runs off the event loop.
+        if message_id is not None:
+            _spawn_bg_task(asyncio.to_thread(
+                records_index.add_record,
+                member.id,
+                message_id,
+                channel_id=MEMBER_RECORDS_CHANNEL_ID,
+            ))
     except Exception:
         logger.exception("onboarding: _post_member_record failed for %s", member.id)
+
+
+def _member_record_jump_urls(guild_id: int, user_id: int) -> list[str]:
+    """Build Discord jump URLs for a member's record messages.
+
+    Reads the (tiny) records_index synchronously and resolves the records
+    channel from the index, falling back to ``MEMBER_RECORDS_CHANNEL_ID``.
+    Fail-soft (returns ``[]`` on any problem).
+    """
+    try:
+        index = records_index.load_index()
+        channel_id = index.get("channel_id") or MEMBER_RECORDS_CHANNEL_ID
+        ids = index.get("users", {}).get(str(user_id), [])
+    except Exception:
+        logger.debug(
+            "records index lookup failed for %s", user_id, exc_info=True
+        )
+        return []
+    if not channel_id:
+        return []
+    return [
+        f"https://discord.com/channels/{guild_id}/{channel_id}/{mid}"
+        for mid in ids
+    ]
 
 
 async def _handle_onboarding_interaction(
@@ -3634,31 +2654,13 @@ def _status_page_channels(
     def fmt(cid: int) -> str:
         return f"<#{cid}> `{cid}`" if cid else "*(unset)*"
 
-    def fmt_reaction(rid: int | None) -> str:
-        if not rid:
-            return "*(unset)*"
-        # Pull the rendered form from the bot's cache so animated
-        # custom emojis get <a:name:id> (and the correct display
-        # name) automatically. Falls back to a bare id reference for
-        # the rare window before the cache populates.
-        live = client.get_emoji(rid) if client else None
-        if live is not None:
-            return str(live)
-        return f"`{rid}`"
-
-    last_seen = _load_catchup_state()
-    last = f"`{last_seen}`" if last_seen else "*(none)*"
-
     return (
         f"**Channels**\n"
-        f"-# Target: {fmt(TARGET_CHANNEL_ID)}\n"
-        f"\n**Reactions**\n"
-        f"-# Pass: {fmt_reaction(PASS_REACTION_ID)}\n"
-        f"-# Pending: {fmt_reaction(PENDING_REACTION_ID)}\n"
-        f"-# Fail: {FAIL_REACTION or '*(unset)*'}\n"
+        f"-# Onboarding: {fmt(ONBOARDING_CHANNEL_ID)}\n"
+        f"-# Records: {fmt(MEMBER_RECORDS_CHANNEL_ID)}\n"
+        f"-# Help: {fmt(HELP_CHANNEL_ID)}\n"
         f"\n**Messaging**\n"
-        f"-# Reply TTL: `{REPLY_TTL_SECONDS}s`\n"
-        f"-# Catch-up: `{CATCHUP_LOOKBACK_HOURS}h` lookback \u2022 last id: {last}"
+        f"-# Reply TTL: `{REPLY_TTL_SECONDS}s`"
     )
 
 
@@ -4099,7 +3101,10 @@ async def _manage_snapshot(guild_id: int, user_id: int) -> dict:
     titles = await asyncio.to_thread(
         analytics.list_member_titles, guild_id, user_id
     )
-    return {"profile": profile, "titles": titles}
+    records = await asyncio.to_thread(
+        _member_record_jump_urls, guild_id, user_id
+    )
+    return {"profile": profile, "titles": titles, "records": records}
 
 
 def _manage_nav_row(member_id: int, page: int) -> dict:
@@ -4544,6 +3549,21 @@ def _manage_components(
         else:
             lines.append("-# No stored profile data.")
         lines.append(f"-# Titles: `{len(titles)}`")
+        records = snap.get("records") or []
+        if records:
+            recent = records[-3:]
+            start = len(records) - len(recent) + 1
+            links = " \u00b7 ".join(
+                f"[record {n}]({u})"
+                for n, u in enumerate(recent, start=start)
+            )
+            more = len(records) - len(recent)
+            tail = f" (+{more} older)" if more else ""
+            lines.append(
+                f"-# Records: `{len(records)}` \u2014 {links}{tail}"
+            )
+        else:
+            lines.append("-# Records: *(none)*")
         lines.append("")
         lines.append(_clan_sync_summary_line())
         container_components = [{"type": 10, "content": "\n".join(lines)}]
@@ -5311,12 +4331,13 @@ class _ScreenshotVerifyModal(discord.ui.Modal):
             return
 
         member = self._gp_member
-        summary = await _verify_member_from_screenshot(
+        result = await _verify_member_from_screenshot(
             member,
             image_bytes=image_bytes,
             filename=attachment.filename or "profile.png",
             content_type=attachment.content_type or "image/png",
         )
+        summary = result.summary
 
         # Re-fetch so the re-render reflects freshly assigned roles (the
         # cached member.roles lags the role-add gateway event).
@@ -5535,12 +4556,13 @@ class _ManageScreenshotModal(discord.ui.Modal):
                 )
             return
 
-        summary = await _verify_member_from_screenshot(
+        result = await _verify_member_from_screenshot(
             member,
             image_bytes=image_bytes,
             filename=attachment.filename or "profile.png",
             content_type=attachment.content_type or "image/png",
         )
+        summary = result.summary
 
         # Refresh the /manage Overview page in place so the stored-profile
         # block reflects whatever the screenshot just wrote.
@@ -5563,10 +4585,24 @@ class _ManageScreenshotModal(discord.ui.Modal):
                 )
 
 
+class _VerifyResult(NamedTuple):
+    """Outcome of :func:`_verify_member_from_screenshot`.
+
+    ``summary`` holds the human-readable per-field lines (empty when the
+    screenshot couldn't be read). ``in_game_name`` and ``mastery_rank`` carry
+    the OCR-only fields — the handle + exact rank that aren't recoverable from
+    Discord roles — so callers can thread them into the member-records log.
+    """
+
+    summary: list[str]
+    in_game_name: str | None
+    mastery_rank: str | None
+
+
 async def _verify_member_from_screenshot(
     member: discord.Member, *, image_bytes: bytes,
     filename: str, content_type: str,
-) -> list[str]:
+) -> _VerifyResult:
     """OCR a Warframe profile screenshot and assign/store every field we can
     for ``member``: in-game name + clan role + mastery rank.
 
@@ -5585,11 +4621,11 @@ async def _verify_member_from_screenshot(
             probe.close()
     except Exception:
         logger.warning("profile screenshot: invalid image", exc_info=True)
-        return []
+        return _VerifyResult([], None, None)
 
     fields = await _ocr_profile_fields(image_bytes, filename, content_type)
     if not fields.ok:
-        return []
+        return _VerifyResult([], None, None)
     profile_name = fields.profile_name
     clan_name = fields.clan_name
     mastery_rank = fields.mastery_rank
@@ -5641,7 +4677,7 @@ async def _verify_member_from_screenshot(
             **store,
         )
 
-    return summary
+    return _VerifyResult(summary, profile_name, mastery_rank)
 
 
 def _sync_profile_action_items(
@@ -5796,6 +4832,21 @@ async def profile_cmd(
                 info=info,
                 in_game_name=in_game_name,
             )
+        # Public record link: anyone viewing any profile can jump to the
+        # member's logged record(s). Added after the own-profile sync above
+        # (which rebuilds link buttons) so it isn't stripped. Newest last.
+        record_urls = await asyncio.to_thread(
+            _member_record_jump_urls, target.guild.id, target.id
+        )
+        if record_urls:
+            if view is None:
+                view = discord.ui.View(timeout=600)
+            view.add_item(discord.ui.Button(
+                style=discord.ButtonStyle.link,
+                label="View record",
+                url=record_urls[-1],
+                emoji=discord.PartialEmoji(name="\U0001F4CB"),
+            ))
         if view is not None and view.children:
             send_kwargs["view"] = view
         await interaction.followup.send(**send_kwargs)
@@ -5945,212 +4996,6 @@ async def onboard_cmd(
     )
 
 
-async def _handle_nick_interaction(
-    interaction: discord.Interaction, custom_id: str
-) -> None:
-    """Handle the in-game-name buttons embedded at the bottom of the
-    verification reply.
-
-    On click we apply the nickname (if Yes) and then edit the message in
-    place via UPDATE_MESSAGE (callback type 7), stripping just the
-    nick-prompt components from the bottom so the verification card +
-    progress bar above remain intact.
-    """
-    from urllib.parse import unquote
-
-    parts = custom_id.split(":", 3)
-    # ["nick", "y"|"n", uid, encoded_name?]
-    if len(parts) < 3:
-        return
-    action = parts[1]
-    try:
-        target_uid = int(parts[2])
-    except ValueError:
-        return
-
-    suggestion = ""
-    if len(parts) >= 4:
-        suggestion = unquote(parts[3])[:32].strip()
-
-    if interaction.user.id != target_uid:
-        # Wrong user clicked: ephemeral notice, no visible message change.
-        try:
-            await _interaction_callback(
-                interaction, 4,
-                _nickname_resolved_components(
-                    "-# Only the verified member can use these buttons.",
-                    ACCENT_FAIL,
-                ),
-            )
-        except Exception:
-            logger.exception("nick: deny ack failed")
-        return
-
-    if action not in ("y", "n"):
-        return
-
-    if action == "y" and suggestion:
-        if interaction.guild and isinstance(interaction.user, discord.Member):
-            try:
-                await interaction.user.edit(
-                    nick=suggestion,
-                    reason="In-game name applied via verification prompt",
-                )
-            except discord.Forbidden:
-                logger.info("nick: forbidden setting %s", suggestion)
-            except discord.HTTPException:
-                logger.exception("nick: edit failed")
-
-    # Build the trimmed component list: keep everything from the original
-    # message EXCEPT the nick-prompt block at the bottom (banner image,
-    # gold container header, two button sections, and the separator
-    # between them). discord.py 2.x doesn't parse V2 sub-components, so
-    # fetch the raw message JSON to get authoritative component data.
-    raw: list[dict] = []
-    msg_attachments: list[dict] = []
-    try:
-        if interaction.message is not None:
-            data = await client.http.get_message(
-                interaction.channel_id, interaction.message.id,
-            )
-            raw = data.get("components") or []
-            msg_attachments = data.get("attachments") or []
-    except Exception:
-        logger.exception("nick: fetch original message failed")
-    trimmed = _strip_nick_prompt(raw)
-    if not trimmed:
-        # Nothing left to show; fall back to a silent ACK so Discord
-        # doesn't display "interaction failed".
-        try:
-            from discord.http import Route
-            route = Route(
-                "POST",
-                "/interactions/{interaction_id}/{interaction_token}/callback",
-                interaction_id=interaction.id,
-                interaction_token=interaction.token,
-            )
-            await client.http.request(route, json={"type": 6})
-        except Exception:
-            logger.exception("nick: deferred ack failed")
-        return
-
-    # If the original verification reply included the progress card
-    # attachment, re-render it from the member's CURRENT roles so the
-    # bar reflects any changes since the message was first posted
-    # (clan/platform/MR/syndicate roles picked up via self-service,
-    # plus any unverified-role removal). When refreshed, we must edit
-    # via PATCH+multipart so the new PNG replaces the old attachment;
-    # the type:9/type:12 component still references attachment://progress.png.
-    has_progress = any(
-        att.get("filename") == "progress.png" for att in msg_attachments
-    )
-    refreshed_png: bytes | None = None
-    if (
-        has_progress
-        and interaction.guild
-        and isinstance(interaction.user, discord.Member)
-    ):
-        try:
-            member = interaction.user
-            role_ids = {r.id for r in member.roles}
-            cats = _role_categories_for(role_ids)
-            have = sum(1 for _, ok in cats if ok)
-            total = len(cats)
-            avatar_url = (
-                member.display_avatar or member.default_avatar
-            ).replace(size=256, format="png").url
-            avatar_bytes = await _fetch_avatar_bytes(avatar_url)
-            refreshed_png = await _run_heavy(
-                _render_progress_card_png,
-                avatar_bytes=avatar_bytes,
-                display_name=member.display_name,
-                count=have,
-                target=total,
-            )
-        except Exception:
-            logger.exception("nick: progress card refresh failed")
-            refreshed_png = None
-
-    if refreshed_png is not None:
-        # Deferred-update ACK, then PATCH the message with multipart so
-        # the new attachment supersedes the old one. UPDATE_MESSAGE
-        # (type 7) is JSON-only so we can't use it for attachment swaps.
-        try:
-            from discord.http import Route
-            route = Route(
-                "POST",
-                "/interactions/{interaction_id}/{interaction_token}/callback",
-                interaction_id=interaction.id,
-                interaction_token=interaction.token,
-            )
-            await client.http.request(route, json={"type": 6})
-        except Exception:
-            logger.exception("nick: deferred ack (refresh) failed")
-            return
-        try:
-            await _edit_message_v2_with_file(
-                channel_id=interaction.channel_id,
-                message_id=interaction.message.id,
-                components=trimmed,
-                file_bytes=refreshed_png,
-                file_name="progress.png",
-            )
-        except Exception:
-            logger.exception("nick: message PATCH with refreshed card failed")
-        return
-
-    try:
-        await _interaction_callback(
-            interaction, 7, trimmed, ephemeral=False,
-        )
-    except Exception:
-        logger.exception("nick: update message failed")
-
-
-def _strip_nick_prompt(components: list[dict]) -> list[dict]:
-    """Return ``components`` with the in-game-name prompt removed.
-
-    Two shapes are produced by the bot and both are handled here,
-    regardless of position:
-
-      * the incomplete flow appends a STANDALONE gold container (accent
-        ``_NICK_PROMPT_ACCENT``) — drop it wholesale;
-      * the pass flow folds the caption + ``nick:`` buttons INTO its
-        ``ACCENT_PASS`` container — reach in and remove just those,
-        dropping the container only if nothing survives.
-    """
-    result: list[dict] = []
-    for comp in components:
-        # Standalone nick-prompt container (incomplete flow): drop it.
-        if (
-            comp.get("type") == 17
-            and comp.get("accent_color") == _NICK_PROMPT_ACCENT
-        ):
-            continue
-        # Any other container may have the call-sign prompt folded in
-        # (the pass reply): strip just the caption + nick: buttons.
-        if comp.get("type") == 17 and isinstance(comp.get("components"), list):
-            kept: list[dict] = []
-            for child in comp["components"]:
-                ct = child.get("type")
-                if ct == 10 and child.get("content") == _CALLSIGN_CAPTION:
-                    continue
-                if ct == 1:
-                    btns = [
-                        b for b in (child.get("components") or [])
-                        if not str(b.get("custom_id", "")).startswith("nick:")
-                    ]
-                    if not btns:
-                        continue
-                    child = {**child, "components": btns}
-                kept.append(child)
-            if not kept:
-                continue
-            comp = {**comp, "components": kept}
-        result.append(comp)
-    return result
-
-
 @client.event
 async def on_interaction(interaction: discord.Interaction) -> None:
     if interaction.type != discord.InteractionType.component:
@@ -6158,9 +5003,6 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     data = interaction.data or {}
     custom_id = str(data.get("custom_id", ""))
 
-    if custom_id.startswith("nick:"):
-        await _handle_nick_interaction(interaction, custom_id)
-        return
     if custom_id.startswith("manage:"):
         await _handle_manage_interaction(interaction, custom_id)
         return
