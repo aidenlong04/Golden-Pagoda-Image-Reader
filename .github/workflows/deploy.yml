@@ -40,7 +40,7 @@ jobs:
     runs-on: [self-hosted, windows]
     steps:
       - name: Update working copy + restart service
-        shell: powershell
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           set -e
           if [ -z "$GP_BOT_DIR" ]; then
