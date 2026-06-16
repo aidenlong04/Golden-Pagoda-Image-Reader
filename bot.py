@@ -665,11 +665,13 @@ def _sync_clan_slots_from_guilds() -> list[str]:
     changes: list[str] = []
     for slot in CLAN_SLOTS:
         resolved: discord.Role | None = None
+        resolved_guild: discord.Guild | None = None
         for guild in client.guilds:
             if slot.role_id:
                 role = guild.get_role(slot.role_id)
                 if role is not None:
                     resolved = role
+                    resolved_guild = guild
                     break
             if slot.clan_name:
                 want = _normalize(slot.clan_name)
@@ -678,24 +680,39 @@ def _sync_clan_slots_from_guilds() -> list[str]:
                 )
                 if role is not None:
                     resolved = role
+                    resolved_guild = guild
                     break
         if resolved is None:
             continue
-        if slot.role_id != resolved.id or slot.clan_name != resolved.name:
+        resolved_emoji = slot.emoji
+        # If the slot has no configured emoji, try to auto-resolve a custom
+        # emoji whose name matches the clan/role name.
+        if not resolved_emoji and resolved_guild is not None:
+            resolved_emoji = _find_clan_emoji_literal(resolved_guild, resolved.name)
+        if (
+            slot.role_id != resolved.id
+            or slot.clan_name != resolved.name
+            or slot.emoji != resolved_emoji
+        ):
             logger.info(
-                "clan slot %d: %r/%s → %r/%s",
+                "clan slot %d: %r/%s/%r → %r/%s/%r",
                 slot.slot,
                 slot.clan_name,
                 slot.role_id,
+                slot.emoji,
                 resolved.name,
                 resolved.id,
+                resolved_emoji,
             )
             old_name = slot.clan_name
             old_id = slot.role_id
+            old_emoji = slot.emoji
             slot.clan_name = resolved.name
             slot.role_id = resolved.id
+            slot.emoji = resolved_emoji
             changes.append(
-                f"slot {slot.slot}: {old_name!r}/{old_id} → {resolved.name!r}/{resolved.id}"
+                f"slot {slot.slot}: {old_name!r}/{old_id}/{old_emoji!r} → "
+                f"{resolved.name!r}/{resolved.id}/{resolved_emoji!r}"
             )
     if changes:
         try:
@@ -710,6 +727,7 @@ def _sync_clan_slots_from_guilds() -> list[str]:
 _CLAN_TAG_SUFFIX_RE = re.compile(r"#\d+\s*$")
 _WS_RE = re.compile(r"\s+")
 _PLACEHOLDER_NAME_RE = re.compile(r"^place[\s\-_]*holder", re.IGNORECASE)
+_EMOJI_NAME_RE = re.compile(r"[^a-z0-9]+")
 
 
 def _normalize(name: str) -> str:
@@ -719,6 +737,25 @@ def _normalize(name: str) -> str:
 def _strip_clan_tag(clan_name: str) -> str:
     """'Grand Warhorde#245' -> 'Grand Warhorde'."""
     return _CLAN_TAG_SUFFIX_RE.sub("", clan_name).strip()
+
+
+def _normalize_emoji_name(name: str) -> str:
+    return _EMOJI_NAME_RE.sub("", (name or "").strip().lower())
+
+
+def _emoji_literal(emoji: discord.Emoji) -> str:
+    prefix = "a" if emoji.animated else ""
+    return f"<{prefix}:{emoji.name}:{emoji.id}>"
+
+
+def _find_clan_emoji_literal(guild: discord.Guild, clan_name: str) -> str | None:
+    target = _normalize_emoji_name(_strip_clan_tag(clan_name or ""))
+    if not target:
+        return None
+    for emoji in guild.emojis:
+        if _normalize_emoji_name(emoji.name) == target:
+            return _emoji_literal(emoji)
+    return None
 
 
 def _find_role(guild: discord.Guild, *candidates: str) -> discord.Role | None:
