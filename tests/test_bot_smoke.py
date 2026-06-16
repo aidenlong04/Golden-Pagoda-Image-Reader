@@ -1249,6 +1249,94 @@ class ProfileAccessGateTests(unittest.TestCase):
             )
 
 
+class ClanEmojiResolveTests(unittest.TestCase):
+    """Auto-pulling a custom server emoji for a clan slot with none set."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+        self._orig_client = getattr(bot_module, "client", None)
+
+    def tearDown(self):
+        if self._orig_client is not None:
+            self.b.client = self._orig_client
+
+    @staticmethod
+    def _emoji(name, eid, animated=False):
+        e = Mock()
+        e.name = name
+        e.id = eid
+        e.animated = animated
+        return e
+
+    def _set_guild_emojis(self, *emojis):
+        guild = Mock()
+        guild.emojis = list(emojis)
+        client = Mock()
+        client.guilds = [guild]
+        self.b.client = client
+        return guild
+
+    def test_match_keys_full_then_words(self):
+        self.assertEqual(
+            self.b._clan_emoji_match_keys("Kavat Raiders"),
+            ["kavatraiders", "kavat", "raiders"],
+        )
+        # Stopwords + sub-4-char words are dropped.
+        self.assertEqual(
+            self.b._clan_emoji_match_keys("Church of Slua"),
+            ["churchofslua", "church", "slua"],
+        )
+
+    def test_exact_full_name_match(self):
+        self._set_guild_emojis(self._emoji("Apestorm", 11))
+        self.assertEqual(
+            self.b._resolve_clan_emoji_literal("Apestorm"),
+            "<:Apestorm:11>",
+        )
+
+    def test_word_match_when_no_full_match(self):
+        # No "churchofslua" emoji, but a "slua" emoji should resolve.
+        self._set_guild_emojis(self._emoji("slua", 22))
+        self.assertEqual(
+            self.b._resolve_clan_emoji_literal("Church of Slua"),
+            "<:slua:22>",
+        )
+
+    def test_prefix_match_when_no_exact(self):
+        # "death" is a >=4-char prefix of the single key "deathroe" and isn't
+        # itself a key (one-word clan), so only the prefix tier can match it.
+        self._set_guild_emojis(self._emoji("death", 33))
+        self.assertEqual(
+            self.b._resolve_clan_emoji_literal("Deathroe"),
+            "<:death:33>",
+        )
+
+    def test_animated_literal(self):
+        self._set_guild_emojis(self._emoji("Deathroe", 44, animated=True))
+        self.assertEqual(
+            self.b._resolve_clan_emoji_literal("Deathroe"),
+            "<a:Deathroe:44>",
+        )
+
+    def test_no_match_returns_none(self):
+        self._set_guild_emojis(self._emoji("unrelated", 55))
+        self.assertIsNone(
+            self.b._resolve_clan_emoji_literal("Grand Warhorde")
+        )
+
+    def test_full_name_beats_word(self):
+        # Both present: the full-name emoji wins over a single-word emoji.
+        self._set_guild_emojis(
+            self._emoji("raiders", 66),
+            self._emoji("kavatraiders", 77),
+        )
+        self.assertEqual(
+            self.b._resolve_clan_emoji_literal("Kavat Raiders"),
+            "<:kavatraiders:77>",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
 

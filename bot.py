@@ -66,6 +66,7 @@ from envstore import (  # noqa: F401  (some re-exported for tests via bot.*)
 from cards import (  # noqa: F401  (test-facing re-exports resolved as bot.*)
     _card_backdrop,
     _card_backdrop_cached,
+    _circular_avatar,
     _ellipsize,
     _load_font,
     _pagoda_silhouette,
@@ -173,14 +174,14 @@ ACCENT_INCOMPLETE = _int_env("ACCENT_INCOMPLETE", 0x99AAB5)  # grey
 # Role granted to users whose screenshot was readable but couldn't be fully
 # verified automatically (platform icon missing, unconfigured clan, etc).
 # A staff member then manually completes verification.
-INCOMPLETE_ROLE_ID = _int_env("INCOMPLETE_ROLE_ID", 1361846841905381632)
+INCOMPLETE_ROLE_ID = _int_env("INCOMPLETE_ROLE_ID", 1459326361968574555)
 
 # Auto-delete bot replies after this many seconds (0 = keep forever).
 REPLY_TTL_SECONDS = _int_env("REPLY_TTL_SECONDS", 180)
 
 # Role removed from a member on successful verification (e.g. an "unverified"
 # gate role). Set to 0 to disable.
-VERIFY_REMOVE_ROLE_ID = _int_env("VERIFY_REMOVE_ROLE_ID", 1459326361968574555)
+VERIFY_REMOVE_ROLE_ID = _int_env("VERIFY_REMOVE_ROLE_ID", 1381447170229538917)
 
 # Onboarding flow: welcome prompt + screenshot verification for new joins.
 # Hours before a pending welcome prompt triggers a re-prompt (default: 5h).
@@ -576,9 +577,11 @@ def _sync_clan_slots_from_guilds() -> list[str]:
             continue
         resolved_emoji = slot.emoji
         # If the slot has no configured emoji, try to auto-resolve a custom
-        # emoji whose name matches the clan/role name.
-        if not resolved_emoji and resolved_guild is not None:
-            resolved_emoji = _find_clan_emoji_literal(resolved_guild, resolved.name)
+        # emoji whose name matches the clan/role name (across all guilds).
+        if not resolved_emoji:
+            resolved_emoji = _resolve_clan_emoji_literal(
+                slot.clan_name, resolved.name, primary_guild=resolved_guild
+            )
         if (
             slot.role_id != resolved.id
             or slot.clan_name != resolved.name
@@ -638,13 +641,74 @@ def _emoji_literal(emoji: discord.Emoji) -> str:
     return f"<{prefix}:{emoji.name}:{emoji.id}>" if prefix else f"<:{emoji.name}:{emoji.id}>"
 
 
-def _find_clan_emoji_literal(guild: discord.Guild, clan_name: str) -> str | None:
-    target = _normalize_emoji_name(_strip_clan_tag(clan_name or ""))
-    if not target:
+# Short connector/filler words dropped when deriving clan-name match keys, so
+# a word like "of" in "Church of Slua" never matches a stray server emoji.
+_CLAN_NAME_STOPWORDS = frozenset({"of", "the", "and", "clan", "for"})
+
+
+def _clan_emoji_match_keys(*names: str) -> list[str]:
+    """Normalized emoji-match keys for clan/role names, most specific first.
+
+    Yields the full alphanumeric name (e.g. ``kavatraiders``) before each
+    significant (>=4 char, non-stopword) word (e.g. ``kavat``, ``raiders``)
+    so a full-name match always beats a single-word match.
+    """
+    keys: list[str] = []
+    seen: set[str] = set()
+    # Full names first (most specific).
+    for name in names:
+        full = _normalize_emoji_name(_strip_clan_tag(name or ""))
+        if full and full not in seen:
+            seen.add(full)
+            keys.append(full)
+    # Then significant individual words.
+    for name in names:
+        for word in re.split(r"[^A-Za-z0-9]+", _strip_clan_tag(name or "")):
+            key = _normalize_emoji_name(word)
+            if len(key) >= 4 and key not in _CLAN_NAME_STOPWORDS and key not in seen:
+                seen.add(key)
+                keys.append(key)
+    return keys
+
+
+def _resolve_clan_emoji_literal(
+    clan_name: str | None,
+    role_name: str | None = None,
+    *,
+    primary_guild: discord.Guild | None = None,
+) -> str | None:
+    """Auto-pull a custom emoji for a clan slot that has none configured.
+
+    Searches every guild the bot is in (``primary_guild`` first so a local
+    match wins) for a custom emoji whose normalized name matches the clan.
+    Match order: the full clan/role name, then any significant word (e.g.
+    emoji ``slua`` for ``Church of Slua``), then a >=4-char prefix of the full
+    name (e.g. ``kavat`` for ``Kavat Raiders``). Returns the ``<:name:id>``
+    literal or None.
+    """
+    keys = _clan_emoji_match_keys(clan_name or "", role_name or "")
+    if not keys:
         return None
-    for emoji in guild.emojis:
-        if _normalize_emoji_name(emoji.name) == target:
-            return _emoji_literal(emoji)
+    guilds: list[discord.Guild] = []
+    if primary_guild is not None:
+        guilds.append(primary_guild)
+    guilds.extend(g for g in client.guilds if g is not primary_guild)
+    full = keys[0]
+    for guild in guilds:
+        emojis = [(_normalize_emoji_name(e.name), e) for e in guild.emojis]
+        # Exact match on any key (full name before words).
+        for key in keys:
+            for norm, emoji in emojis:
+                if norm and norm == key:
+                    return _emoji_literal(emoji)
+        # Prefix of the full name (e.g. "kavat" -> "kavatraiders"); longest wins.
+        best: tuple[str, discord.Emoji] | None = None
+        for norm, emoji in emojis:
+            if len(norm) >= 4 and full.startswith(norm):
+                if best is None or len(norm) > len(best[0]):
+                    best = (norm, emoji)
+        if best is not None:
+            return _emoji_literal(best[1])
     return None
 
 
@@ -1090,10 +1154,15 @@ async def _v2_multipart_request(
     file_bytes: bytes,
     file_name: str,
     file_content_type: str = "image/png",
+    extra_files: list[tuple[bytes, str]] | None = None,
 ) -> dict | None:
-    """Send a multipart Components-V2 body (``payload_json`` + one file) to
-    ``url`` via the shared aiohttp session, authenticated with the bot token.
+    """Send a multipart Components-V2 body (``payload_json`` + one or more
+    files) to ``url`` via the shared aiohttp session, authenticated with the
+    bot token.
 
+    The primary file is ``files[0]``; any ``extra_files`` (``(bytes, name)``
+    tuples, e.g. a circular avatar alongside the screenshot) are appended as
+    ``files[1]``, ``files[2]``… so the payload's ``attachments`` ids line up.
     Returns the parsed JSON response when the server sends one, else None.
     Raises ``discord.HTTPException`` on any 4xx/5xx so callers can fall back
     (``_send_v2``) or log (``_edit_message_v2_with_file``).
@@ -1107,6 +1176,11 @@ async def _v2_multipart_request(
         "files[0]", file_bytes,
         filename=file_name, content_type=file_content_type,
     )
+    for idx, (extra_bytes, extra_name) in enumerate(extra_files or [], start=1):
+        form.add_field(
+            f"files[{idx}]", extra_bytes,
+            filename=extra_name, content_type="image/png",
+        )
     headers = {
         "Authorization": f"Bot {DISCORD_TOKEN}",
         "User-Agent": _V2_USER_AGENT,
@@ -1269,6 +1343,144 @@ async def _post_channel_v2_with_file(
             "_post_channel_v2_with_file: failed to post to channel %s", channel_id
         )
     return None
+
+
+def _record_attachment_plan(
+    file_bytes: bytes | None,
+    file_name: str,
+    avatar_bytes: bytes | None,
+) -> tuple[bytes | None, str, list[tuple[bytes, str]], list[dict]]:
+    """Order the record's attachments (screenshot then avatar) for a multipart
+    upload.
+
+    Returns ``(primary_bytes, primary_name, extra_files, attachments)`` where
+    ``attachments`` are the ``{id, filename}`` descriptors in upload order so
+    each ``attachment://`` reference in the embed resolves. ``primary_bytes``
+    is None when there's nothing to upload (caller sends plain JSON).
+    """
+    files: list[tuple[bytes, str]] = []
+    if file_bytes is not None:
+        files.append((file_bytes, file_name))
+    if avatar_bytes is not None:
+        files.append((avatar_bytes, "avatar.png"))
+    if not files:
+        return None, file_name, [], []
+    primary_bytes, primary_name = files[0]
+    extra_files = files[1:]
+    attachments = [
+        {"id": i, "filename": name} for i, (_, name) in enumerate(files)
+    ]
+    return primary_bytes, primary_name, extra_files, attachments
+
+
+async def _post_channel_embed(
+    channel_id: int,
+    embed: dict,
+    *,
+    file_bytes: bytes | None = None,
+    file_name: str = "record.png",
+    avatar_bytes: bytes | None = None,
+) -> int | None:
+    """POST a plain (non-V2) message carrying a single rich ``embed`` to
+    ``channel_id``, optionally with a screenshot and/or a circular avatar.
+
+    Records are sent as real embeds (not Components V2) so they render as the
+    gold ``/status``-styled card and can be re-styled from
+    ``scripts/record_layout.json``. ``file_bytes`` is the screenshot
+    (``attachment://record.png``); ``avatar_bytes`` is the /profile-style
+    circular avatar (``attachment://avatar.png``). Whichever are present are
+    uploaded multipart with their ``attachments`` ids in upload order. Returns
+    the posted message id or None on failure.
+    """
+    url = f"{_DISCORD_API_BASE}/channels/{channel_id}/messages"
+    payload: dict = {"embeds": [embed], "allowed_mentions": {"parse": []}}
+    primary_bytes, primary_name, extra_files, attachments = (
+        _record_attachment_plan(file_bytes, file_name, avatar_bytes)
+    )
+    try:
+        if primary_bytes is not None:
+            payload["attachments"] = attachments
+            data = await _v2_multipart_request(
+                "POST", url, payload=payload,
+                file_bytes=primary_bytes, file_name=primary_name,
+                extra_files=extra_files or None,
+            )
+        else:
+            from discord.http import Route
+
+            data = await client.http.request(
+                Route(
+                    "POST", "/channels/{channel_id}/messages",
+                    channel_id=channel_id,
+                ),
+                json=payload,
+            )
+        if isinstance(data, dict):
+            raw_id = data.get("id")
+            if isinstance(raw_id, (str, int)):
+                try:
+                    return int(raw_id)
+                except (TypeError, ValueError):
+                    pass
+    except discord.HTTPException:
+        logger.exception(
+            "_post_channel_embed: failed to post to channel %s", channel_id
+        )
+    return None
+
+
+async def _edit_channel_embed(
+    channel_id: int,
+    message_id: int,
+    embed: dict,
+    *,
+    file_bytes: bytes | None = None,
+    file_name: str = "record.png",
+    avatar_bytes: bytes | None = None,
+    keep_attachment_ids: list[int] | None = None,
+) -> None:
+    """PATCH an existing record message's ``embed`` in place.
+
+    With ``file_bytes`` and/or ``avatar_bytes`` the attachments are re-uploaded
+    multipart (screenshot then circular avatar) and the embed's
+    ``attachment://`` references resolve to the new uploads. Without any new
+    file only the embed JSON is rewritten; pass ``keep_attachment_ids`` to
+    retain already-attached files (screenshot + avatar). Fail-soft.
+    """
+    payload: dict = {"embeds": [embed], "allowed_mentions": {"parse": []}}
+    primary_bytes, primary_name, extra_files, attachments = (
+        _record_attachment_plan(file_bytes, file_name, avatar_bytes)
+    )
+    try:
+        if primary_bytes is not None:
+            url = (
+                f"{_DISCORD_API_BASE}/channels/"
+                f"{channel_id}/messages/{message_id}"
+            )
+            payload["attachments"] = attachments
+            await _v2_multipart_request(
+                "PATCH", url, payload=payload,
+                file_bytes=primary_bytes, file_name=primary_name,
+                extra_files=extra_files or None,
+            )
+            return
+        from discord.http import Route
+
+        if keep_attachment_ids is not None:
+            payload["attachments"] = [
+                {"id": int(a)} for a in keep_attachment_ids
+            ]
+        await client.http.request(
+            Route(
+                "PATCH", "/channels/{channel_id}/messages/{message_id}",
+                channel_id=channel_id, message_id=message_id,
+            ),
+            json=payload,
+        )
+    except discord.HTTPException:
+        logger.exception(
+            "_edit_channel_embed: failed to edit message %s", message_id
+        )
 
 
 async def _clear_member_data_on_leave(
@@ -1766,9 +1978,11 @@ async def _onboarding_route_manual_review(
             await _interaction_callback(interaction, 6, [])  # DEFERRED_UPDATE
 
 
-# Roles granted when a staff member approves a manual-review case via the
-# "Verify" button on the alert.
-_MREVIEW_APPROVE_ROLE_IDS = (1361846841905381632, 1392585653971062815)
+# When a staff member approves a manual-review case via the "Verify" button on
+# the alert, the pending-review + unverified gate roles are removed and the
+# verified-member role is granted.
+_MREVIEW_REMOVE_ROLE_IDS = (1459326361968574555, 1381447170229538917)
+_MREVIEW_APPROVE_ROLE_IDS = (1361846841905381632,)
 
 
 async def _handle_mreview_interaction(
@@ -1819,20 +2033,37 @@ async def _handle_mreview_interaction(
             )
         return
 
+    reason = f"Manual review approved by {user}"
+    removed: list[str] = []
+    for rid in _MREVIEW_REMOVE_ROLE_IDS:
+        role = guild.get_role(rid)
+        if role is None or role not in member.roles:
+            continue
+        try:
+            await _discord_call_with_retry(
+                lambda r=role: member.remove_roles(r, reason=reason),
+                label=f"mreview_remove:{role.name}",
+            )
+            removed.append(role.name)
+        except discord.Forbidden:
+            logger.warning(
+                "mreview: missing permission to remove %s", role.name
+            )
+        except discord.HTTPException:
+            logger.exception("mreview: failed to remove %s", role.name)
+
     granted: list[str] = []
     for rid in _MREVIEW_APPROVE_ROLE_IDS:
         role = guild.get_role(rid)
         if role is None:
             continue
-        ok, _ = await _add_role(
-            member, role, f"Manual review approved by {user}"
-        )
+        ok, _ = await _add_role(member, role, reason)
         if ok:
             granted.append(role.name)
 
     logger.info(
-        "mreview: %s approved %s; granted=%s",
-        user.id, member.id, granted,
+        "mreview: %s approved %s; removed=%s granted=%s",
+        user.id, member.id, removed, granted,
     )
 
     # The manual-review welcome persists until approval. Now that roles are
@@ -1843,12 +2074,21 @@ async def _handle_mreview_interaction(
         await _interaction_callback(interaction, 6, [])  # DEFERRED_UPDATE
     if msg is not None:
         _spawn_bg_task(_delete_message(msg.channel.id, msg.id))
-    # Ephemeral confirmation to the approving staff member.
+    # Ephemeral confirmation to the approving staff member — plain-text
+    # ✅ + -# subtext, matching /titles and /clan-emblems.
+    confirm_lines = [f"\u2705 Verified **{member.display_name}**."]
+    if granted:
+        confirm_lines.append(
+            f"-# Granted: {', '.join(f'**{n}**' for n in granted)}"
+        )
+    if removed:
+        confirm_lines.append(
+            f"-# Removed: {', '.join(f'**{n}**' for n in removed)}"
+        )
     with contextlib.suppress(Exception):
         await interaction.followup.send(
-            f"\u2705 Approved <@{member.id}> — granted: "
-            f"{', '.join(granted) if granted else 'no roles'}.",
-            ephemeral=True,
+            "\n".join(confirm_lines), ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
 
@@ -2102,6 +2342,68 @@ def _member_record_profile_lines(
     return lines
 
 
+def _build_member_record_embed(
+    member: discord.Member,
+    summary_lines: list[str],
+    *,
+    has_image: bool = False,
+    has_avatar: bool = False,
+) -> dict:
+    """Build a /status-styled gold embed dict for the member-records channel.
+
+    The body is the member's complete profile, carried as embed ``fields`` so
+    the records channel stays the parseable source of truth: each
+    ``Key: **Value**`` summary line becomes a ``{name: Key, value: **Value**}``
+    field that :func:`_parse_record_embed` reads back. The member mention +
+    id + join timestamp sit in the description, and the uploaded screenshot
+    (when present) is referenced via ``attachment://record.png``.
+
+    When ``has_avatar`` is set the thumbnail points at an attached
+    ``attachment://avatar.png`` — the same circular, gold-ringed avatar the
+    ``/profile`` card renders — instead of the raw (square) avatar URL.
+    """
+    joined_str = ""
+    if member.joined_at:
+        joined_str = f"  •  joined <t:{int(member.joined_at.timestamp())}:R>"
+    name_extra = (
+        f"  •  {member.display_name}"
+        if member.display_name != str(member) else ""
+    )
+    description = f"**{member.mention}** (`{member.id}`){name_extra}{joined_str}"
+
+    fields: list[dict] = []
+    for line in summary_lines:
+        m = _RECORD_LINE_RE.match(line)
+        if m:
+            fields.append({
+                "name": m.group(1).strip(),
+                "value": f"**{m.group(2).strip()}**",
+                "inline": True,
+            })
+        else:
+            # Non Key: **Value** line (e.g. a manual-review note) — keep it
+            # readable as a full-width field so nothing is silently dropped.
+            fields.append({"name": "\u200b", "value": line, "inline": False})
+
+    embed: dict = {
+        "title": f"\U0001F4CB  Member Record \u2014 {member.display_name}",
+        "color": ACCENT_PASS,
+        "description": description,
+        "fields": fields,
+        "footer": {"text": "Golden Pagoda  \u00b7  Member Records"},
+    }
+    avatar = getattr(member, "display_avatar", None)
+    if has_avatar:
+        embed["thumbnail"] = {"url": "attachment://avatar.png"}
+    elif avatar is not None:
+        embed["thumbnail"] = {"url": str(avatar.url)}
+    if has_image:
+        embed["image"] = {"url": "attachment://record.png"}
+    return embed
+
+
+# Kept for the test-suite + any callers that still want the V2 component
+# shape; the live record path now posts an embed via _build_member_record_embed.
 def _build_member_record_components(
     member: discord.Member,
     summary_lines: list[str],
@@ -2160,19 +2462,24 @@ async def _create_member_record(
     """
     if not MEMBER_RECORDS_CHANNEL_ID:
         return
-    components = _build_member_record_components(member, summary_lines)
-    if image_bytes:
-        message_id = await _post_channel_v2_with_file(
+    avatar_bytes = await _render_record_avatar_bytes(
+        _member_avatar_url(member)
+    )
+    embed = _build_member_record_embed(
+        member, summary_lines,
+        has_image=bool(image_bytes), has_avatar=bool(avatar_bytes),
+    )
+    if image_bytes or avatar_bytes:
+        message_id = await _post_channel_embed(
             MEMBER_RECORDS_CHANNEL_ID,
-            components,
+            embed,
             file_bytes=image_bytes,
             file_name="record.png",
+            avatar_bytes=avatar_bytes,
         )
     else:
-        # No screenshot; strip the media gallery and post text-only.
-        text_components = [c for c in components if c.get("type") != 12]
-        message_id = await _post_channel_v2(
-            MEMBER_RECORDS_CHANNEL_ID, text_components
+        message_id = await _post_channel_embed(
+            MEMBER_RECORDS_CHANNEL_ID, embed
         )
     logger.info(
         "records: posted member record for %s to channel %s",
@@ -2236,31 +2543,38 @@ async def _edit_member_record(
 ) -> None:
     """Edit an existing member record in place.
 
-    With a new screenshot, swaps the attachment via a multipart PATCH; without
-    one, rewrites only the container text and retains whatever attachment the
-    record already has (so the image survives a role-change edit). Fail-soft.
+    With a new screenshot, swaps the attachment via a multipart PATCH (and
+    refreshes the circular avatar); without one, rewrites only the embed and
+    retains whatever attachments the record already has (so the screenshot +
+    avatar survive a role-change edit). Fail-soft.
     """
-    components = _build_member_record_components(member, summary_lines)
     if image_bytes:
-        await _edit_message_v2_with_file(
-            channel_id=channel_id,
-            message_id=message_id,
-            components=components,
-            file_bytes=image_bytes,
-            file_name="record.png",
+        avatar_bytes = await _render_record_avatar_bytes(
+            _member_avatar_url(member)
+        )
+        embed = _build_member_record_embed(
+            member, summary_lines,
+            has_image=True, has_avatar=bool(avatar_bytes),
+        )
+        await _edit_channel_embed(
+            channel_id, message_id, embed,
+            file_bytes=image_bytes, file_name="record.png",
+            avatar_bytes=avatar_bytes,
         )
         return
     existing = await _fetch_record_message(channel_id, message_id)
-    attachment_ids = [
-        int(a["id"])
-        for a in (existing or {}).get("attachments", [])
+    existing_atts = [
+        a for a in (existing or {}).get("attachments", [])
         if isinstance(a, dict) and a.get("id") is not None
     ]
-    if not attachment_ids:
-        # The record was posted text-only; keep it that way.
-        components = [c for c in components if c.get("type") != 12]
-    await _edit_channel_message_v2(
-        channel_id, message_id, components,
+    attachment_ids = [int(a["id"]) for a in existing_atts]
+    has_avatar = any(a.get("filename") == "avatar.png" for a in existing_atts)
+    has_image = any(a.get("filename") != "avatar.png" for a in existing_atts)
+    embed = _build_member_record_embed(
+        member, summary_lines, has_image=has_image, has_avatar=has_avatar,
+    )
+    await _edit_channel_embed(
+        channel_id, message_id, embed,
         keep_attachment_ids=attachment_ids or None,
     )
 
@@ -2438,6 +2752,41 @@ def _parse_record_profile_text(text: str) -> dict:
     return out
 
 
+def _parse_record_embed(embeds: object) -> dict:
+    """Parse a member record's profile fields out of its rich ``embeds``.
+
+    Mirrors :func:`_parse_record_profile_text` but reads the structured
+    ``embeds[].fields`` (``{name, value}``) written by
+    :func:`_build_member_record_embed`. Field names map through
+    ``_RECORD_PROFILE_LABELS``; values may be wrapped in ``**bold**``. Mastery
+    Rank is kept only when it's an exact ``MR n`` / ``LR n`` rank.
+    """
+    out: dict = {}
+    if not isinstance(embeds, list):
+        return out
+    for embed in embeds:
+        if not isinstance(embed, dict):
+            continue
+        for field in embed.get("fields") or []:
+            if not isinstance(field, dict):
+                continue
+            name = str(field.get("name", "")).strip().lower()
+            key = _RECORD_PROFILE_LABELS.get(name)
+            if not key or key in out:
+                continue
+            value = str(field.get("value", "")).strip()
+            if value.startswith("**") and value.endswith("**") and len(value) > 4:
+                value = value[2:-2].strip()
+            if not value:
+                continue
+            if key == "mastery_rank" and not re.match(
+                r"^(MR|LR)\s*\d+$", value, re.IGNORECASE
+            ):
+                continue
+            out[key] = value
+    return out
+
+
 async def _fetch_record_message(channel_id: int, message_id: int) -> dict | None:
     """Fetch a single record message as raw JSON (so its V2 components are
     readable). Fail-soft: returns None on NotFound / any HTTP error."""
@@ -2485,9 +2834,12 @@ async def _read_member_profile_from_records(
     data = await _fetch_record_message(channel_id, message_id)
     if not data:
         return None
-    parsed = _parse_record_profile_text(
-        _collect_v2_text(data.get("components") or [])
-    )
+    # New records are rich embeds; older ones may still be Components V2 text.
+    parsed = _parse_record_embed(data.get("embeds") or [])
+    if not parsed:
+        parsed = _parse_record_profile_text(
+            _collect_v2_text(data.get("components") or [])
+        )
     if not parsed:
         return None
     parsed.setdefault("last_verified_ts", _snowflake_ts(message_id))
@@ -4260,6 +4612,55 @@ async def _fetch_cdn_bytes(
 async def _fetch_avatar_bytes(url: str) -> bytes | None:
     """Best-effort avatar fetch (avatars are <512 KiB); None on any failure."""
     return await _fetch_cdn_bytes(url, accept="image/png,image/webp,image/*;q=0.8")
+
+
+# Diameter (px) of the circular record-avatar thumbnail. The /profile card
+# renders at 112px; the record thumbnail can be a touch larger since Discord
+# downscales it for display.
+_RECORD_AVATAR_SIZE = 256
+
+
+def _render_circular_avatar_png(avatar_bytes: bytes | None) -> bytes:
+    """Render ``avatar_bytes`` into the /profile-style circular avatar (gold
+    ring, transparent corners) and return PNG bytes. Runs in a worker thread
+    via :func:`_run_heavy`."""
+    img = _circular_avatar(avatar_bytes, _RECORD_AVATAR_SIZE)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+async def _render_record_avatar_bytes(avatar_url: str | None) -> bytes | None:
+    """Fetch a member's avatar and render it as the /profile-style circular
+    thumbnail (gold ring) for the record embed. Fail-soft -> None so a record
+    still posts (with the square URL thumbnail) when the avatar can't render.
+    """
+    if not avatar_url:
+        return None
+    avatar_bytes = await _fetch_avatar_bytes(avatar_url)
+    if not avatar_bytes:
+        return None
+    try:
+        return await _run_heavy(_render_circular_avatar_png, avatar_bytes)
+    except Exception:
+        logger.exception("records: circular avatar render failed")
+        return None
+
+
+def _member_avatar_url(member: object) -> str | None:
+    """Best-effort 256px PNG avatar URL for a Member/User (or a stand-in that
+    only exposes ``display_avatar``). None when no avatar is resolvable."""
+    avatar = getattr(member, "display_avatar", None) or getattr(
+        member, "default_avatar", None
+    )
+    if avatar is None:
+        return None
+    try:
+        return avatar.replace(size=256, format="png").url
+    except Exception:
+        url = getattr(avatar, "url", None)
+        return str(url) if url else None
+
 
 
 # Decoded emoji PNG bytes keyed by Discord emoji ID. Emojis are immutable

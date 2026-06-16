@@ -1,24 +1,47 @@
 {
-  "_doc": "Layout for migrated member records. Edit 'heading' and 'lines' to change how each record looks. Text in {braces} is replaced per message. A line whose placeholders ALL resolve to empty is skipped when 'skip_empty_lines' is true.",
+  "_doc": "Embed layout for member records (logs). Styled like /status: gold accent bar, emoji headers, structured fields. Edit any value below to change how each record looks. Text in {braces} is replaced per record. A field whose {placeholders} ALL resolve to empty is hidden when 'skip_empty_lines' is true. 'color' accepts 0xRRGGBB, #RRGGBB, or a plain number. URL values (icon_url / thumbnail / image) are dropped if any placeholder they use is empty, so you never get a broken link.",
   "_available_placeholders": {
     "user_id": "Author's numeric Discord user ID (searchable key).",
     "user_mention": "Clickable mention, e.g. <@123>.",
     "display_name": "Author's server/display name.",
     "author_name": "Author's full username.",
+    "author_avatar": "URL of the author's avatar (for author / thumbnail icon).",
+    "in_game_name": "Warframe in-game name (OCR-only; blank for role-derived refreshes).",
+    "clan": "Clan name from the member's clan role.",
+    "platform": "Platform (PC / Xbox / PlayStation / Switch / Mobile) from role.",
+    "mastery_rank": "Mastery Rank (exact 'MR 28' / 'Legendary 3' when known, else role bucket).",
+    "syndicate": "Syndicate name(s) from the member's syndicate role(s).",
     "sent_unix": "Original message timestamp (unix seconds) for <t:..> tags.",
     "source_message_id": "Original message ID in the source channel.",
     "source_channel_id": "Source channel ID.",
     "attachment_count": "Number of attachments on the original message.",
-    "original_text": "Original message text (may be empty)."
+    "original_text": "Original message text (may be empty).",
+    "image_name": "Filename of the attached screenshot, for image: attachment://{image_name}."
   },
-  "heading": "### \uD83D\uDCCB Member Record",
+  "color": "0xD4A857",
   "empty_value": "\u2014",
   "skip_empty_lines": true,
-  "lines": [
-    "**User ID:** `{user_id}`",
-    "**Member:** {user_mention}  \u00b7  {display_name}",
-    "**Sent:** <t:{sent_unix}:F>  \u00b7  <t:{sent_unix}:R>",
-    "**Source:** <#{source_channel_id}>  \u00b7  message `{source_message_id}`",
-    "{original_text}"
-  ]
+  "author": {
+    "name": "{display_name}",
+    "icon_url": "{author_avatar}"
+  },
+  "title": "\uD83D\uDCCB  Member Record",
+  "description": "{original_text}",
+  "fields": [
+    { "name": "\uD83C\uDFAE  In-game name", "value": "{in_game_name}", "inline": true },
+    { "name": "\uD83C\uDFC6  Mastery Rank", "value": "{mastery_rank}", "inline": true },
+    { "name": "\uD83C\uDFF0  Clan", "value": "{clan}", "inline": true },
+    { "name": "\uD83D\uDD79\uFE0F  Platform", "value": "{platform}", "inline": true },
+    { "name": "\u269C\uFE0F  Syndicate", "value": "{syndicate}", "inline": false },
+    { "name": "\uD83D\uDC64  Member", "value": "{user_mention}", "inline": true },
+    { "name": "\uD83C\uDD94  User ID", "value": "`{user_id}`", "inline": true },
+    { "name": "\uD83D\uDD53  Submitted", "value": "<t:{sent_unix}:F>  \u00b7  <t:{sent_unix}:R>", "inline": false },
+    { "name": "\uD83D\uDCE5  Source", "value": "<#{source_channel_id}>  \u00b7  message `{source_message_id}`", "inline": false }
+  ],
+  "thumbnail": "{author_avatar}",
+  "image": "attachment://{image_name}",
+  "footer": {
+    "text": "Golden Pagoda  \u00b7  Member Records"
+  },
+  "timestamp_from": "sent_unix"
 }

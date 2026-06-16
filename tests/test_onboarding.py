@@ -701,7 +701,7 @@ class RepromptSweepTests(unittest.IsolatedAsyncioTestCase):
 # ---------------------------------------------------------------------------
 
 class MemberRecordComponentsTests(unittest.TestCase):
-    """Tests for _build_member_record_components structure."""
+    """Tests for _build_member_record_embed structure (records are embeds)."""
 
     def setUp(self):
         import bot as bot_module
@@ -714,55 +714,158 @@ class MemberRecordComponentsTests(unittest.TestCase):
         m.mention = f"<@{uid}>"
         m.__str__ = MagicMock(return_value=f"Tenno#{uid}")
         m.joined_at = None
+        m.display_avatar = MagicMock()
+        m.display_avatar.url = "https://cdn.example/avatar.png"
         return m
 
-    def test_components_has_heading_text(self):
-        """First component is a type-10 text block with 'Member Record' in it."""
+    def test_embed_has_title(self):
+        """The embed title carries 'Member Record' and the display name."""
         member = self._make_member("TestUser")
-        comps = self.bot._build_member_record_components(member, ["Clan: Golden Pagoda"])
-        self.assertTrue(comps, "component list must not be empty")
-        self.assertEqual(comps[0]["type"], 10)
-        self.assertIn("Member Record", comps[0]["content"])
-        self.assertIn("TestUser", comps[0]["content"])
+        embed = self.bot._build_member_record_embed(
+            member, ["Clan: **Golden Pagoda**"]
+        )
+        self.assertIn("Member Record", embed["title"])
+        self.assertIn("TestUser", embed["title"])
 
-    def test_components_has_media_gallery(self):
-        """A type-12 media gallery referencing 'attachment://record.png' is present."""
+    def test_embed_image_when_screenshot_present(self):
+        """With an image the embed references 'attachment://record.png'."""
         member = self._make_member()
-        comps = self.bot._build_member_record_components(member, [])
-        gallery_types = [c for c in comps if c.get("type") == 12]
-        self.assertTrue(gallery_types, "must have at least one type-12 gallery")
-        items = gallery_types[0].get("items", [])
-        self.assertTrue(
-            any("attachment://record.png" in str(i) for i in items),
-            "gallery must reference attachment://record.png",
+        embed = self.bot._build_member_record_embed(
+            member, [], has_image=True
+        )
+        self.assertEqual(
+            embed.get("image", {}).get("url"), "attachment://record.png"
         )
 
-    def test_components_has_gold_container(self):
-        """A type-17 container with accent_color == ACCENT_PASS is present."""
+    def test_embed_no_image_when_text_only(self):
+        """Without a screenshot the embed carries no image reference."""
         member = self._make_member()
-        comps = self.bot._build_member_record_components(member, ["Mastery Rank: MR 10"])
-        containers = [c for c in comps if c.get("type") == 17]
-        self.assertTrue(containers, "must have at least one type-17 container")
-        container = containers[0]
-        self.assertEqual(container.get("accent_color"), self.bot.ACCENT_PASS)
+        embed = self.bot._build_member_record_embed(
+            member, [], has_image=False
+        )
+        self.assertNotIn("image", embed)
 
-    def test_summary_lines_appear_in_container(self):
-        """Summary lines from verification are included in the container text."""
+    def test_embed_thumbnail_is_url_without_avatar_attachment(self):
+        """Without an attached avatar the thumbnail is the raw avatar URL."""
         member = self._make_member()
-        summary = ["Clan: Golden Pagoda", "Mastery Rank: MR 15"]
-        comps = self.bot._build_member_record_components(member, summary)
-        containers = [c for c in comps if c.get("type") == 17]
-        self.assertTrue(containers)
-        body = str(containers[0])
+        embed = self.bot._build_member_record_embed(
+            member, [], has_avatar=False
+        )
+        self.assertEqual(
+            embed.get("thumbnail", {}).get("url"),
+            "https://cdn.example/avatar.png",
+        )
+
+    def test_embed_thumbnail_is_circular_avatar_attachment(self):
+        """With has_avatar the thumbnail references attachment://avatar.png
+        (the /profile-style circular avatar) instead of the square URL."""
+        member = self._make_member()
+        embed = self.bot._build_member_record_embed(
+            member, [], has_avatar=True
+        )
+        self.assertEqual(
+            embed.get("thumbnail", {}).get("url"), "attachment://avatar.png"
+        )
+
+    def test_embed_is_gold(self):
+        """The embed color is ACCENT_PASS (the /status gold)."""
+        member = self._make_member()
+        embed = self.bot._build_member_record_embed(
+            member, ["Mastery Rank: **MR 10**"]
+        )
+        self.assertEqual(embed.get("color"), self.bot.ACCENT_PASS)
+
+    def test_summary_lines_become_fields(self):
+        """Key: **Value** summary lines become embed fields."""
+        member = self._make_member()
+        summary = ["Clan: **Golden Pagoda**", "Mastery Rank: **MR 15**"]
+        embed = self.bot._build_member_record_embed(member, summary)
+        names = {f["name"] for f in embed["fields"]}
+        body = str(embed["fields"])
+        self.assertIn("Clan", names)
+        self.assertIn("Mastery Rank", names)
         self.assertIn("Golden Pagoda", body)
         self.assertIn("MR 15", body)
 
-    def test_member_id_appears_in_container(self):
-        """The member ID is always embedded in the record."""
+    def test_member_id_appears_in_embed(self):
+        """The member ID is always embedded in the record description."""
         member = self._make_member(uid=123456789)
-        comps = self.bot._build_member_record_components(member, [])
-        body = str(comps)
-        self.assertIn("123456789", body)
+        embed = self.bot._build_member_record_embed(member, [])
+        self.assertIn("123456789", str(embed))
+
+    def test_embed_fields_round_trip_through_parser(self):
+        """The fields _build_member_record_embed writes parse back via
+        _parse_record_embed to the source-of-truth profile dict."""
+        member = self._make_member()
+        summary = [
+            "In-game name: **TennoOne**",
+            "Clan: **Golden Pagoda**",
+            "Platform: **PC**",
+            "Mastery Rank: **MR 27**",
+            "Syndicate: **Red Veil**",
+        ]
+        embed = self.bot._build_member_record_embed(member, summary)
+        parsed = self.bot._parse_record_embed([embed])
+        self.assertEqual(parsed.get("in_game_name"), "TennoOne")
+        self.assertEqual(parsed.get("clan"), "Golden Pagoda")
+        self.assertEqual(parsed.get("platform"), "PC")
+        self.assertEqual(parsed.get("mastery_rank"), "MR 27")
+        self.assertEqual(parsed.get("syndicate"), "Red Veil")
+
+    def test_parser_drops_coarse_mastery_bucket(self):
+        """A non-exact mastery bucket name is dropped (matches old store)."""
+        member = self._make_member()
+        embed = self.bot._build_member_record_embed(
+            member, ["Mastery Rank: **MR 10-15**"]
+        )
+        parsed = self.bot._parse_record_embed([embed])
+        self.assertNotIn("mastery_rank", parsed)
+
+
+class RecordAttachmentPlanTests(unittest.TestCase):
+    """Tests for _record_attachment_plan attachment ordering."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.bot = bot_module
+
+    def test_no_files_returns_none_primary(self):
+        primary, name, extra, atts = self.bot._record_attachment_plan(
+            None, "record.png", None
+        )
+        self.assertIsNone(primary)
+        self.assertEqual(extra, [])
+        self.assertEqual(atts, [])
+
+    def test_screenshot_only_is_id_zero(self):
+        primary, name, extra, atts = self.bot._record_attachment_plan(
+            b"img", "record.png", None
+        )
+        self.assertEqual(primary, b"img")
+        self.assertEqual(name, "record.png")
+        self.assertEqual(extra, [])
+        self.assertEqual(atts, [{"id": 0, "filename": "record.png"}])
+
+    def test_avatar_only_is_id_zero(self):
+        primary, name, extra, atts = self.bot._record_attachment_plan(
+            None, "record.png", b"av"
+        )
+        self.assertEqual(primary, b"av")
+        self.assertEqual(name, "avatar.png")
+        self.assertEqual(extra, [])
+        self.assertEqual(atts, [{"id": 0, "filename": "avatar.png"}])
+
+    def test_both_screenshot_then_avatar(self):
+        primary, name, extra, atts = self.bot._record_attachment_plan(
+            b"img", "record.png", b"av"
+        )
+        self.assertEqual(primary, b"img")
+        self.assertEqual(name, "record.png")
+        self.assertEqual(extra, [(b"av", "avatar.png")])
+        self.assertEqual(atts, [
+            {"id": 0, "filename": "record.png"},
+            {"id": 1, "filename": "avatar.png"},
+        ])
 
 
 # ---------------------------------------------------------------------------
