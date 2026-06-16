@@ -745,7 +745,7 @@ def _normalize_emoji_name(name: str) -> str:
 
 def _emoji_literal(emoji: discord.Emoji) -> str:
     prefix = "a" if emoji.animated else ""
-    return f"<{prefix}:{emoji.name}:{emoji.id}>"
+    return f"<{prefix}:{emoji.name}:{emoji.id}>" if prefix else f"<:{emoji.name}:{emoji.id}>"
 
 
 def _find_clan_emoji_literal(guild: discord.Guild, clan_name: str) -> str | None:
