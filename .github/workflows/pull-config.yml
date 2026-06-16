@@ -1,0 +1,52 @@
+name: Pull config (one-shot, encrypted)
+
+# TEMPORARY one-shot. Runs on push so it can be triggered from a Codespace
+# (which can't dispatch workflows). It SSHes to the server using the existing
+# HETZNER_SSH_KEY secret, extracts ONLY non-secret role/emoji/clan/channel
+# config (secrets are never read), encrypts the result to the committed RSA
+# public cert (pullcert.pem), and prints the PEM ciphertext between markers.
+# The matching private key never leaves the Codespace, so the public Actions
+# log reveals nothing. Delete this workflow + pullcert.pem after use.
+
+on:
+  push:
+    paths:
+      - '.github/workflows/pull-config.yml'
+      - 'pullcert.pem'
+
+concurrency:
+  group: deploy-hetzner
+  cancel-in-progress: false
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.HETZNER_SSH_KEY }}" | base64 -d > ~/.ssh/hetzner
+          chmod 600 ~/.ssh/hetzner
+          ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Pull + encrypt non-secret config
+        env:
+          GP_HOST: ${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}
+        run: |
+          set -eo pipefail
+          # Allow-list of non-secret config keys to extract (regex anchored).
+          ssh -i ~/.ssh/hetzner "$GP_HOST" bash -s > plain.txt <<'REMOTE'
+          set -eo pipefail
+          ENV_FILE=/opt/golden-pagoda/.env
+          grep -E '^(CLAN_ROLE_[0-9]+_(NAME|ID|EMOJI)|PLATFORM_ROLE_[A-Z]+_ID|PLATFORM_EMOJI_[A-Z]+|MR_ROLE_IDS|OPERATOR_EMOJI|MASTERY_RANK_EMOJI|SYNDICATE_EMOJI[A-Z_]*|WARNING_EMOJI|INCOMPLETE_ROLE_ID|VERIFY_REMOVE_ROLE_ID|HELP_CHANNEL_ID|ONBOARDING_CHANNEL_ID|MEMBER_RECORDS_CHANNEL_ID|TARGET_CHANNEL_ID|ASSIGN_ROLE_EMOJI_ID|PASS_REACTION_ID|FAIL_REACTION|PENDING_REACTION_ID)=' "$ENV_FILE" || true
+          REMOTE
+          echo "extracted $(wc -l < plain.txt) config line(s)"
+          # Encrypt to the committed public cert; only the Codespace's private
+          # key can decrypt. Safe to print in a public log.
+          openssl cms -encrypt -binary -aes-256-cbc -outform PEM \
+            -in plain.txt -out cipher.pem pullcert.pem
+          echo "-----GP-CIPHER-BEGIN-----"
+          cat cipher.pem
+          echo "-----GP-CIPHER-END-----"
