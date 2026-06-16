@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -2436,14 +2437,26 @@ _JOIN_LAST_POST: dict[int, float] = {}
 # Minimum seconds between welcomes in the same guild (join-storm guard).
 _JOIN_DEBOUNCE_SECONDS = 2.0
 
+# Animated banners shown at the top of the onboarding welcome; one is picked at
+# random each time the prompt is built so repeat joins/reprompts vary.
+_ONBOARDING_WELCOME_GIFS = (
+    "https://i.imgur.com/tSUNiNB.gif",
+    "https://i.imgur.com/L5gdLhn.gif",
+    "https://i.imgur.com/EYEX2uw.gif",
+    "https://i.imgur.com/jUVIpox.gif",
+    "https://orig00.deviantart.net/fa45/f/2018/167/1/b/warframe_umbra_sprite_gif_animation_by_masich2d-dceknro.gif",
+    "https://orig00.deviantart.net/a07a/f/2018/009/2/d/mesa_peacemaker_animation_gif_by_masich2d-dbzdz5p.gif",
+)
+
 
 def _onboarding_welcome_components(member_id: int) -> list[dict]:
     """Build the Components V2 welcome payload for a new member.
 
-    Renders a top-level welcome line plus a single string-select dropdown with
-    one option per active clan slot (the select custom_id encodes the target
-    member's user id so picks survive bot restarts) and a "Not Affiliated"
-    option (value ``none``) that routes to manual review.
+    Renders a randomly-chosen animated banner (type 12 media gallery), a
+    welcome line, and a single string-select dropdown with one option per
+    active clan slot (the select custom_id encodes the target member's user id
+    so picks survive bot restarts) and a "Not Affiliated" option (value
+    ``none``) that routes to manual review.
     """
     active_slots = [s for s in CLAN_SLOTS if s.clan_name and s.role_id]
     options: list[dict] = []
@@ -2468,7 +2481,7 @@ def _onboarding_welcome_components(member_id: int) -> list[dict]:
             {
                 "type": 3,
                 "custom_id": f"onboard:{member_id}:clanselect",
-                "placeholder": "Select your clan\u2026",
+                "placeholder": "Are you a member of the alliance?",
                 "min_values": 1,
                 "max_values": 1,
                 "options": options,
@@ -2476,12 +2489,14 @@ def _onboarding_welcome_components(member_id: int) -> list[dict]:
         ],
     }
 
-    welcome_text = (
-        f"### Welcome, <@{member_id}>! \n"
-        "> Are you in our Alliance?"
-    )
+    banner = {
+        "type": 12,
+        "items": [{"media": {"url": random.choice(_ONBOARDING_WELCOME_GIFS)}}],
+    }
+    welcome_text = {"type": 10, "content": f"> Welcome <@{member_id}>"}
     return [
-        {"type": 10, "content": welcome_text},
+        banner,
+        welcome_text,
         select_row,
     ]
 
