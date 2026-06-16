@@ -259,19 +259,19 @@ class OnboardingComponentsTests(unittest.TestCase):
             "no custom_id encodes the member_id",
         )
 
-    def test_welcome_components_has_none_button(self):
+    def test_welcome_components_has_none_option(self):
         member_id = 42
         result = self.bot._onboarding_welcome_components(member_id)
-        custom_ids: list[str] = []
+        option_values: list[str] = []
         for top in result:
             for section in top.get("components", []) or []:
                 if section.get("type") == 1:
-                    for btn in section.get("components", []) or []:
-                        cid = btn.get("custom_id", "")
-                        if cid:
-                            custom_ids.append(cid)
-        none_ids = [c for c in custom_ids if c.endswith(":none")]
-        self.assertTrue(none_ids, "no 'Not listed / No' button found")
+                    for comp in section.get("components", []) or []:
+                        for opt in comp.get("options", []) or []:
+                            option_values.append(opt.get("value", ""))
+        self.assertIn(
+            "none", option_values, "no 'Not listed / No' option found"
+        )
 
     def test_welcome_components_clan_buttons_use_onboard_prefix(self):
         result = self.bot._onboarding_welcome_components(12345)
@@ -375,9 +375,56 @@ class OnboardingOwnershipGatingTests(unittest.IsolatedAsyncioTestCase):
         args = send_modal_mock.call_args[0]
         self.assertIsInstance(args[0], bot_module._OnboardingVerifyModal)
 
+    async def test_owner_clan_dropdown_opens_modal(self):
+        """Selecting a clan from the dropdown must open the screenshot modal."""
+        import bot as bot_module
+        from logic import ClanSlot
 
-# ---------------------------------------------------------------------------
-# Reprompt sweep — elapsed window detection and max-reprompt cap
+        target_uid = 1111
+        slot_no = 1
+        custom_id = f"onboard:{target_uid}:clanselect"
+
+        member_mock = MagicMock()
+        member_mock.id = target_uid
+        interaction = self._make_interaction(target_uid)
+        interaction.guild.get_member = MagicMock(return_value=member_mock)
+        interaction.data = {"values": [str(slot_no)]}
+
+        fake_slot = ClanSlot(
+            slot=slot_no, clan_name="Golden Pagoda", role_id=100, emoji="<:gp:1>"
+        )
+        original_slots = bot_module.CLAN_SLOTS
+        bot_module.CLAN_SLOTS = [fake_slot]
+
+        send_modal_mock = AsyncMock()
+        interaction.response.send_modal = send_modal_mock
+
+        try:
+            await bot_module._handle_onboarding_interaction(interaction, custom_id)
+        finally:
+            bot_module.CLAN_SLOTS = original_slots
+
+        send_modal_mock.assert_awaited_once()
+        args = send_modal_mock.call_args[0]
+        self.assertIsInstance(args[0], bot_module._OnboardingVerifyModal)
+
+    async def test_owner_dropdown_none_calls_manual_review(self):
+        """Selecting 'Not listed / No' from the dropdown triggers manual review."""
+        target_uid = 1111
+        custom_id = f"onboard:{target_uid}:clanselect"
+
+        member_mock = MagicMock()
+        member_mock.id = target_uid
+        member_mock.mention = f"<@{target_uid}>"
+        interaction = self._make_interaction(target_uid)
+        interaction.guild.get_member = MagicMock(return_value=member_mock)
+        interaction.data = {"values": ["none"]}
+
+        with patch.object(
+            self.bot, "_onboarding_route_manual_review", new_callable=AsyncMock
+        ) as mock_review:
+            await self.bot._handle_onboarding_interaction(interaction, custom_id)
+            mock_review.assert_awaited_once()
 # ---------------------------------------------------------------------------
 
 class RepromptSweepTests(unittest.IsolatedAsyncioTestCase):

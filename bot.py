@@ -2401,40 +2401,43 @@ _JOIN_DEBOUNCE_SECONDS = 2.0
 def _onboarding_welcome_components(member_id: int) -> list[dict]:
     """Build the Components V2 welcome payload for a new member.
 
-    Includes one button per active clan slot (custom_id encodes the slot and
-    the target member's user id so clicks survive bot restarts) plus a
-    "Not listed / No" button. Buttons are grouped into action rows of ≤5.
+    Renders a single string-select dropdown with one option per active clan
+    slot (the select custom_id encodes the target member's user id so picks
+    survive bot restarts) plus a "Not listed / No" option.
     """
     active_slots = [s for s in CLAN_SLOTS if s.clan_name and s.role_id]
-    buttons: list[dict] = []
+    options: list[dict] = []
     for slot in active_slots:
         emoji_dict = _button_emoji_from_literal(slot.emoji)
-        btn: dict = {
-            "type": 2,
-            "style": 1,
-            "label": _strip_clan_tag(slot.clan_name or "")[:80],
-            "custom_id": f"onboard:{member_id}:clan:{slot.slot}",
+        opt: dict = {
+            "label": _strip_clan_tag(slot.clan_name or "")[:100],
+            "value": str(slot.slot),
         }
         if emoji_dict:
-            btn["emoji"] = emoji_dict
-        buttons.append(btn)
-    buttons.append({
-        "type": 2,
-        "style": 2,
+            opt["emoji"] = emoji_dict
+        options.append(opt)
+    options.append({
         "label": "Not listed / No",
-        "custom_id": f"onboard:{member_id}:none",
+        "value": "none",
         "emoji": {"name": "\u274C"},
     })
-    action_rows = [
-        {"type": 1, "components": buttons[i: i + 5]}
-        for i in range(0, len(buttons), 5)
-    ]
+    select_row = {
+        "type": 1,
+        "components": [
+            {
+                "type": 3,
+                "custom_id": f"onboard:{member_id}:clanselect",
+                "placeholder": "Select your clan\u2026",
+                "options": options,
+            }
+        ],
+    }
 
     welcome_text = (
         f"### Welcome, <@{member_id}>! \U0001F3AF\n"
         "Are you associated with any of the groups below?\n"
-        "-# Click your clan to begin verification, or **Not listed / No** "
-        "if none of these apply to you."
+        "-# Pick your clan from the menu to begin verification, or "
+        "**Not listed / No** if none of these apply to you."
     )
     return [
         {
@@ -2442,7 +2445,7 @@ def _onboarding_welcome_components(member_id: int) -> list[dict]:
             "accent_color": ACCENT_PASS,
             "components": [
                 {"type": 10, "content": welcome_text},
-                *action_rows,
+                select_row,
             ],
         }
     ]
@@ -2824,8 +2827,9 @@ async def _handle_onboarding_interaction(
 ) -> None:
     """Dispatch interactions from the onboarding welcome prompt.
 
-    ``custom_id`` format: ``onboard:<user_id>:<action>[:<slot>]``
-    Actions: ``clan:<slot_number>`` | ``none``.
+    ``custom_id`` format: ``onboard:<user_id>:<action>``
+    Actions: ``clanselect`` (slot in the select's values) | ``none``.
+    Legacy clan buttons (``clan:<slot_number>``) are still accepted.
 
     Ownership check: only the target member may interact.
     """
@@ -2839,6 +2843,18 @@ async def _handle_onboarding_interaction(
     action = parts[2] if len(parts) > 2 else ""
     user = interaction.user
     guild = interaction.guild
+
+    # The clan dropdown carries the chosen slot in the select's values, while
+    # legacy clan buttons encoded it in the custom_id. Normalise both to a
+    # single ``slot_token`` (a slot number string or "none").
+    slot_token: str | None = None
+    if action == "clanselect":
+        values = (interaction.data or {}).get("values") or []
+        slot_token = str(values[0]) if values else None
+    elif action == "clan":
+        slot_token = parts[3] if len(parts) > 3 else None
+    elif action == "none":
+        slot_token = "none"
 
     # Ownership gate — reject any other user with an ephemeral.
     if user.id != target_id:
@@ -2868,15 +2884,15 @@ async def _handle_onboarding_interaction(
             )
         return
 
-    if action == "none":
+    if slot_token == "none":
         await _onboarding_route_manual_review(
             interaction, member, "selected 'Not listed / No'"
         )
         return
 
-    if action == "clan":
+    if slot_token is not None:
         try:
-            slot_no = int(parts[3])
+            slot_no = int(slot_token)
         except (IndexError, ValueError):
             return
         slot = next((s for s in CLAN_SLOTS if s.slot == slot_no), None)
