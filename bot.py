@@ -2792,6 +2792,11 @@ async def _onboarding_route_manual_review(
     # Drop the clan-select dropdown from the original welcome prompt so it
     # can't be re-submitted (banner + welcome line are preserved).
     await _remove_onboarding_dropdown(member.guild.id, member.id)
+    # Post a profile-card record to the member-records channel so staff have a
+    # record of the pending case (mirrors the onboarding-pass path).
+    _spawn_bg_task(
+        _post_member_record(member, [f"Manual review pending — {reason}"])
+    )
     # Member-facing response: post the public welcome card (a duplicate of the
     # onboarding-complete card, with the manual-review text variant) — it now
     # carries the staff-only "Approve & Assign Roles" button inline.
