@@ -2440,9 +2440,10 @@ _JOIN_DEBOUNCE_SECONDS = 2.0
 def _onboarding_welcome_components(member_id: int) -> list[dict]:
     """Build the Components V2 welcome payload for a new member.
 
-    Renders a single string-select dropdown with one option per active clan
-    slot (the select custom_id encodes the target member's user id so picks
-    survive bot restarts) plus a "Not listed / No" option.
+    Renders a top-level welcome line plus a single string-select dropdown with
+    one option per active clan slot (the select custom_id encodes the target
+    member's user id so picks survive bot restarts) and a "Not Affiliated"
+    option (value ``none``) that routes to manual review.
     """
     active_slots = [s for s in CLAN_SLOTS if s.clan_name and s.role_id]
     options: list[dict] = []
@@ -2456,9 +2457,10 @@ def _onboarding_welcome_components(member_id: int) -> list[dict]:
             opt["emoji"] = emoji_dict
         options.append(opt)
     options.append({
-        "label": "Not listed / No",
+        "label": "Not Affiliated",
         "value": "none",
-        "emoji": {"name": "\u274C"},
+        "description": "I am not in one of the above clans",
+        "emoji": {"id": "1467922510908494098", "name": "warframe", "animated": False},
     })
     select_row = {
         "type": 1,
@@ -2467,26 +2469,20 @@ def _onboarding_welcome_components(member_id: int) -> list[dict]:
                 "type": 3,
                 "custom_id": f"onboard:{member_id}:clanselect",
                 "placeholder": "Select your clan\u2026",
+                "min_values": 1,
+                "max_values": 1,
                 "options": options,
             }
         ],
     }
 
     welcome_text = (
-        f"### Welcome, <@{member_id}>! \U0001F3AF\n"
-        "Are you associated with any of the groups below?\n"
-        "-# Pick your clan from the menu to begin verification, or "
-        "**Not listed / No** if none of these apply to you."
+        f"### Welcome, <@{member_id}>! \n"
+        "> Are you in our Alliance?"
     )
     return [
-        {
-            "type": 17,
-            "accent_color": ACCENT_PASS,
-            "components": [
-                {"type": 10, "content": welcome_text},
-                select_row,
-            ],
-        }
+        {"type": 10, "content": welcome_text},
+        select_row,
     ]
 
 
@@ -2925,7 +2921,7 @@ async def _handle_onboarding_interaction(
 
     if slot_token == "none":
         await _onboarding_route_manual_review(
-            interaction, member, "selected 'Not listed / No'"
+            interaction, member, "selected 'Not Affiliated'"
         )
         return
 

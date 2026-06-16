@@ -213,6 +213,31 @@ def test_onboarding_fail_soft_when_disabled(tmp_path, monkeypatch):
 # bot.py — _onboarding_welcome_components structure
 # ---------------------------------------------------------------------------
 
+def _walk_components(components):
+    """Yield every component dict in a (possibly nested) V2 component tree."""
+    for comp in components or []:
+        if not isinstance(comp, dict):
+            continue
+        yield comp
+        yield from _walk_components(comp.get("components"))
+
+
+def _collect_custom_ids(components):
+    return [
+        comp["custom_id"]
+        for comp in _walk_components(components)
+        if comp.get("custom_id")
+    ]
+
+
+def _collect_option_values(components):
+    values: list[str] = []
+    for comp in _walk_components(components):
+        for opt in comp.get("options", []) or []:
+            values.append(opt.get("value", ""))
+    return values
+
+
 class OnboardingComponentsTests(unittest.TestCase):
     """Smoke tests for the onboarding welcome component builder."""
 
@@ -225,11 +250,19 @@ class OnboardingComponentsTests(unittest.TestCase):
         self.assertIsInstance(result, list)
         self.assertGreater(len(result), 0)
 
-    def test_welcome_components_has_container(self):
+    def test_welcome_components_is_flat_text_plus_select(self):
         result = self.bot._onboarding_welcome_components(12345)
+        # Per the onboarding JSON: a top-level text component (type 10) and a
+        # top-level action row (type 1) holding a string select (type 3); no
+        # type:17 container wrapper.
+        top_types = [c.get("type") for c in result]
+        self.assertIn(10, top_types, "expected a top-level type:10 text component")
+        self.assertIn(1, top_types, "expected a top-level type:1 action row")
+        self.assertNotIn(17, top_types, "welcome should not be wrapped in a type:17 container")
+        select_row = next(c for c in result if c.get("type") == 1)
         self.assertTrue(
-            any(c.get("type") == 17 for c in result),
-            "expected at least one type:17 container",
+            any(comp.get("type") == 3 for comp in select_row.get("components", [])),
+            "expected a type:3 string select in the action row",
         )
 
     def test_welcome_components_action_rows_respect_5_button_cap(self):
@@ -246,14 +279,7 @@ class OnboardingComponentsTests(unittest.TestCase):
     def test_welcome_components_custom_ids_encode_member_id(self):
         member_id = 99887766
         result = self.bot._onboarding_welcome_components(member_id)
-        custom_ids: list[str] = []
-        for top in result:
-            for section in top.get("components", []) or []:
-                if section.get("type") == 1:
-                    for btn in section.get("components", []) or []:
-                        cid = btn.get("custom_id", "")
-                        if cid:
-                            custom_ids.append(cid)
+        custom_ids = _collect_custom_ids(result)
         self.assertTrue(
             any(str(member_id) in cid for cid in custom_ids),
             "no custom_id encodes the member_id",
@@ -262,29 +288,20 @@ class OnboardingComponentsTests(unittest.TestCase):
     def test_welcome_components_has_none_option(self):
         member_id = 42
         result = self.bot._onboarding_welcome_components(member_id)
-        option_values: list[str] = []
-        for top in result:
-            for section in top.get("components", []) or []:
-                if section.get("type") == 1:
-                    for comp in section.get("components", []) or []:
-                        for opt in comp.get("options", []) or []:
-                            option_values.append(opt.get("value", ""))
+        option_values = _collect_option_values(result)
         self.assertIn(
-            "none", option_values, "no 'Not listed / No' option found"
+            "none", option_values, "no 'Not Affiliated' option found"
         )
 
     def test_welcome_components_clan_options_use_onboard_prefix(self):
         result = self.bot._onboarding_welcome_components(12345)
-        for top in result:
-            for section in top.get("components", []) or []:
-                if section.get("type") == 1:
-                    for btn in section.get("components", []) or []:
-                        cid = btn.get("custom_id", "")
-                        if cid:
-                            self.assertTrue(
-                                cid.startswith("onboard:"),
-                                f"button custom_id '{cid}' doesn't start with 'onboard:'",
-                            )
+        custom_ids = _collect_custom_ids(result)
+        self.assertTrue(custom_ids, "expected at least one custom_id in the welcome")
+        for cid in custom_ids:
+            self.assertTrue(
+                cid.startswith("onboard:"),
+                f"custom_id '{cid}' doesn't start with 'onboard:'",
+            )
 
 
 # ---------------------------------------------------------------------------
