@@ -40,10 +40,7 @@ jobs:
     runs-on: [self-hosted, windows]
     steps:
       - name: Update working copy + restart service
-        # The self-hosted runner process runs under WSL2/bash on the Windows host,
-        # so 'pwsh'/'powershell' shells are unavailable.  Use bash and reach
-        # Windows tooling (powershell.exe, python.exe) via the WSL2 interop layer.
-        shell: bash
+        shell: powershell
         run: |
           set -e
           if [ -z "$GP_BOT_DIR" ]; then
