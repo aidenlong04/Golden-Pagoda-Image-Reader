@@ -208,7 +208,7 @@ CATCHUP_DELAY_SECONDS = _float_env("CATCHUP_DELAY_SECONDS", 1.0)
 # Hours before a pending welcome prompt triggers a re-prompt (default: 5h).
 ONBOARDING_REPROMPT_HOURS = _float_env("ONBOARDING_REPROMPT_HOURS", 5.0)
 # Maximum number of re-prompts before giving up and leaving the member to
-# use /verify or the passive detection fallback (default: 3).
+# the passive detection fallback (default: 3).
 ONBOARDING_MAX_REPROMPTS = _int_env("ONBOARDING_MAX_REPROMPTS", 3)
 # OCR submission failures before routing to manual review (default: 3).
 ONBOARDING_MAX_OCR_FAILS = _int_env("ONBOARDING_MAX_OCR_FAILS", 3)
@@ -1940,6 +1940,45 @@ async def _member_in_game_name(member: discord.Member) -> str | None:
     )
     name = (stored or {}).get("in_game_name")
     return name.strip() if isinstance(name, str) and name.strip() else None
+
+
+async def _sync_member_profile_from_roles(member: discord.Member) -> None:
+    """Update the durable member store to match the member's current roles.
+
+    Reads the member's clan + platform straight from their Discord roles and
+    upserts them into the per-member profile store so the stored snapshot
+    tracks role changes (a member who switched clan/platform sees the change
+    reflected without re-submitting a screenshot). Only non-None fields are
+    written (COALESCE), so a member with no clan/platform role never wipes a
+    previous good snapshot. Fail-soft + off the event loop.
+    """
+    role_ids = {r.id for r in member.roles}
+
+    clan: str | None = None
+    slot = next(
+        (s for s in CLAN_SLOTS if s.role_id and s.role_id in role_ids),
+        None,
+    )
+    if slot is not None and slot.clan_name:
+        clan = _strip_clan_tag(slot.clan_name) or None
+
+    member_platform = next(
+        (
+            p for p, rid in PLATFORM_ROLE_IDS.items()
+            if rid and rid in role_ids
+        ),
+        None,
+    )
+
+    if clan is None and member_platform is None:
+        return
+    await asyncio.to_thread(
+        analytics.upsert_member_profile,
+        guild_id=member.guild.id,
+        user_id=member.id,
+        platform=member_platform,
+        clan=clan,
+    )
 
 
 def _help_link_buttons(guild: "discord.Guild | None") -> list[tuple[str, str]]:
@@ -5289,6 +5328,9 @@ async def profile_cmd(
     # Platform / Mastery / Syndicate) without the progress bar.
     try:
         await interaction.response.defer(ephemeral=ephemeral)
+        # Mirror the member's current roles into the durable store so the
+        # card (and stored snapshot) tracks any clan/platform changes.
+        await _sync_member_profile_from_roles(target)
         info = await _member_profile_info_lines(target)
         in_game_name = await _member_in_game_name(target)
         avatar_bytes = await _fetch_avatar_bytes(avatar_url)
@@ -5422,49 +5464,6 @@ async def titles_cmd(
         msg, ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
-
-
-@tree.command(
-    name="verify",
-    description="(Re-)verify your Warframe profile by uploading a screenshot.",
-)
-async def verify_cmd(interaction: discord.Interaction) -> None:
-    """Self-service re-verification entry point.
-
-    Opens the profile screenshot modal so any member (new or existing) can
-    submit a screenshot and have their clan / mastery / IGN updated without
-    needing to post in the entry channel or wait for a welcome prompt.
-    Useful for members who joined while the bot was offline, or who want to
-    update their clan/rank after switching.
-    """
-    if not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message(
-            "\u274C /verify can only be used in a server.", ephemeral=True
-        )
-        return
-    member = interaction.user
-    avatar_asset = member.display_avatar or member.default_avatar
-    avatar_url = avatar_asset.replace(size=256, format="png").url
-    avatar_bytes: bytes | None = None
-    try:
-        avatar_bytes = await _run_heavy(_fetch_avatar_bytes, avatar_url)
-    except Exception:
-        pass
-    modal = _ScreenshotVerifyModal(
-        member=member,
-        owner_id=member.id,
-        avatar_bytes=avatar_bytes,
-        display_name=member.display_name,
-        source_view=None,
-    )
-    try:
-        await interaction.response.send_modal(modal)
-    except Exception:
-        logger.exception("/verify: send_modal failed")
-        if not interaction.response.is_done():
-            await interaction.response.send_message(
-                "\u274C Failed to open the verify panel.", ephemeral=True
-            )
 
 
 async def _handle_nick_interaction(

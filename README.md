@@ -43,9 +43,6 @@ When a new member joins the server:
    processed, and joins missed while the bot was offline are recovered on the
    next startup.
 
-Existing members and re-verifications can use the `/verify` slash command to
-submit a fresh screenshot at any time.
-
 ## Stack
 
 - Python 3.12, `discord.py` 2.x (raw HTTP for Components V2)
@@ -69,8 +66,6 @@ full env reference.
 
 ## Slash commands
 
-- `/verify` — self-service (re-)verify your Warframe profile by uploading a
-  screenshot. Updates clan / mastery / IGN. Available to all members.
 - `/clan-emblems role:<role> emoji:<:name:id>` — set the per-clan emoji at
   runtime. Updates in-memory state, `os.environ`, and rewrites the server's
   `.env`. Requires **Manage Server**.
@@ -93,7 +88,8 @@ full env reference.
   `/titles`. Requires **Manage Server**.
 - `/profile [user] [ephemeral] [edit_mastery]` — render a member's profile card.
   Defaults to caller; ephemeral by default. Requires the configured access role
-  or Manage Server.
+  or Manage Server. Syncs the member's clan/platform from their current roles
+  into the durable store on each use.
 
 ## Data retention / on-leave clear
 
