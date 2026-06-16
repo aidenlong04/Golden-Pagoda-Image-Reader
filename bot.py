@@ -2449,18 +2449,29 @@ _ONBOARDING_WELCOME_GIFS = (
 )
 
 
-def _onboarding_welcome_components(member_id: int) -> list[dict]:
+def _onboarding_welcome_components(
+    member_id: int, guild: discord.Guild | None = None
+) -> list[dict]:
     """Build the Components V2 welcome payload for a new member.
 
     Renders a randomly-chosen animated banner (type 12 media gallery), a
     welcome line, and a single string-select dropdown with one option per
-    active clan slot (the select custom_id encodes the target member's user id
+    real clan slot (the select custom_id encodes the target member's user id
     so picks survive bot restarts) and a "Not Affiliated" option (value
     ``none``) that routes to manual review.
+
+    Uses the same source/filter as the /status clans page: only slots with a
+    configured ``clan_name`` whose role actually resolves in ``guild`` are
+    offered, so placeholder/unconfigured clans never appear. When ``guild`` is
+    None we fall back to the env-level ``clan_name and role_id`` check.
     """
-    active_slots = [s for s in CLAN_SLOTS if s.clan_name and s.role_id]
     options: list[dict] = []
-    for slot in active_slots:
+    for slot in CLAN_SLOTS:
+        if not slot.clan_name or not slot.role_id:
+            continue
+        # Mirror /status: a slot is only "real" if its role exists in the guild.
+        if guild is not None and guild.get_role(slot.role_id) is None:
+            continue
         emoji_dict = _button_emoji_from_literal(slot.emoji)
         opt: dict = {
             "label": _strip_clan_tag(slot.clan_name or "")[:100],
@@ -2507,7 +2518,7 @@ async def _post_onboarding_welcome(member: discord.Member) -> bool:
     Returns True when the welcome was posted (and the prompt recorded), False
     on any failure so callers (e.g. the admin /onboard trigger) can surface it.
     """
-    components = _onboarding_welcome_components(member.id)
+    components = _onboarding_welcome_components(member.id, member.guild)
     try:
         msg_id = await _post_channel_v2(
             ONBOARDING_CHANNEL_ID,
@@ -3034,7 +3045,7 @@ async def _onboarding_reprompt_sweep() -> None:
             await _delete_message(channel_id, message_id)
 
         # Post fresh welcome.
-        components = _onboarding_welcome_components(user_id)
+        components = _onboarding_welcome_components(user_id, guild)
         new_msg_id = await _post_channel_v2(
             ONBOARDING_CHANNEL_ID,
             components,
