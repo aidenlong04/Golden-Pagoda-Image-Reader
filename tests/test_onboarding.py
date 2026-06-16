@@ -304,6 +304,45 @@ class OnboardingComponentsTests(unittest.TestCase):
             )
 
 
+class OnboardingPassWelcomeTests(unittest.TestCase):
+    """The public verified-welcome card (pass + manual-review variants)."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.bot = bot_module
+
+    def _buttons(self, components):
+        out = []
+        for top in components:
+            for inner in top.get("components", []) or []:
+                if inner.get("type") == 1:
+                    out.extend(inner.get("components") or [])
+        return out
+
+    def test_pass_welcome_has_no_verify_button(self):
+        comps = self.bot._onboarding_pass_welcome_components(12345)
+        labels = [b.get("label") for b in self._buttons(comps)]
+        self.assertNotIn("Verify", labels)
+
+    def test_manual_review_verify_button_label_and_emoji(self):
+        member_id = 778899
+        comps = self.bot._onboarding_pass_welcome_components(
+            member_id, manual_review=True
+        )
+        verify = next(
+            (b for b in self._buttons(comps)
+             if b.get("custom_id") == f"mreview:{member_id}:approve"),
+            None,
+        )
+        self.assertIsNotNone(
+            verify, "manual-review card missing the approve button"
+        )
+        self.assertEqual(verify["label"], "Verify")
+        self.assertEqual(verify["emoji"]["name"], "Processing")
+        self.assertEqual(verify["emoji"]["id"], "1459403163432910972")
+        self.assertTrue(verify["emoji"]["animated"])
+
+
 # ---------------------------------------------------------------------------
 # /onboard admin command — triggers the onboarding pipeline on demand
 # ---------------------------------------------------------------------------

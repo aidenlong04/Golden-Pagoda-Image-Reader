@@ -56,7 +56,7 @@ from logic import (
 )
 import analytics
 from config import _csv, _csv_ids, _float_env, _int_env
-from ocr_engine import OCR_API_KEY, _ocr, _supplement_title_bar_ocr
+from ocr_engine import OCR_API_KEY, OLLAMA_OCR_MODEL, _ocr, _supplement_title_bar_ocr
 from envstore import (  # noqa: F401  (some re-exported for tests via bot.*)
     ENV_FILE_PATH,
     PLATFORM_ROLE_ID_ENV_KEYS,
@@ -119,8 +119,8 @@ TARGET_CHANNEL_ID = _int_env("TARGET_CHANNEL_ID")
 # Defaults to TARGET_CHANNEL_ID when unset (backwards-compatible).
 ONBOARDING_CHANNEL_ID = _int_env("ONBOARDING_CHANNEL_ID") or _int_env("TARGET_CHANNEL_ID")
 
-# Channel where a V2 profile-card record is posted after a member completes
-# onboarding verification. 0 disables the record post.
+# Channel where a V2 record (the member's uploaded screenshot) is posted after
+# a member completes onboarding verification. 0 disables the record post.
 MEMBER_RECORDS_CHANNEL_ID = _int_env("MEMBER_RECORDS_CHANNEL_ID")
 
 # Platform name → list of acceptable Discord role-name aliases (case-insensitive).
@@ -202,7 +202,7 @@ VERIFY_REMOVE_ROLE_ID = _int_env("VERIFY_REMOVE_ROLE_ID", 1459326361968574555)
 
 # Catch-up scan: process missed messages from recent history on startup.
 CATCHUP_LOOKBACK_HOURS = _int_env("CATCHUP_LOOKBACK_HOURS", 24)
-CATCHUP_STATE_PATH = Path(os.getenv("CATCHUP_STATE_PATH", "/app/data/catchup_state.json"))
+CATCHUP_STATE_PATH = Path(os.getenv("CATCHUP_STATE_PATH", "./data/catchup_state.json"))
 CATCHUP_DELAY_SECONDS = _float_env("CATCHUP_DELAY_SECONDS", 1.0)
 
 # Onboarding flow: welcome prompt + screenshot verification for new joins.
@@ -246,17 +246,12 @@ HELP_CHANNEL_ID = _int_env("HELP_CHANNEL_ID", 1392582268769271950)
 # /profile card when the member is missing Platform / Mastery Rank / Syndicate.
 ASSIGN_ROLE_EMOJI_ID = _int_env("ASSIGN_ROLE_EMOJI_ID", 1416857287166918827)
 
-# Role permitted to run /profile (server managers are always allowed too).
-# When unset (0), /profile stays open to everyone.
-PROFILE_ACCESS_ROLE_ID = _int_env("PROFILE_ACCESS_ROLE_ID", 1392585653971062815)
-
-# Roles permitted to use the advanced /profile options — `user` (target
-# another member) and `ephemeral` (control reply visibility). Members without
-# one of these (and non-managers) get those two options coerced to their
-# defaults (their own profile, shown only to them), so the options effectively
-# surface only for these roles. The `edit_mastery` option is exempt (it only
-# ever acts on the caller's own profile). Comma-separated; falls back to the
-# baked-in IDs when unset.
+# Roles permitted to make a /profile reply public (i.e. flip the `ephemeral`
+# toggle off); server managers are always allowed. /profile itself is open to
+# everyone and anyone may target any member — only the `ephemeral` toggle is
+# gated, so members without one of these roles always get an ephemeral reply.
+# The `edit_mastery` option is self-only regardless. Comma-separated; falls
+# back to the baked-in IDs when unset.
 PROFILE_OPTIONS_ROLE_IDS: list[int] = _csv_ids("PROFILE_OPTIONS_ROLE_IDS") or [
     1361846841934610563,
     1361846841934610564,
@@ -298,7 +293,7 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 BOT_START_TIME = time.time()
-HEALTH_PATH = os.getenv("HEALTH_PATH", "/tmp/gp_health")
+HEALTH_PATH = os.getenv("HEALTH_PATH", "./data/gp_health")
 HEALTH_INTERVAL = _int_env("HEALTH_INTERVAL", 20)
 
 # Populated after tree.sync(); used to render clickable slash-command mentions
@@ -789,7 +784,11 @@ async def _ocr_profile_fields(
     heartbeats. The caller owns image validation (probe-decode) and every
     response / role / analytics side effect.
     """
-    engine = "ocr.space" if OCR_API_KEY else ("tesseract" if pytesseract else "none")
+    engine = (
+        "ollama" if OLLAMA_OCR_MODEL
+        else "ocr.space" if OCR_API_KEY
+        else ("tesseract" if pytesseract else "none")
+    )
     started = time.monotonic()
     try:
         # OCR involves blocking HTTP (up to 60s) and subprocess work.
@@ -2615,6 +2614,10 @@ _PASS_WELCOME_SELF_ROLES_URL = (
 _PASS_WELCOME_SELF_ROLES_EMOJI = {
     "id": "1416857239599317022", "name": "ExcalNod", "animated": True,
 }
+# Animated emoji shown on the manual-review "Verify" button.
+_MREVIEW_VERIFY_EMOJI = {
+    "id": "1459403163432910972", "name": "Processing", "animated": True,
+}
 # Seconds the normal onboarding-complete welcome stays up before it
 # auto-deletes. The manual-review variant is exempt — it persists until
 # staff approve it (then _handle_mreview_interaction deletes it).
@@ -2643,8 +2646,8 @@ def _onboarding_pass_welcome_components(
             "all serve the Origin System.*\n"
         )
     # Action row: the Self Roles link button, plus (manual-review only) a
-    # staff-only "Approve & Assign Roles" button that grants the verified
-    # roles right from this card.
+    # staff-only "Verify" button that grants the verified roles right from
+    # this card.
     action_buttons: list[dict] = [
         {
             "type": 2,
@@ -2658,7 +2661,8 @@ def _onboarding_pass_welcome_components(
         action_buttons.append({
             "type": 2,
             "style": 3,
-            "label": "Approve & Assign Roles",
+            "label": "Verify",
+            "emoji": _MREVIEW_VERIFY_EMOJI,
             "custom_id": f"mreview:{member_id}:approve",
         })
     return [
@@ -2791,6 +2795,8 @@ async def _onboarding_route_manual_review(
     interaction: discord.Interaction,
     member: discord.Member,
     reason: str,
+    *,
+    image_bytes: bytes | None = None,
 ) -> None:
     """Assign the incomplete review role, notify the help channel, and ack."""
     await _add_incomplete_role(member)
@@ -2813,14 +2819,17 @@ async def _onboarding_route_manual_review(
     # Drop the clan-select dropdown from the original welcome prompt so it
     # can't be re-submitted (banner + welcome line are preserved).
     await _remove_onboarding_dropdown(member.guild.id, member.id)
-    # Post a profile-card record to the member-records channel so staff have a
-    # record of the pending case (mirrors the onboarding-pass path).
+    # Post a member record (the uploaded screenshot, if any) to the records
+    # channel so staff have a record of the pending case.
     _spawn_bg_task(
-        _post_member_record(member, [f"Manual review pending — {reason}"])
+        _post_member_record(
+            member, [f"Manual review pending — {reason}"],
+            image_bytes=image_bytes,
+        )
     )
     # Member-facing response: post the public welcome card (a duplicate of the
     # onboarding-complete card, with the manual-review text variant) — it now
-    # carries the staff-only "Approve & Assign Roles" button inline.
+    # carries the staff-only "Verify" button inline.
     await _post_onboarding_pass_welcome(member, manual_review=True)
     # Ack the triggering interaction so it doesn't error (the modal path already
     # deferred; the dropdown path needs a fresh DEFERRED_UPDATE ack).
@@ -2830,7 +2839,7 @@ async def _onboarding_route_manual_review(
 
 
 # Roles granted when a staff member approves a manual-review case via the
-# "Approve & Assign Roles" button on the alert.
+# "Verify" button on the alert.
 _MREVIEW_APPROVE_ROLE_IDS = (1361846841905381632, 1392585653971062815)
 
 
@@ -2994,6 +3003,7 @@ class _OnboardingVerifyModal(discord.ui.Modal):
                 await _onboarding_route_manual_review(
                     interaction, member,
                     f"screenshot unreadable after {fail_count} attempt(s)",
+                    image_bytes=image_bytes,
                 )
                 return
             remaining = ONBOARDING_MAX_OCR_FAILS - fail_count
@@ -3027,6 +3037,7 @@ class _OnboardingVerifyModal(discord.ui.Modal):
                 await _onboarding_route_manual_review(
                     interaction, member,
                     f"clan mismatch after {fail_count} attempt(s)",
+                    image_bytes=image_bytes,
                 )
                 return
             remaining = ONBOARDING_MAX_OCR_FAILS - fail_count
@@ -3055,6 +3066,7 @@ class _OnboardingVerifyModal(discord.ui.Modal):
                     await _onboarding_route_manual_review(
                         interaction, member,
                         f"clan not detectable after {fail_count} attempt(s)",
+                        image_bytes=image_bytes,
                     )
                     return
                 remaining = ONBOARDING_MAX_OCR_FAILS - fail_count
@@ -3090,8 +3102,9 @@ class _OnboardingVerifyModal(discord.ui.Modal):
         # Welcome-only response: post the public "Welcome to the Golden Pagoda"
         # message to the server-entry channel (no ephemeral confirmation).
         await _post_onboarding_pass_welcome(member)
-        # Post a profile-card record to the member-records channel (fire-and-forget).
-        _spawn_bg_task(_post_member_record(member, summary))
+        # Post a member record (the uploaded screenshot) to the records
+        # channel (fire-and-forget).
+        _spawn_bg_task(_post_member_record(member, summary, image_bytes=image_bytes))
 
 
 def _build_member_record_components(
@@ -3141,53 +3154,32 @@ def _build_member_record_components(
 async def _post_member_record(
     member: discord.Member,
     summary_lines: list[str],
+    *,
+    image_bytes: bytes | None = None,
 ) -> None:
-    """Render a profile card and post it to MEMBER_RECORDS_CHANNEL_ID.
+    """Post a member record to MEMBER_RECORDS_CHANNEL_ID.
+
+    Uses the screenshot the member uploaded to the verification modal as the
+    record image (``image_bytes``). When no screenshot is available (e.g. the
+    "Not Affiliated" path), posts a text-only record with the media gallery
+    stripped.
 
     Fail-soft: exceptions are logged but never propagate (this is called as a
-    background task from the onboarding success path).
+    background task from the onboarding success / manual-review paths).
     """
     if not MEMBER_RECORDS_CHANNEL_ID:
         return
     try:
-        # Fetch avatar for the profile card.
-        avatar_asset = member.display_avatar or member.default_avatar
-        avatar_url = avatar_asset.replace(size=256, format="png").url
-        avatar_bytes: bytes | None = None
-        try:
-            avatar_bytes = await _fetch_avatar_bytes(avatar_url)
-        except Exception:
-            logger.debug("member record: avatar fetch failed for %s", member.id)
-
-        # Gather profile info lines (roles-derived: clan, platform, mastery, etc.)
-        info = await _member_profile_info_lines(member)
-        in_game_name = await _member_in_game_name(member)
-        display_name = member.display_name
-
-        # Render the profile card via the shared renderer.
-        card_bytes: bytes | None = None
-        try:
-            card_bytes = await _run_heavy(
-                _render_profile_card_png,
-                avatar_bytes=avatar_bytes,
-                display_name=display_name,
-                info_lines=info,
-                in_game_name=in_game_name,
-            )
-        except Exception:
-            logger.debug("member record: profile card render failed for %s", member.id)
-
         components = _build_member_record_components(member, summary_lines)
-
-        if card_bytes:
+        if image_bytes:
             await _post_channel_v2_with_file(
                 MEMBER_RECORDS_CHANNEL_ID,
                 components,
-                file_bytes=card_bytes,
+                file_bytes=image_bytes,
                 file_name="record.png",
             )
         else:
-            # No card available; strip the media gallery and post text-only.
+            # No screenshot; strip the media gallery and post text-only.
             text_components = [c for c in components if c.get("type") != 12]
             await _post_channel_v2(MEMBER_RECORDS_CHANNEL_ID, text_components)
         logger.info(
@@ -3658,7 +3650,7 @@ def _status_page_stats(_interaction: discord.Interaction, snap: dict) -> str:
             "**Analytics**\n"
             "-# Storage unavailable.\n"
             f"-# DB path: `{snap.get('db_path')}`\n"
-            "-# Mount `/opt/golden-pagoda/data:/app/data` to enable."
+            "-# Ensure the `./data` directory is writable to enable."
         )
     total = snap["total"]
     by = snap["by_outcome"]
@@ -5641,26 +5633,13 @@ def _can_use_command(
     return any(r.id in ids for r in member.roles)
 
 
-def _can_use_profile(member: discord.Member) -> bool:
-    """Return True when ``member`` may run /profile.
-
-    Access is gated to ``PROFILE_ACCESS_ROLE_ID`` (server managers are always
-    allowed). When that role isn't configured (0), the command stays open to
-    everyone.
-    """
-    return _can_use_command(
-        member, (PROFILE_ACCESS_ROLE_ID,), open_when_empty=True
-    )
-
-
 def _can_use_profile_options(member: discord.Member) -> bool:
-    """Return True when ``member`` may use the advanced /profile options.
+    """Return True when ``member`` may make a /profile reply public.
 
-    Gates the ``user`` (target another member) and ``ephemeral`` options to
-    ``PROFILE_OPTIONS_ROLE_IDS`` (server managers are always allowed). Members
-    without one of those roles get both options coerced to their defaults, so
-    the options effectively surface only for these roles. The ``edit_mastery``
-    option is intentionally exempt.
+    Gates the ``ephemeral`` toggle to ``PROFILE_OPTIONS_ROLE_IDS`` (server
+    managers are always allowed). Members without one of those roles always
+    get an ephemeral (private) reply. The ``user`` target is open to everyone,
+    and ``edit_mastery`` is self-only.
     """
     return _can_use_command(member, PROFILE_OPTIONS_ROLE_IDS)
 
@@ -5674,12 +5653,6 @@ def _can_use_profile_options(member: discord.Member) -> bool:
     ephemeral="Hide the reply so only you see it (default: true).",
     edit_mastery="Attach a dropdown to set your Mastery Rank (only on your own profile).",
 )
-# Hide /profile from everyone by default (default_member_permissions = 0).
-# Discord doesn't let a bot scope a command's visibility to a specific role,
-# so a server admin grants PROFILE_ACCESS_ROLE_ID via Server Settings →
-# Integrations → /profile. The _can_use_profile runtime check is the matching
-# safety net for the same role.
-@app_commands.default_permissions()
 async def profile_cmd(
     interaction: discord.Interaction,
     user: discord.Member | None = None,
@@ -5687,27 +5660,20 @@ async def profile_cmd(
     edit_mastery: bool = False,
 ) -> None:
     target = user or interaction.user
-    if not isinstance(target, discord.Member):
+    if not (
+        isinstance(target, discord.Member)
+        and isinstance(interaction.user, discord.Member)
+    ):
         await interaction.response.send_message(
             "\u274C /profile can only be used in a server.", ephemeral=True
         )
         return
 
-    if not (
-        isinstance(interaction.user, discord.Member)
-        and _can_use_profile(interaction.user)
-    ):
-        await interaction.response.send_message(
-            "\u274C You don't have access to /profile.", ephemeral=True
-        )
-        return
-
-    # The `user` + `ephemeral` options are gated to PROFILE_OPTIONS_ROLE_IDS.
-    # Members without one of those roles get them coerced to their defaults
-    # (their own profile, shown only to them) so those options effectively
-    # surface only for these roles. `edit_mastery` is intentionally exempt.
+    # /profile is open to everyone and anyone may target any member. Only the
+    # `ephemeral` toggle is gated to PROFILE_OPTIONS_ROLE_IDS — members without
+    # one of those roles always get an ephemeral (private) reply. `edit_mastery`
+    # is self-only (enforced below), so no one can change another member's MR.
     if not _can_use_profile_options(interaction.user):
-        target = interaction.user
         ephemeral = True
 
     display_name = target.display_name

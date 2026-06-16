@@ -18,6 +18,7 @@ Performance enhancements (all tunable via env vars):
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import logging
@@ -54,6 +55,21 @@ OCR_API_URL = os.getenv("OCR_API_URL", "https://api.ocr.space/parse/image")
 OCR_ENGINE = os.getenv("OCR_ENGINE", "3")
 OCR_LANGUAGE = os.getenv("OCR_LANGUAGE", "eng")
 TESSERACT_CONFIG = "--oem 3 --psm 6"
+
+# Local Ollama vision backend. When OLLAMA_OCR_MODEL is set, the bot reads the
+# screenshot text with a local Ollama vision model (e.g. llama3.2-vision,
+# llava) instead of OCR.space — fully offline, no API key. Falls through to
+# OCR.space / Tesseract if Ollama is unreachable or returns nothing.
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_OCR_MODEL = os.getenv("OLLAMA_OCR_MODEL", "").strip()
+OLLAMA_TIMEOUT = _int_env("OLLAMA_TIMEOUT", 120)
+_OLLAMA_OCR_PROMPT = (
+    "You are an OCR engine. Transcribe ALL text visible in this Warframe "
+    "profile screenshot exactly as it appears, line by line. Preserve the "
+    "title-bar player handle in the form PlayerName#NNN, the MASTERY RANK "
+    "number, and the CLAN name. Output only the raw transcribed text — no "
+    "commentary, no markdown, no explanations."
+)
 # OCR.space free tier rejects uploads >1 MB. We re-encode oversize images as
 # JPEG before sending so large PNG screenshots still get verified.
 OCR_MAX_UPLOAD_BYTES = _int_env("OCR_MAX_UPLOAD_BYTES", 900_000)
@@ -234,6 +250,36 @@ def _ocr_via_api(
     return text, words
 
 
+def _ocr_via_ollama(
+    image_bytes: bytes,
+) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]]:
+    """Transcribe a screenshot with a local Ollama vision model.
+
+    Returns ``(text, [])`` — Ollama yields plain text with no per-word bounding
+    boxes, so the words list is always empty (the title-bar Tesseract
+    supplement still runs afterward to recover the PlayerName#NNN box when a
+    local Tesseract is available).
+    """
+    if not OLLAMA_OCR_MODEL:
+        raise RuntimeError("OLLAMA_OCR_MODEL not configured")
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    response = requests.post(
+        f"{OLLAMA_URL}/api/generate",
+        json={
+            "model": OLLAMA_OCR_MODEL,
+            "prompt": _OLLAMA_OCR_PROMPT,
+            "images": [b64],
+            "stream": False,
+            "options": {"temperature": 0},
+        },
+        timeout=OLLAMA_TIMEOUT,
+    )
+    response.raise_for_status()
+    data = response.json()
+    text = (data.get("response") or "").strip()
+    return text, []
+
+
 def _preprocess_for_tesseract(image_bytes: bytes) -> Image.Image:
     """Upscale + grayscale + autocontrast. Tesseract is dramatically more
     accurate on Warframe's stylized UI font when the input is enlarged and
@@ -290,6 +336,36 @@ def _ocr(
 def _ocr_uncached(
     image_bytes: bytes, filename: str, content_type: str
 ) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]], str]:
+    # Preferred backend: a local Ollama vision model (offline, no API key).
+    if OLLAMA_OCR_MODEL:
+        try:
+            text, words = _ocr_via_ollama(image_bytes)
+            if text:
+                return text, words, "ollama"
+            logger.warning(
+                "Ollama OCR (%s) returned empty text; falling back",
+                OLLAMA_OCR_MODEL,
+            )
+        except Exception as ollama_err:
+            logger.warning(
+                "Ollama OCR (%s) failed (%s); falling back",
+                OLLAMA_OCR_MODEL,
+                ollama_err.__class__.__name__,
+            )
+        # Fall through: prefer OCR.space if configured, else Tesseract.
+        if OCR_API_KEY:
+            try:
+                text, words = _ocr_via_api(image_bytes, filename, content_type)
+                return text, words, "ocr.space"
+            except Exception:
+                logger.warning("OCR.space fallback after Ollama also failed")
+        if pytesseract is not None:
+            text, words = _ocr_via_tesseract(image_bytes)
+            return text, words, "tesseract"
+        raise RuntimeError(
+            "Ollama OCR failed and no OCR.space key / Tesseract fallback "
+            "is available."
+        )
     if OCR_API_KEY:
         try:
             text, words = _ocr_via_api(image_bytes, filename, content_type)

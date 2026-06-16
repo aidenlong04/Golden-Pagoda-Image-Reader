@@ -9,8 +9,9 @@ clan buttons, screenshot upload, and automatic re-prompts.
 ## What it does
 
 - Watches one configured channel (`TARGET_CHANNEL_ID`) for image uploads.
-- Runs OCR via [OCR.space](https://ocr.space/) engine 3 with a local
-  Tesseract fallback if `OCR_API_KEY` is unset.
+- Runs OCR locally via [Ollama](https://ollama.com/) vision models
+  (`OLLAMA_OCR_MODEL`, e.g. `llama3.2-vision`), with [OCR.space](https://ocr.space/)
+  engine 3 and a local Tesseract install as fallbacks.
 - Parses the **in-game name** from the title bar.
 - Parses the **clan name** from the right-hand panel and matches it against
   the configured 7-slot clan list.
@@ -49,16 +50,61 @@ When a new member joins the server:
 - Pillow + NumPy for the progress card render
 - SQLite (stdlib) for analytics (WAL mode, persistent connection)
 - Pooled `aiohttp.ClientSession` for Discord REST + CDN
-- Docker + systemd on Hetzner CX22; GitHub Actions auto-deploy on push to
-  `main`
+- Runs locally from a terminal (`python bot.py` / `./run.ps1` on Windows);
+  OCR served by a local Ollama instance
 
 ## Setup (local)
 
+### Prerequisites
+
+Install these on the machine that runs the bot (Windows `winget` shown; on macOS
+use `brew install python git ollama tesseract`, on Linux use your package
+manager):
+
+| Tool | Why | Install (winget) |
+| --- | --- | --- |
+| **Python 3.12+** | Runtime | `winget install Python.Python.3.12` |
+| **Git** | Clone + auto-deploy pulls | `winget install Git.Git` |
+| **Ollama** + a vision model | Primary local OCR | `winget install Ollama.Ollama` then `ollama pull llama3.2-vision` |
+| **Tesseract OCR** *(optional)* | Last-resort OCR fallback | `winget install UB-Mannheim.TesseractOCR` |
+| **NSSM** *(optional)* | Run the bot as a background service | `winget install NSSM.NSSM` |
+
+The Python packages (`discord.py`, Pillow, numpy, …) install automatically into
+a local `.venv` via `run.ps1` / `install-service.ps1` — you don't install those
+by hand. On Windows, allow the launcher scripts to run once per user:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+### macOS / Linux
+
 ```bash
 pip install -r requirements.txt
-cp .env.example .env  # or export the variables manually
+cp .env.example .env  # then fill in DISCORD_TOKEN + TARGET_CHANNEL_ID
 python bot.py
 ```
+
+### Windows (PowerShell)
+
+```powershell
+./run.ps1
+```
+
+`run.ps1` creates a `.venv`, installs dependencies, copies `.env.example` to
+`.env` on first run, verifies the local Ollama server when `OLLAMA_OCR_MODEL`
+is set, then launches the bot. Pass `-NoInstall` to skip the dependency step.
+
+### Local OCR with Ollama (recommended)
+
+```bash
+ollama pull llama3.2-vision   # or another vision-capable model
+ollama serve                  # leave running
+```
+
+Then set `OLLAMA_OCR_MODEL=llama3.2-vision` in `.env`. With it set, the bot
+reads screenshots fully offline through Ollama and needs no API key; it falls
+back to OCR.space (`OCR_API_KEY`) then Tesseract only if Ollama fails.
 
 Required env: `DISCORD_TOKEN`, `TARGET_CHANNEL_ID`. See
 [.github/copilot-instructions.md](.github/copilot-instructions.md) for the
@@ -95,9 +141,11 @@ full env reference.
   (multi-select that syncs the syndicate roles). A Titles button points you at
   `/titles`. Requires **Manage Server**.
 - `/profile [user] [ephemeral] [edit_mastery]` — render a member's profile card.
-  Defaults to caller; ephemeral by default. Requires the configured access role
-  or Manage Server. Syncs the member's clan/platform from their current roles
-  into the durable store on each use.
+  Open to everyone, and anyone may target any member (defaults to the caller).
+  The reply is ephemeral by default; only managers (or `PROFILE_OPTIONS_ROLE_IDS`)
+  can flip `ephemeral` off to post it publicly. `edit_mastery` is self-only — no
+  one can change another member's Mastery Rank. Syncs the member's clan/platform
+  from their current roles into the durable store on each use.
 
 ## Data retention / on-leave clear
 
@@ -116,20 +164,61 @@ either path.
 
 ## Deployment
 
-Push to `main` triggers `.github/workflows/deploy.yml`:
+The bot runs on your own hardware — there is no cloud host. Day to day you can
+just run `python bot.py` (or `./run.ps1` on Windows) and keep the terminal open.
+For an always-on setup on Windows, run it as a service and let GitHub
+auto-deploy your pushes.
 
-1. rsync the repo to `/opt/golden-pagoda` (excludes `data/`, `icons/`, `.env`)
-2. `docker build golden-pagoda:latest`
-3. `systemctl restart golden-pagoda`
+### Run as a service (Windows / NSSM)
 
-The systemd unit is hardened (`--init`, `--memory=512m`, `--cpus=1.5`,
-`--pids-limit=256`, JSON log rotation). A sibling
-`golden-pagoda-watchdog.service` blocks on `docker events` and restarts the
-container on `health_status: unhealthy` or `die`, with cooldown +
-sliding-window restart cap.
+Install [NSSM](https://nssm.cc/) (`winget install NSSM.NSSM`), then from an
+**elevated** PowerShell:
 
-Server `.env` is the source of truth (`/opt/golden-pagoda/.env`); see
-`scripts/ops.sh env-get` / `env-set` for in-place edits.
+```powershell
+./scripts/install-service.ps1
+```
+
+This creates `.venv`, installs deps, copies `.env.example` → `.env` on first
+run, and registers the `GoldenPagoda` service (start on boot, restart on crash,
+rotating logs under `data\service.*.log`). It also records the repo path in the
+`GP_BOT_DIR` machine environment variable for the deploy workflow. Manage it
+with `nssm restart GoldenPagoda` / `Stop-Service GoldenPagoda` /
+`Get-Service GoldenPagoda`. (Don't also run `run.ps1` at the same time — that
+would start a second bot instance.)
+
+### Auto-deploy on push (self-hosted runner)
+
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) runs the test
+suite on a GitHub-hosted runner on every push/PR; when a push to `main` passes,
+a **self-hosted runner on your device** pulls `origin/main`, reinstalls deps,
+and restarts the service. One-time setup:
+
+1. **Clone to a fixed path** and configure it:
+   ```powershell
+   git clone https://github.com/aidenlong04/Golden-Pagoda-Image-Reader.git C:\GoldenPagoda
+   cd C:\GoldenPagoda
+   copy .env.example .env   # fill in DISCORD_TOKEN + TARGET_CHANNEL_ID
+   ```
+2. **Install the service:** `./scripts/install-service.ps1` (elevated — see above).
+3. **Register the runner:** on GitHub open **Settings → Actions → Runners →
+   New self-hosted runner → Windows**, run the shown download/config commands,
+   and add the label `windows` when prompted. Install it as a service so it
+   survives reboots:
+   ```powershell
+   ./svc.cmd install
+   ./svc.cmd start
+   ```
+   Run the runner under an account that can restart services, and restart it
+   **after** step 2 so it picks up `GP_BOT_DIR`.
+4. **Deploy:** `git push origin main` (or **Actions → CI & Deploy → Run
+   workflow**). Tests run first; the device only updates if they pass.
+
+> **Security:** the self-hosted runner executes this repo's code on your
+> machine. Keep the repo **private** (or rely on the workflow's `push`-to-`main`
+> guard so pull requests never run on your device).
+
+The optional `Dockerfile` builds a generic `golden-pagoda:latest` image if you
+prefer a container instead.
 
 ## Tests
 
@@ -169,7 +258,7 @@ The following improvements were added to address latency, reliability, and obser
 
 **`bot.py`**
 - `_HEAVY_JOB_SEMAPHORE` concurrency is now tunable via `HEAVY_JOB_CONCURRENCY`
-  (default 2; safe for 512 MB Hetzner CX22).
+  (default 2; conservative for low-memory machines).
 - `_run_heavy` instruments `heavy_semaphore_metrics` so `/status → Latency` shows
   current / peak / queued counts and average queue-wait time.
 - `_discord_call_with_retry` wraps role-assignment calls with rate-limit-aware
@@ -181,18 +270,19 @@ The following improvements were added to address latency, reliability, and obser
 ### Tuning guide
 
 All parameters have safe defaults and are backwards-compatible — no `.env`
-changes are required to upgrade.  To tune for a more powerful host:
+changes are required.  To tune for a more powerful host, set the values in
+`.env` and restart the bot:
 
 ```bash
 # Allow 3 concurrent heavy jobs (verify memory headroom first via /status Latency).
-scripts/ops.sh env-set HEAVY_JOB_CONCURRENCY 3
+HEAVY_JOB_CONCURRENCY=3
 
 # Reduce analytics cache TTL for a high-traffic server where fresh stats matter.
-scripts/ops.sh env-set ANALYTICS_SUMMARY_TTL 10
+ANALYTICS_SUMMARY_TTL=10
 
-# Increase OCR retries if the OCR.space API is flaky in your region.
-scripts/ops.sh env-set OCR_RETRY_MAX_ATTEMPTS 4
-scripts/ops.sh env-set OCR_RETRY_BASE_DELAY 2.0
+# Increase OCR retries if the OCR.space fallback is flaky in your region.
+OCR_RETRY_MAX_ATTEMPTS=4
+OCR_RETRY_BASE_DELAY=2.0
 ```
 
 ## Notes

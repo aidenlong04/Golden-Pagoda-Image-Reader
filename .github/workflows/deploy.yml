@@ -1,77 +1,72 @@
-name: Deploy to Hetzner
+name: CI & Deploy
 
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
+# Never run two deploys to the device at once; let an in-flight deploy finish.
 concurrency:
-  group: deploy-hetzner
+  group: deploy-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  test:
+    name: Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Set up SSH
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
         run: |
-          mkdir -p ~/.ssh
-          # HETZNER_SSH_KEY is base64-encoded private key (avoids any
-          # whitespace/CRLF mangling by the GitHub secrets UI).
-          echo "${{ secrets.HETZNER_SSH_KEY }}" | base64 -d > ~/.ssh/hetzner
-          chmod 600 ~/.ssh/hetzner
-          ssh-keygen -y -f ~/.ssh/hetzner > /dev/null  # validate
-          ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Run tests
+        env:
+          DISCORD_TOKEN: test
+          TARGET_CHANNEL_ID: "1"
+        run: python -m pytest tests/ -q
 
-      - name: Sync repo to server
+  deploy:
+    name: Deploy to device
+    needs: test
+    # Only the maintainer's pushes to main reach the self-hosted runner — never
+    # pull requests (which keeps fork PRs off your personal machine).
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, windows]
+    steps:
+      - name: Update working copy + restart service
+        shell: pwsh
         run: |
-          rsync -az --delete \
-            -e "ssh -i ~/.ssh/hetzner" \
-            --exclude '.git' \
-            --exclude '.github' \
-            --exclude '__pycache__' \
-            --exclude '*.pyc' \
-            --exclude '.venv' \
-            --exclude '.env' \
-            --exclude 'data' \
-            --exclude 'icons' \
-            ./ "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}:/opt/golden-pagoda/"
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:GP_BOT_DIR) {
+            throw "GP_BOT_DIR machine env var is not set on this runner. Run scripts\install-service.ps1 (as admin), then restart the Actions runner so it picks up the variable."
+          }
+          if (-not (Test-Path $env:GP_BOT_DIR)) {
+            throw "GP_BOT_DIR points to '$env:GP_BOT_DIR' but that folder does not exist."
+          }
+          Set-Location $env:GP_BOT_DIR
+          $venvPy = Join-Path $env:GP_BOT_DIR '.venv\Scripts\python.exe'
 
-      - name: Build image and restart service
-        run: |
-          ssh -i ~/.ssh/hetzner "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
-            set -eo pipefail
-            cd /opt/golden-pagoda
-            sudo mkdir -p /opt/golden-pagoda/data /opt/golden-pagoda/icons
-            # Container runs as uid 10001 (bot); the bind-mounted data dir
-            # must be writable by that uid, otherwise sqlite3.connect fails.
-            sudo chown -R 10001:10001 /opt/golden-pagoda/data
-            # Daemon-wide log rotation defaults so any transient container is bounded.
-            if [ ! -f /etc/docker/daemon.json ]; then
-                echo "{\"log-driver\":\"json-file\",\"log-opts\":{\"max-size\":\"10m\",\"max-file\":\"3\"}}" \
-                    | sudo tee /etc/docker/daemon.json > /dev/null
-                sudo systemctl reload docker || sudo systemctl restart docker
-            fi
-            sudo install -m 0644 scripts/golden-pagoda.service /etc/systemd/system/golden-pagoda.service
-            sudo chmod +x scripts/golden-pagoda-watchdog.sh
-            sudo install -m 0644 scripts/golden-pagoda-watchdog.service /etc/systemd/system/golden-pagoda-watchdog.service
-            # Old timer-based watchdog is superseded by the long-running service.
-            sudo systemctl disable --now golden-pagoda-watchdog.timer 2>/dev/null || true
-            sudo rm -f /etc/systemd/system/golden-pagoda-watchdog.timer
-            sudo systemctl daemon-reload
-            sudo systemctl enable --now golden-pagoda-watchdog.service
-            sudo systemctl restart golden-pagoda-watchdog.service
-            DOCKER_BUILDKIT=1 docker build -t golden-pagoda:latest . | tail -3
-            sudo systemctl restart golden-pagoda
-            sleep 5
-            systemctl is-active golden-pagoda
-            docker logs golden-pagoda --tail 20
-            # Reclaim disk on the CX22 without nuking the warm cache: drop only
-            # dangling images (keeps the python:3.12-slim base for next build)
-            # and cap the build cache rather than wiping it, so the next deploy
-            # still hits the apt/pip layers instead of a cold from-scratch build.
-            docker image prune -f >/dev/null || true
-            docker builder prune -f --keep-storage 2GB >/dev/null || true
-          '
+          Write-Host '>> stopping GoldenPagoda service'
+          Stop-Service -Name GoldenPagoda -ErrorAction SilentlyContinue
+
+          Write-Host '>> updating working copy to origin/main'
+          git fetch --all --prune
+          git reset --hard origin/main
+
+          if (-not (Test-Path $venvPy)) {
+            Write-Host '>> creating .venv'
+            python -m venv .venv
+          }
+          Write-Host '>> installing dependencies'
+          & $venvPy -m pip install --quiet --upgrade pip
+          & $venvPy -m pip install --quiet -r requirements.txt
+
+          Write-Host '>> starting GoldenPagoda service'
+          Start-Service -Name GoldenPagoda
+          Write-Host '>> deploy complete'

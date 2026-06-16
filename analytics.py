@@ -1,10 +1,9 @@
 """Lightweight analytics for verification outcomes.
 
 Stores one row per verification attempt in a local SQLite DB. The DB path
-defaults to ``/app/data/analytics.db`` so it can be mounted as a host volume
-on Hetzner (``/opt/golden-pagoda/data:/app/data``). If the directory is not
-writable the module silently degrades to a no-op so the bot can never crash
-because of analytics.
+defaults to ``./data/analytics.db`` (relative to the working directory). If the
+directory is not writable the module silently degrades to a no-op so the bot
+can never crash because of analytics.
 
 Performance enhancements:
 - ``summary()`` result is cached for ``ANALYTICS_SUMMARY_TTL`` seconds
@@ -27,7 +26,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = os.getenv("ANALYTICS_DB_PATH", "/app/data/analytics.db")
+DEFAULT_DB_PATH = os.getenv("ANALYTICS_DB_PATH", "./data/analytics.db")
 
 # Summary cache TTL in seconds (tunable via env var).
 try:

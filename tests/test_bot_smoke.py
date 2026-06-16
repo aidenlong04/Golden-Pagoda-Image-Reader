@@ -1476,8 +1476,9 @@ class EnvRewriteRoundtripTests(unittest.TestCase):
 
 
 class ProfileAccessGateTests(unittest.TestCase):
-    """Truth table for the two /profile gates (Phase 2 merges them into one
-    _can_use_command helper; this locks the current semantics)."""
+    """Truth table for the /profile ephemeral gate. /profile itself is open to
+    everyone (anyone may target any member); only the ``ephemeral`` toggle is
+    gated to PROFILE_OPTIONS_ROLE_IDS (managers always allowed)."""
 
     def setUp(self):
         import bot as bot_module
@@ -1488,32 +1489,6 @@ class ProfileAccessGateTests(unittest.TestCase):
         m.guild_permissions = Mock(manage_guild=manage_guild)
         m.roles = [Mock(id=r) for r in role_ids]
         return m
-
-    def test_profile_open_when_no_access_role_configured(self):
-        with patch.object(self.b, "PROFILE_ACCESS_ROLE_ID", 0):
-            self.assertTrue(
-                self.b._can_use_profile(
-                    self._member(manage_guild=False, role_ids=[])
-                )
-            )
-
-    def test_profile_requires_access_role_or_manager(self):
-        with patch.object(self.b, "PROFILE_ACCESS_ROLE_ID", 555):
-            self.assertTrue(  # manager always allowed
-                self.b._can_use_profile(
-                    self._member(manage_guild=True, role_ids=[])
-                )
-            )
-            self.assertTrue(  # has the access role
-                self.b._can_use_profile(
-                    self._member(manage_guild=False, role_ids=[555])
-                )
-            )
-            self.assertFalse(  # neither
-                self.b._can_use_profile(
-                    self._member(manage_guild=False, role_ids=[1, 2])
-                )
-            )
 
     def test_profile_options_require_options_role_or_manager(self):
         with patch.object(self.b, "PROFILE_OPTIONS_ROLE_IDS", [777]):
