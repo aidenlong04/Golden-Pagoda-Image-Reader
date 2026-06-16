@@ -2554,13 +2554,32 @@ def _onboarding_pass_welcome_components(
     if manual_review:
         body_line = (
             f"\n> Our <@&{_PASS_WELCOME_STAFF_ROLE_ID}> will reach out to "
-            "confirm your clan details and update your roles.\n"
+            "confirm your clan details.\n"
         )
     else:
         body_line = (
-            "\n> *\"Each clan within the alliance walks a different path — but "
-            "all serve the Origin System.\"*\n"
+            "\n> *Each clan within the alliance walks a different path — but "
+            "all serve the Origin System.*\n"
         )
+    # Action row: the Self Roles link button, plus (manual-review only) a
+    # staff-only "Approve & Assign Roles" button that grants the verified
+    # roles right from this card.
+    action_buttons: list[dict] = [
+        {
+            "type": 2,
+            "style": 5,
+            "label": "Self Roles",
+            "emoji": _PASS_WELCOME_SELF_ROLES_EMOJI,
+            "url": _PASS_WELCOME_SELF_ROLES_URL,
+        }
+    ]
+    if manual_review:
+        action_buttons.append({
+            "type": 2,
+            "style": 3,
+            "label": "Approve & Assign Roles",
+            "custom_id": f"mreview:{member_id}:approve",
+        })
     return [
         {
             "type": 17,
@@ -2596,15 +2615,7 @@ def _onboarding_pass_welcome_components(
                 },
                 {
                     "type": 1,
-                    "components": [
-                        {
-                            "type": 2,
-                            "style": 5,
-                            "label": "Self Roles",
-                            "emoji": _PASS_WELCOME_SELF_ROLES_EMOJI,
-                            "url": _PASS_WELCOME_SELF_ROLES_URL,
-                        }
-                    ],
+                    "components": action_buttons,
                 },
             ],
         }
@@ -2689,6 +2700,10 @@ async def _onboarding_route_manual_review(
 ) -> None:
     """Assign the incomplete review role, notify the help channel, and ack."""
     await _add_incomplete_role(member)
+    logger.info(
+        "onboarding: routing %s (%s) to manual review: %s",
+        member, member.id, reason,
+    )
     await asyncio.to_thread(
         analytics.record_verification,
         outcome="incomplete",
@@ -2701,32 +2716,9 @@ async def _onboarding_route_manual_review(
         guild_id=member.guild.id,
         user_id=member.id,
     )
-    # Notify the server-entry (onboarding) channel for staff to pick up, with
-    # a one-click approve button that grants the verified-member roles.
-    review_channel_id = ONBOARDING_CHANNEL_ID or HELP_CHANNEL_ID
-    if review_channel_id:
-        components = [{
-            "type": 17,
-            "accent_color": ACCENT_INCOMPLETE,
-            "components": [
-                {"type": 10, "content": (
-                    f"\U0001F6E1\uFE0F Manual review needed: <@{member.id}> "
-                    f"(`{member.id}`) — {reason}"
-                )},
-                {"type": 1, "components": [
-                    {
-                        "type": 2,
-                        "style": 3,
-                        "label": "Approve & Assign Roles",
-                        "custom_id": f"mreview:{member.id}:approve",
-                    }
-                ]},
-            ],
-        }]
-        with contextlib.suppress(Exception):
-            await _post_channel_v2(review_channel_id, components)
     # Member-facing response: post the public welcome card (a duplicate of the
-    # onboarding-complete card, with the manual-review text variant).
+    # onboarding-complete card, with the manual-review text variant) — it now
+    # carries the staff-only "Approve & Assign Roles" button inline.
     await _post_onboarding_pass_welcome(member, manual_review=True)
     # Ack the triggering interaction so it doesn't error (the modal path already
     # deferred; the dropdown path needs a fresh DEFERRED_UPDATE ack).
@@ -2804,16 +2796,21 @@ async def _handle_mreview_interaction(
         user.id, member.id, granted,
     )
 
-    approved_text = (
-        f"\u2705 Manual review approved for <@{member.id}> by <@{user.id}>."
-    )
-    # UPDATE_MESSAGE (type 7) — replace the alert (and its button) in place.
+    # UPDATE_MESSAGE (type 7) — re-render the welcome card as the normal
+    # completed variant, which drops the approve button and flips the text to
+    # the standard lore line, leaving the member's welcome intact.
     with contextlib.suppress(Exception):
         await _interaction_callback(
             interaction, 7,
-            [{"type": 17, "accent_color": ACCENT_PASS,
-              "components": [{"type": 10, "content": approved_text}]}],
+            _onboarding_pass_welcome_components(member.id, manual_review=False),
             ephemeral=False,
+        )
+    # Ephemeral confirmation to the approving staff member.
+    with contextlib.suppress(Exception):
+        await interaction.followup.send(
+            f"\u2705 Approved <@{member.id}> — granted: "
+            f"{', '.join(granted) if granted else 'no roles'}.",
+            ephemeral=True,
         )
 
 
