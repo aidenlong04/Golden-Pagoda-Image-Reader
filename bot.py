@@ -2611,6 +2611,10 @@ _PASS_WELCOME_SELF_ROLES_URL = (
 _PASS_WELCOME_SELF_ROLES_EMOJI = {
     "id": "1416857239599317022", "name": "ExcalNod", "animated": True,
 }
+# Seconds the normal onboarding-complete welcome stays up before it
+# auto-deletes. The manual-review variant is exempt — it persists until
+# staff approve it (then _handle_mreview_interaction deletes it).
+_ONBOARDING_PASS_WELCOME_TTL = 180
 
 
 def _onboarding_pass_welcome_components(
@@ -2698,17 +2702,30 @@ def _onboarding_pass_welcome_components(
 async def _post_onboarding_pass_welcome(
     member: discord.Member, *, manual_review: bool = False
 ) -> None:
-    """Post the public verified-welcome to the server-entry channel."""
+    """Post the public verified-welcome to the server-entry channel.
+
+    The normal onboarding-complete variant auto-deletes after
+    ``_ONBOARDING_PASS_WELCOME_TTL`` seconds. The manual-review variant
+    persists until staff approve it (then it's deleted in
+    :func:`_handle_mreview_interaction`).
+    """
     if ONBOARDING_CHANNEL_ID <= 0:
         return
     components = _onboarding_pass_welcome_components(
         member.id, manual_review=manual_review
     )
+    msg_id: int | None = None
     with contextlib.suppress(Exception):
-        await _post_channel_v2(
+        msg_id = await _post_channel_v2(
             ONBOARDING_CHANNEL_ID,
             components,
             mention_user_ids=[member.id],
+        )
+    if msg_id and not manual_review and _ONBOARDING_PASS_WELCOME_TTL > 0:
+        _spawn_bg_task(
+            _delete_after(
+                ONBOARDING_CHANNEL_ID, msg_id, _ONBOARDING_PASS_WELCOME_TTL
+            )
         )
 
 
@@ -2877,15 +2894,14 @@ async def _handle_mreview_interaction(
         user.id, member.id, granted,
     )
 
-    # UPDATE_MESSAGE (type 7) — re-render the welcome card as the normal
-    # completed variant, which drops the approve button and flips the text to
-    # the standard lore line, leaving the member's welcome intact.
+    # The manual-review welcome persists until approval. Now that roles are
+    # granted, delete it: ack the click (DEFERRED_UPDATE) then remove the
+    # message so it doesn't linger.
+    msg = interaction.message
     with contextlib.suppress(Exception):
-        await _interaction_callback(
-            interaction, 7,
-            _onboarding_pass_welcome_components(member.id, manual_review=False),
-            ephemeral=False,
-        )
+        await _interaction_callback(interaction, 6, [])  # DEFERRED_UPDATE
+    if msg is not None:
+        _spawn_bg_task(_delete_message(msg.channel.id, msg.id))
     # Ephemeral confirmation to the approving staff member.
     with contextlib.suppress(Exception):
         await interaction.followup.send(
@@ -2948,9 +2964,10 @@ class _OnboardingVerifyModal(discord.ui.Modal):
                 )
             return
 
-        # Re-fetch member to get fresh roles after potential concurrent changes.
-        with contextlib.suppress(discord.HTTPException):
-            member = await guild.fetch_member(member.id)
+        # Prefer the cached member (no REST round-trip) to keep the submit
+        # responsive; the member handed to the modal already carries current
+        # roles. Only the cache is consulted, so there's no extra latency.
+        member = guild.get_member(member.id) or member
 
         summary = await _verify_member_from_screenshot(
             member,
