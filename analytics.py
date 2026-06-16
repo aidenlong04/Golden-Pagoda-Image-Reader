@@ -173,18 +173,6 @@ def _init() -> None:
                 CREATE INDEX IF NOT EXISTS idx_events_user_guild
                     ON events(guild_id, user_id);
 
-                CREATE TABLE IF NOT EXISTS member_profiles (
-                    guild_id INTEGER NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    mastery_rank TEXT,
-                    in_game_name TEXT,
-                    platform TEXT,
-                    clan TEXT,
-                    last_verified_ts INTEGER,
-                    updated_ts INTEGER NOT NULL,
-                    PRIMARY KEY (guild_id, user_id)
-                );
-
                 CREATE TABLE IF NOT EXISTS member_titles (
                     guild_id INTEGER NOT NULL,
                     user_id INTEGER NOT NULL,
@@ -266,81 +254,6 @@ def record_verification(
             invalidate_summary_cache()
         except Exception:
             logger.exception("analytics: record failed")
-
-
-def upsert_member_profile(
-    *,
-    guild_id: int,
-    user_id: int,
-    mastery_rank: str | None = None,
-    in_game_name: str | None = None,
-    platform: str | None = None,
-    clan: str | None = None,
-    last_verified_ts: int | None = None,
-) -> None:
-    """Insert or update a durable per-member profile row.
-
-    Only non-None fields overwrite existing values (COALESCE), so a
-    partial update — e.g. the /profile mastery dropdown touching just
-    ``mastery_rank`` — never wipes the snapshot captured at verify time.
-    Fail-soft like :func:`record_verification`.
-    """
-    if _disabled:
-        return
-    with _lock:
-        _init()
-        if _disabled:
-            return
-        try:
-            with _connect() as conn:
-                conn.execute(
-                    "INSERT INTO member_profiles"
-                    " (guild_id, user_id, mastery_rank, in_game_name,"
-                    "  platform, clan, last_verified_ts, updated_ts)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-                    " ON CONFLICT(guild_id, user_id) DO UPDATE SET"
-                    "  mastery_rank=COALESCE(excluded.mastery_rank, mastery_rank),"
-                    "  in_game_name=COALESCE(excluded.in_game_name, in_game_name),"
-                    "  platform=COALESCE(excluded.platform, platform),"
-                    "  clan=COALESCE(excluded.clan, clan),"
-                    "  last_verified_ts=COALESCE(excluded.last_verified_ts, last_verified_ts),"
-                    "  updated_ts=excluded.updated_ts",
-                    (
-                        guild_id,
-                        user_id,
-                        mastery_rank,
-                        in_game_name,
-                        platform,
-                        clan,
-                        last_verified_ts,
-                        int(time.time()),
-                    ),
-                )
-                conn.commit()
-        except Exception:
-            logger.exception("analytics: upsert_member_profile failed")
-
-
-def get_member_profile(guild_id: int, user_id: int) -> dict | None:
-    """Return the stored per-member profile row as a dict, or None."""
-    if _disabled:
-        return None
-    with _lock:
-        _init()
-        if _disabled:
-            return None
-        try:
-            with _connect() as conn:
-                row = conn.execute(
-                    "SELECT mastery_rank, in_game_name, platform, clan,"
-                    " last_verified_ts, updated_ts FROM member_profiles"
-                    " WHERE guild_id=? AND user_id=?",
-                    (guild_id, user_id),
-                ).fetchone()
-                return dict(row) if row is not None else None
-        except Exception:
-            logger.exception("analytics: get_member_profile failed")
-            return None
 
 
 def award_title(
@@ -453,18 +366,19 @@ def revoke_title(*, guild_id: int, user_id: int, title: str) -> bool:
 def delete_member_data(*, guild_id: int, user_id: int) -> dict:
     """Erase a member's durable data when they leave the server.
 
-    Scoped strictly to ``(guild_id, user_id)``. Drops their profile row and
-    every awarded title, then anonymises their verification telemetry by
-    NULLing ``user_id`` on the ``events`` rows (the aggregate /status stats
-    only ever group by outcome/clan, so the counts stay exact while the
-    personal reference is gone). Also deletes any pending onboarding prompt.
-    Fail-soft like the rest of the module.
+    Scoped strictly to ``(guild_id, user_id)``. Drops every awarded title,
+    then anonymises their verification telemetry by NULLing ``user_id`` on
+    the ``events`` rows (the aggregate /status stats only ever group by
+    outcome/clan, so the counts stay exact while the personal reference is
+    gone). Also deletes any pending onboarding prompt. The member's profile
+    fields live in the records channel, not here. Fail-soft like the rest of
+    the module.
 
-    Returns a small audit dict ``{"profiles", "titles", "events_anonymized",
+    Returns a small audit dict ``{"titles", "events_anonymized",
     "onboarding"}`` with the number of rows touched in each table (all zero
     when disabled).
     """
-    out = {"profiles": 0, "titles": 0, "events_anonymized": 0, "onboarding": 0}
+    out = {"titles": 0, "events_anonymized": 0, "onboarding": 0}
     if _disabled:
         return out
     with _lock:
@@ -475,16 +389,10 @@ def delete_member_data(*, guild_id: int, user_id: int) -> dict:
             with _connect() as conn:
                 # The connection is autocommit (isolation_level=None), so an
                 # explicit transaction is required to make the purge atomic —
-                # otherwise a crash mid-delete could drop the profile while
-                # leaving the member's titles / telemetry behind.
+                # otherwise a crash mid-delete could drop the titles while
+                # leaving the member's telemetry behind.
                 conn.execute("BEGIN")
                 try:
-                    cur = conn.execute(
-                        "DELETE FROM member_profiles"
-                        " WHERE guild_id=? AND user_id=?",
-                        (guild_id, user_id),
-                    )
-                    profiles = cur.rowcount or 0
                     cur = conn.execute(
                         "DELETE FROM member_titles"
                         " WHERE guild_id=? AND user_id=?",
@@ -508,11 +416,10 @@ def delete_member_data(*, guild_id: int, user_id: int) -> dict:
                     conn.execute("ROLLBACK")
                     raise
                 # Only report counts once the whole purge has committed.
-                out["profiles"] = profiles
                 out["titles"] = titles
                 out["events_anonymized"] = events
                 out["onboarding"] = onboarding
-            if out["events_anonymized"] or out["profiles"] or out["titles"]:
+            if out["events_anonymized"] or out["titles"]:
                 invalidate_summary_cache()
         except Exception:
             logger.exception("analytics: delete_member_data failed")

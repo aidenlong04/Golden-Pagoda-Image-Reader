@@ -12,9 +12,6 @@ import sys
 import time
 import warnings
 from collections.abc import Callable, Iterable
-from datetime import timedelta
-
-from pathlib import Path
 from typing import NamedTuple
 
 # Suppress discord.py's audioop DeprecationWarning on Python 3.12. The bot
@@ -911,12 +908,10 @@ async def _member_profile_info_lines(
     role_ids = {r.id for r in member.roles}
     rows: list[tuple] = []
 
-    # Durable per-member store: the exact picked/OCR'd Mastery Rank lives
-    # here (Discord roles only carry coarse buckets), so prefer it for the
-    # Mastery Rank row when present.
-    stored = await asyncio.to_thread(
-        analytics.get_member_profile, member.guild.id, member.id
-    )
+    # The records channel is the source of truth for the exact picked/OCR'd
+    # Mastery Rank (Discord roles only carry coarse buckets), so prefer it for
+    # the Mastery Rank row when present.
+    stored = await _member_profile_from_records(member.guild.id, member.id)
     mastery_override = (stored or {}).get("mastery_rank")
 
     # Clan — match the member's clan role to its slot for name + emoji.
@@ -1017,54 +1012,13 @@ async def _member_profile_info_lines(
 
 
 async def _member_in_game_name(member: discord.Member) -> str | None:
-    """Return the member's stored in-game handle (e.g. ``PlayerName#123``)
-    from the durable profile store, or ``None`` when no readable scan has
-    been recorded. Used as the /profile card headline (the server nickname
-    becomes a small subtitle beneath it)."""
-    stored = await asyncio.to_thread(
-        analytics.get_member_profile, member.guild.id, member.id
-    )
+    """Return the member's in-game handle (e.g. ``PlayerName#123``) from their
+    record in the records channel, or ``None`` when no readable scan has been
+    recorded. Used as the /profile card headline (the server nickname becomes
+    a small subtitle beneath it)."""
+    stored = await _member_profile_from_records(member.guild.id, member.id)
     name = (stored or {}).get("in_game_name")
     return name.strip() if isinstance(name, str) and name.strip() else None
-
-
-async def _sync_member_profile_from_roles(member: discord.Member) -> None:
-    """Update the durable member store to match the member's current roles.
-
-    Reads the member's clan + platform straight from their Discord roles and
-    upserts them into the per-member profile store so the stored snapshot
-    tracks role changes (a member who switched clan/platform sees the change
-    reflected without re-submitting a screenshot). Only non-None fields are
-    written (COALESCE), so a member with no clan/platform role never wipes a
-    previous good snapshot. Fail-soft + off the event loop.
-    """
-    role_ids = {r.id for r in member.roles}
-
-    clan: str | None = None
-    slot = next(
-        (s for s in CLAN_SLOTS if s.role_id and s.role_id in role_ids),
-        None,
-    )
-    if slot is not None and slot.clan_name:
-        clan = _strip_clan_tag(slot.clan_name) or None
-
-    member_platform = next(
-        (
-            p for p, rid in PLATFORM_ROLE_IDS.items()
-            if rid and rid in role_ids
-        ),
-        None,
-    )
-
-    if clan is None and member_platform is None:
-        return
-    await asyncio.to_thread(
-        analytics.upsert_member_profile,
-        guild_id=member.guild.id,
-        user_id=member.id,
-        platform=member_platform,
-        clan=clan,
-    )
 
 
 # Categories a member can self-assign via the help channel; surfaced as
@@ -1324,10 +1278,10 @@ async def _clear_member_data_on_leave(
     clear" policy). Runs off the event loop and never raises so a gateway
     member-remove event can't crash the bot.
 
-    Deletes their stored profile + awarded titles and anonymises their
-    verification telemetry (see :func:`analytics.delete_member_data`). The
-    rendered profile/progress cards hold no persisted state of their own, so
-    clearing the store leaves nothing behind to reference.
+    Deletes their awarded titles + onboarding prompt and anonymises their
+    verification telemetry (see :func:`analytics.delete_member_data`). Their
+    profile fields live in the records channel, and the rendered cards hold
+    no persisted state of their own, so this leaves nothing dangling here.
     """
     try:
         result = await asyncio.to_thread(
@@ -1340,17 +1294,17 @@ async def _clear_member_data_on_leave(
             "on-leave clear failed for %s (guild %s)", user_id, guild_id
         )
         return
-    if result.get("profiles") or result.get("titles") or result.get(
-        "events_anonymized"
+    if result.get("titles") or result.get("events_anonymized") or result.get(
+        "onboarding"
     ):
         logger.info(
             "on-leave clear: %s (%s) left guild %s \u2014 removed "
-            "profile=%d titles=%d, anonymised events=%d",
+            "titles=%d onboarding=%d, anonymised events=%d",
             label,
             user_id,
             guild_id,
-            result.get("profiles", 0),
             result.get("titles", 0),
+            result.get("onboarding", 0),
             result.get("events_anonymized", 0),
         )
 
@@ -1372,6 +1326,37 @@ async def on_member_remove(member: discord.Member) -> None:
     _spawn_bg_task(
         _clear_member_data_on_leave(guild.id, member.id, str(label))
     )
+
+
+@client.event
+async def on_member_update(
+    before: discord.Member, after: discord.Member
+) -> None:
+    """Keep a member's canonical record in sync when their profile-relevant
+    roles change (clan / platform / mastery bucket / syndicate).
+
+    Editing the record message doesn't itself fire ``on_member_update``, so
+    there's no feedback loop. Only fires when a *tracked* role actually
+    changed, and only refreshes an **existing** record — a bare role edit
+    never creates one (records are born at verify / onboarding time).
+    Fail-soft.
+    """
+    tracked = _tracked_role_ids()
+    if not tracked:
+        return
+    if ({r.id for r in before.roles} & tracked) == (
+        {r.id for r in after.roles} & tracked
+    ):
+        return
+    try:
+        ids = await asyncio.to_thread(
+            records_index.get_record_message_ids, after.id
+        )
+    except Exception:
+        ids = []
+    if not ids:
+        return
+    _spawn_bg_task(_edit_or_create_member_record(after))
 
 
 # ---------- Member onboarding flow ------------------------------------------
@@ -1761,10 +1746,10 @@ async def _onboarding_route_manual_review(
     # Drop the clan-select dropdown from the original welcome prompt so it
     # can't be re-submitted (banner + welcome line are preserved).
     await _remove_onboarding_dropdown(member.guild.id, member.id)
-    # Post a member record (the uploaded screenshot, if any) to the records
-    # channel so staff have a record of the pending case.
+    # Maintain the member's canonical record (the uploaded screenshot, if any)
+    # in the records channel so staff have a record of the pending case.
     _spawn_bg_task(
-        _post_member_record(
+        _edit_or_create_member_record(
             member,
             extra_lines=[f"Manual review pending — {reason}"],
             image_bytes=image_bytes,
@@ -2046,9 +2031,9 @@ class _OnboardingVerifyModal(discord.ui.Modal):
         # Welcome-only response: post the public "Welcome to the Golden Pagoda"
         # message to the server-entry channel (no ephemeral confirmation).
         await _post_onboarding_pass_welcome(member)
-        # Post a member record (the member's full profile) to the records
-        # ("profile-log") channel (fire-and-forget).
-        _spawn_bg_task(_post_member_record(
+        # Maintain the member's canonical record (their full profile) in the
+        # records ("profile-log") channel (fire-and-forget).
+        _spawn_bg_task(_edit_or_create_member_record(
             member,
             in_game_name=result.in_game_name,
             mastery_rank=result.mastery_rank,
@@ -2161,7 +2146,126 @@ def _build_member_record_components(
     ]
 
 
-async def _post_member_record(
+async def _create_member_record(
+    member: discord.Member,
+    summary_lines: list[str],
+    *,
+    image_bytes: bytes | None = None,
+) -> None:
+    """Post a new member record to MEMBER_RECORDS_CHANNEL_ID and index it.
+
+    Uses the member's uploaded screenshot as the record image
+    (``image_bytes``); when none is available, posts text-only with the media
+    gallery stripped. Fail-soft.
+    """
+    if not MEMBER_RECORDS_CHANNEL_ID:
+        return
+    components = _build_member_record_components(member, summary_lines)
+    if image_bytes:
+        message_id = await _post_channel_v2_with_file(
+            MEMBER_RECORDS_CHANNEL_ID,
+            components,
+            file_bytes=image_bytes,
+            file_name="record.png",
+        )
+    else:
+        # No screenshot; strip the media gallery and post text-only.
+        text_components = [c for c in components if c.get("type") != 12]
+        message_id = await _post_channel_v2(
+            MEMBER_RECORDS_CHANNEL_ID, text_components
+        )
+    logger.info(
+        "records: posted member record for %s to channel %s",
+        member.id, MEMBER_RECORDS_CHANNEL_ID,
+    )
+    # Keep the user_id -> record message_ids index fresh for fast lookups
+    # (records_index). File IO runs off the event loop.
+    if message_id is not None:
+        _spawn_bg_task(asyncio.to_thread(
+            records_index.add_record,
+            member.id,
+            message_id,
+            channel_id=MEMBER_RECORDS_CHANNEL_ID,
+        ))
+
+
+async def _edit_channel_message_v2(
+    channel_id: int,
+    message_id: int,
+    components: list[dict],
+    *,
+    keep_attachment_ids: list[int] | None = None,
+) -> None:
+    """PATCH an existing V2 message's components without re-uploading a file.
+
+    For role-change edits that only rewrite the container text. When the
+    message carries an attachment that the new components still reference
+    (``attachment://record.png``), pass its id in ``keep_attachment_ids`` so
+    Discord retains it instead of dropping it. Fail-soft.
+    """
+    from discord.http import Route
+
+    payload: dict = {
+        "flags": COMPONENTS_V2_FLAG,
+        "components": components,
+        "allowed_mentions": {"parse": []},
+    }
+    if keep_attachment_ids is not None:
+        payload["attachments"] = [{"id": int(a)} for a in keep_attachment_ids]
+    try:
+        await client.http.request(
+            Route(
+                "PATCH",
+                "/channels/{channel_id}/messages/{message_id}",
+                channel_id=channel_id,
+                message_id=message_id,
+            ),
+            json=payload,
+        )
+    except discord.HTTPException:
+        logger.exception("records: failed to edit message %s", message_id)
+
+
+async def _edit_member_record(
+    channel_id: int,
+    message_id: int,
+    member: discord.Member,
+    summary_lines: list[str],
+    *,
+    image_bytes: bytes | None = None,
+) -> None:
+    """Edit an existing member record in place.
+
+    With a new screenshot, swaps the attachment via a multipart PATCH; without
+    one, rewrites only the container text and retains whatever attachment the
+    record already has (so the image survives a role-change edit). Fail-soft.
+    """
+    components = _build_member_record_components(member, summary_lines)
+    if image_bytes:
+        await _edit_message_v2_with_file(
+            channel_id=channel_id,
+            message_id=message_id,
+            components=components,
+            file_bytes=image_bytes,
+            file_name="record.png",
+        )
+        return
+    existing = await _fetch_record_message(channel_id, message_id)
+    attachment_ids = [
+        int(a["id"])
+        for a in (existing or {}).get("attachments", [])
+        if isinstance(a, dict) and a.get("id") is not None
+    ]
+    if not attachment_ids:
+        # The record was posted text-only; keep it that way.
+        components = [c for c in components if c.get("type") != 12]
+    await _edit_channel_message_v2(
+        channel_id, message_id, components,
+        keep_attachment_ids=attachment_ids or None,
+    )
+
+
+async def _edit_or_create_member_record(
     member: discord.Member,
     *,
     in_game_name: str | None = None,
@@ -2169,58 +2273,57 @@ async def _post_member_record(
     extra_lines: list[str] | None = None,
     image_bytes: bytes | None = None,
 ) -> None:
-    """Post a member record (the member's full profile) to
-    MEMBER_RECORDS_CHANNEL_ID — the records ("profile-log") channel that is
-    the source of truth for member profile data.
+    """Maintain a member's single canonical record in the records
+    ("profile-log") channel — the source of truth for member profile data.
 
     The body is the member's complete profile (in-game name + clan + platform
     + mastery + syndicate), derived from their current roles plus the OCR-only
     fields (``in_game_name`` / ``mastery_rank``), with any ``extra_lines``
-    (e.g. a manual-review note) appended. Uses the screenshot the member
-    uploaded as the record image (``image_bytes``); when none is available
-    (e.g. the manual-review path), posts a text-only record with the media
-    gallery stripped.
+    (e.g. a manual-review note) appended. Edits the existing record in place
+    when one exists; posts a new one only when none does. Invalidates the
+    record-profile TTL cache so reads see the change immediately.
 
-    Fail-soft: exceptions are logged but never propagate (this is called as a
-    background task from the onboarding success / manual-review paths).
+    Fail-soft: exceptions are logged but never propagate (called as a
+    background task from the onboarding / re-verify / role-change paths).
     """
     if not MEMBER_RECORDS_CHANNEL_ID:
         return
     try:
+        # Preserve the OCR-only fields (in-game handle + exact Mastery Rank)
+        # from the existing record when the caller didn't supply them — a
+        # role-change refresh must not clobber data that isn't role-derivable.
+        if in_game_name is None or mastery_rank is None:
+            existing = await _member_profile_from_records(
+                member.guild.id, member.id
+            )
+            if existing:
+                if in_game_name is None:
+                    in_game_name = existing.get("in_game_name")
+                if mastery_rank is None:
+                    mastery_rank = existing.get("mastery_rank")
         summary_lines = _member_record_profile_lines(
             member, in_game_name=in_game_name, mastery_rank=mastery_rank,
         )
         if extra_lines:
             summary_lines = summary_lines + list(extra_lines)
-        components = _build_member_record_components(member, summary_lines)
-        if image_bytes:
-            message_id = await _post_channel_v2_with_file(
-                MEMBER_RECORDS_CHANNEL_ID,
-                components,
-                file_bytes=image_bytes,
-                file_name="record.png",
+        ids = await asyncio.to_thread(
+            records_index.get_record_message_ids, member.id
+        )
+        channel_id = _records_channel_id()
+        if ids and channel_id:
+            await _edit_member_record(
+                channel_id, ids[-1], member, summary_lines,
+                image_bytes=image_bytes,
             )
         else:
-            # No screenshot; strip the media gallery and post text-only.
-            text_components = [c for c in components if c.get("type") != 12]
-            message_id = await _post_channel_v2(
-                MEMBER_RECORDS_CHANNEL_ID, text_components
+            await _create_member_record(
+                member, summary_lines, image_bytes=image_bytes,
             )
-        logger.info(
-            "onboarding: posted member record for %s to channel %s",
-            member.id, MEMBER_RECORDS_CHANNEL_ID,
-        )
-        # Keep the user_id -> record message_ids index fresh for fast
-        # lookups (records_index). File IO runs off the event loop.
-        if message_id is not None:
-            _spawn_bg_task(asyncio.to_thread(
-                records_index.add_record,
-                member.id,
-                message_id,
-                channel_id=MEMBER_RECORDS_CHANNEL_ID,
-            ))
+        _invalidate_record_profile_cache(member.guild.id, member.id)
     except Exception:
-        logger.exception("onboarding: _post_member_record failed for %s", member.id)
+        logger.exception(
+            "records: edit_or_create failed for %s", member.id
+        )
 
 
 def _member_record_jump_urls(guild_id: int, user_id: int) -> list[str]:
@@ -2245,6 +2348,170 @@ def _member_record_jump_urls(guild_id: int, user_id: int) -> list[str]:
         f"https://discord.com/channels/{guild_id}/{channel_id}/{mid}"
         for mid in ids
     ]
+
+
+# ---------- Records channel as the profile source of truth ------------------
+
+# The member-records ("profile-log") channel is the source of truth for the
+# two profile fields that aren't recoverable from Discord roles — the in-game
+# handle and the exact Mastery Rank. Instead of a durable SQLite cache, those
+# are read back by parsing the member's record message. A tiny in-memory TTL
+# cache keeps repeated reads (e.g. /profile then /manage) cheap without going
+# stale: dynamic edits invalidate the entry, and entries expire on their own.
+
+_RECORD_PROFILE_TTL_SECONDS = 60.0
+_record_profile_cache: dict[tuple[int, int], tuple[float, dict | None]] = {}
+
+# Maps a record body label to the profile dict key it populates. Mirrors the
+# lines emitted by :func:`_member_record_profile_lines`.
+_RECORD_PROFILE_LABELS = {
+    "in-game name": "in_game_name",
+    "mastery rank": "mastery_rank",
+    "clan": "clan",
+    "platform": "platform",
+    "syndicate": "syndicate",
+}
+
+# A record body line: "Key: **Value**", optionally prefixed by the "-# "
+# small-text marker the container uses.
+_RECORD_LINE_RE = re.compile(
+    r"^\s*(?:-#\s*)?([A-Za-z][\w \-]*?):\s*\*\*(.+?)\*\*\s*$",
+    re.MULTILINE,
+)
+
+# Discord epoch (2015-01-01) in ms, for deriving a timestamp from a snowflake.
+_DISCORD_EPOCH_MS = 1420070400000
+
+
+def _snowflake_ts(snowflake: int) -> int:
+    """Return the unix-seconds creation time encoded in a Discord snowflake."""
+    return int((((int(snowflake) >> 22) + _DISCORD_EPOCH_MS) / 1000))
+
+
+def _records_channel_id() -> int:
+    """Resolve the records channel id (records_index first, env fallback)."""
+    try:
+        cid = records_index.get_channel_id()
+    except Exception:
+        cid = None
+    return int(cid or MEMBER_RECORDS_CHANNEL_ID or 0)
+
+
+def _collect_v2_text(components: object) -> str:
+    """Walk a Components V2 tree and join every type-10 ``content`` string."""
+    parts: list[str] = []
+
+    def _walk(node: object) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == 10 and isinstance(node.get("content"), str):
+                parts.append(node["content"])
+            _walk(node.get("components"))
+            _walk(node.get("items"))
+        elif isinstance(node, list):
+            for child in node:
+                _walk(child)
+
+    _walk(components)
+    return "\n".join(parts)
+
+
+def _parse_record_profile_text(text: str) -> dict:
+    """Parse a record body's ``Key: **Value**`` lines into a profile dict.
+
+    Recognises the labels emitted by :func:`_member_record_profile_lines`.
+    The Mastery Rank value is kept only when it's an exact ``MR n`` / ``LR n``
+    rank (the OCR-exact override); a coarse role-bucket name is dropped so the
+    returned shape matches the old durable-store semantics (where
+    ``mastery_rank`` was always the exact rank or absent).
+    """
+    out: dict = {}
+    for m in _RECORD_LINE_RE.finditer(text or ""):
+        key = _RECORD_PROFILE_LABELS.get(m.group(1).strip().lower())
+        if not key or key in out:
+            continue
+        value = m.group(2).strip()
+        if key == "mastery_rank" and not re.match(
+            r"^(MR|LR)\s*\d+$", value, re.IGNORECASE
+        ):
+            continue
+        out[key] = value
+    return out
+
+
+async def _fetch_record_message(channel_id: int, message_id: int) -> dict | None:
+    """Fetch a single record message as raw JSON (so its V2 components are
+    readable). Fail-soft: returns None on NotFound / any HTTP error."""
+    from discord.http import Route
+
+    try:
+        data = await client.http.request(Route(
+            "GET",
+            "/channels/{channel_id}/messages/{message_id}",
+            channel_id=channel_id,
+            message_id=message_id,
+        ))
+        return data if isinstance(data, dict) else None
+    except discord.NotFound:
+        return None
+    except discord.HTTPException:
+        logger.debug(
+            "records: failed to fetch message %s", message_id, exc_info=True
+        )
+        return None
+
+
+async def _read_member_profile_from_records(
+    guild_id: int, user_id: int
+) -> dict | None:
+    """Read a member's profile (in-game name + exact mastery, plus the
+    role-derived clan/platform snapshot) from their newest record message.
+
+    Returns a dict shaped like the old durable store
+    (``in_game_name`` / ``mastery_rank`` / ``platform`` / ``clan`` /
+    ``last_verified_ts``) or None when no record exists / can't be read.
+    """
+    channel_id = _records_channel_id()
+    if not channel_id:
+        return None
+    try:
+        ids = await asyncio.to_thread(
+            records_index.get_record_message_ids, user_id
+        )
+    except Exception:
+        ids = []
+    if not ids:
+        return None
+    message_id = ids[-1]  # newest appended last
+    data = await _fetch_record_message(channel_id, message_id)
+    if not data:
+        return None
+    parsed = _parse_record_profile_text(
+        _collect_v2_text(data.get("components") or [])
+    )
+    if not parsed:
+        return None
+    parsed.setdefault("last_verified_ts", _snowflake_ts(message_id))
+    return parsed
+
+
+async def _member_profile_from_records(
+    guild_id: int, user_id: int
+) -> dict | None:
+    """Records-backed replacement for the old durable-store read, with a
+    short-lived in-memory TTL cache."""
+    cache_key = (guild_id, user_id)
+    now = time.monotonic()
+    cached = _record_profile_cache.get(cache_key)
+    if cached is not None and (now - cached[0]) < _RECORD_PROFILE_TTL_SECONDS:
+        return cached[1]
+    profile = await _read_member_profile_from_records(guild_id, user_id)
+    _record_profile_cache[cache_key] = (now, profile)
+    return profile
+
+
+def _invalidate_record_profile_cache(guild_id: int, user_id: int) -> None:
+    """Drop a member's cached record profile so the next read re-fetches."""
+    _record_profile_cache.pop((guild_id, user_id), None)
 
 
 async def _handle_onboarding_interaction(
@@ -3090,14 +3357,13 @@ def _button_emoji_from_literal(raw: str | None) -> dict | None:
 
 
 async def _manage_snapshot(guild_id: int, user_id: int) -> dict:
-    """Gather a member's durable store rows for the /manage panel.
+    """Gather a member's profile + titles for the /manage panel.
 
-    Reads the profile row + awarded titles off the event loop (SQLite),
-    fail-soft via the analytics layer. Returns ``{"profile", "titles"}``.
+    Reads the profile from the records channel (source of truth) and the
+    awarded titles off the event loop (SQLite), fail-soft. Returns
+    ``{"profile", "titles", "records"}``.
     """
-    profile = await asyncio.to_thread(
-        analytics.get_member_profile, guild_id, user_id
-    )
+    profile = await _member_profile_from_records(guild_id, user_id)
     titles = await asyncio.to_thread(
         analytics.list_member_titles, guild_id, user_id
     )
@@ -3184,21 +3450,16 @@ async def _apply_platform_role(
     except discord.HTTPException:
         logger.exception("manage: platform role swap failed")
         return "error"
-    await asyncio.to_thread(
-        analytics.upsert_member_profile,
-        guild_id=member.guild.id,
-        user_id=member.id,
-        platform=platform,
-    )
     return "assigned"
 
 
 async def _apply_clan_slot(member: discord.Member, slot: "ClanSlot") -> str:
     """Assign ``member`` the role for clan ``slot`` (removing any other
-    configured clan roles) and persist the clan name to the store.
+    configured clan roles).
 
     Returns ``"assigned"``, ``"no_match"`` (slot has no resolvable role), or
-    ``"error"`` (role edit failed).
+    ``"error"`` (role edit failed). The role change refreshes the member's
+    record via ``on_member_update``.
     """
     target = member.guild.get_role(slot.role_id) if slot.role_id else None
     if target is None:
@@ -3216,12 +3477,6 @@ async def _apply_clan_slot(member: discord.Member, slot: "ClanSlot") -> str:
     except discord.HTTPException:
         logger.exception("manage: clan role swap failed")
         return "error"
-    await asyncio.to_thread(
-        analytics.upsert_member_profile,
-        guild_id=member.guild.id,
-        user_id=member.id,
-        clan=_strip_clan_tag(slot.clan_name or "") or None,
-    )
     return "assigned"
 
 
@@ -3610,15 +3865,14 @@ def _manage_components(
         has_profile = "yes" if profile else "no"
         lines = [
             "**Stored data**",
-            f"-# Profile row: `{has_profile}`",
+            f"-# Profile (records channel): `{has_profile}`",
             f"-# Titles: `{len(titles)}`",
             "",
         ]
         action_row: dict | None = None
         if cleared is not None:
             lines.append(
-                "-# \u2705 Cleared \u2014 removed profile "
-                f"({cleared.get('profiles', 0)}) + titles "
+                "-# \u2705 Cleared \u2014 removed titles "
                 f"({cleared.get('titles', 0)}); anonymised "
                 f"{cleared.get('events_anonymized', 0)} telemetry rows."
             )
@@ -3626,9 +3880,9 @@ def _manage_components(
         elif confirm_clear:
             accent = ACCENT_FAIL
             lines.append(
-                f"-# \u26A0\uFE0F This permanently deletes **{name}**'s stored "
-                "profile + titles and anonymises their telemetry. Roles are "
-                "NOT touched. This can't be undone."
+                f"-# \u26A0\uFE0F This permanently deletes **{name}**'s titles "
+                "and anonymises their telemetry. Roles are NOT touched. This "
+                "can't be undone."
             )
             action_row = {"type": 1, "components": [
                 {"type": 2, "style": 4, "label": "Confirm clear",
@@ -3740,10 +3994,10 @@ async def _handle_manage_interaction(
         )
         logger.info(
             "manage: admin %s cleared data for %s in guild %s \u2014 "
-            "profile=%d titles=%d events=%d",
+            "titles=%d onboarding=%d events=%d",
             user.id, member_id, guild.id,
-            result.get("profiles", 0),
             result.get("titles", 0),
+            result.get("onboarding", 0),
             result.get("events_anonymized", 0),
         )
         snap = await _manage_snapshot(guild.id, member_id)
@@ -3849,9 +4103,7 @@ async def _handle_manage_interaction(
 
     if action == "ign":
         try:
-            stored = await asyncio.to_thread(
-                analytics.get_member_profile, guild.id, member_id
-            )
+            stored = await _member_profile_from_records(guild.id, member_id)
             await interaction.response.send_modal(_ManageIGNModal(
                 member=member, current=(stored or {}).get("in_game_name"),
             ))
@@ -3906,10 +4158,9 @@ async def _handle_manage_interaction(
         if kind in ("MR", "LR") and num.isdigit() and int(num) > 0:
             value = int(num)
             status = await _apply_mastery_bucket(member, kind, value)
-            await asyncio.to_thread(
-                analytics.upsert_member_profile,
-                guild_id=guild.id, user_id=member_id,
-                mastery_rank=f"{kind} {value}",
+            # Persist the exact rank to the record (not role-derivable).
+            await _edit_or_create_member_record(
+                member, mastery_rank=f"{kind} {value}",
             )
             disp = _format_mastery_display(f"{kind} {value}")
             note = {
@@ -4222,13 +4473,10 @@ class _MasteryEditorView(discord.ui.View):
             return
 
         status = await _apply_mastery_bucket(self.member, kind, value)
-        # Persist synchronously (off-loop) so the re-render below reads the
-        # freshly stored override instead of racing the write.
-        await asyncio.to_thread(
-            analytics.upsert_member_profile,
-            guild_id=self.member.guild.id,
-            user_id=self.member.id,
-            mastery_rank=f"{kind} {value}",
+        # Persist the exact rank to the record (source of truth) and await it
+        # so the re-render below reads the fresh value instead of racing.
+        await _edit_or_create_member_record(
+            self.member, mastery_rank=f"{kind} {value}",
         )
         info = await _member_profile_info_lines(self.member)
         png = await _run_heavy(
@@ -4343,6 +4591,15 @@ class _ScreenshotVerifyModal(discord.ui.Modal):
         # cached member.roles lags the role-add gateway event).
         with contextlib.suppress(discord.HTTPException):
             member = await member.guild.fetch_member(member.id)
+
+        # Refresh the member's canonical record (now that roles are fresh).
+        if summary:
+            _spawn_bg_task(_edit_or_create_member_record(
+                member,
+                in_game_name=result.in_game_name,
+                mastery_rank=result.mastery_rank,
+                image_bytes=image_bytes,
+            ))
 
         info = await _member_profile_info_lines(member)
         in_game_name = await _member_in_game_name(member)
@@ -4470,12 +4727,7 @@ class _ManageIGNModal(discord.ui.Modal):
         member = self._gp_member
         value = (self.ign.value or "").strip()
         if value:
-            await asyncio.to_thread(
-                analytics.upsert_member_profile,
-                guild_id=member.guild.id,
-                user_id=member.id,
-                in_game_name=value,
-            )
+            await _edit_or_create_member_record(member, in_game_name=value)
         # Refresh the Edit page in place (the modal submit is a fresh
         # interaction, so ack as a deferred update then PATCH @original).
         with contextlib.suppress(discord.HTTPException):
@@ -4564,6 +4816,20 @@ class _ManageScreenshotModal(discord.ui.Modal):
         )
         summary = result.summary
 
+        # Re-fetch so the record + panel reflect freshly assigned roles.
+        with contextlib.suppress(discord.HTTPException):
+            member = await member.guild.fetch_member(member.id)
+
+        # Refresh the member's canonical record before re-reading it for the
+        # panel (await so the snapshot below sees the new data).
+        if summary:
+            await _edit_or_create_member_record(
+                member,
+                in_game_name=result.in_game_name,
+                mastery_rank=result.mastery_rank,
+                image_bytes=image_bytes,
+            )
+
         # Refresh the /manage Overview page in place so the stored-profile
         # block reflects whatever the screenshot just wrote.
         with contextlib.suppress(Exception):
@@ -4603,15 +4869,15 @@ async def _verify_member_from_screenshot(
     member: discord.Member, *, image_bytes: bytes,
     filename: str, content_type: str,
 ) -> _VerifyResult:
-    """OCR a Warframe profile screenshot and assign/store every field we can
-    for ``member``: in-game name + clan role + mastery rank.
+    """OCR a Warframe profile screenshot and assign every role we can for
+    ``member`` (clan + mastery bucket), returning the parsed in-game name +
+    exact mastery rank for the caller to write into the member's record.
 
-    Shares the OCR + parse pipeline (``_ocr_profile_fields``) and storage
-    snapshot shape (``upsert_member_profile``) with the channel verification
-    flow, but scoped to a single member's self-service: no reactions, no
-    public reply, no verify/incomplete role gating. Returns human-readable
-    summary lines describing what was updated; an empty list means the
-    screenshot couldn't be read.
+    Shares the OCR + parse pipeline (``_ocr_profile_fields``) with the
+    onboarding + /manage flows, but scoped to a single member's self-service:
+    no reactions, no public reply, no verify/incomplete role gating. Returns
+    a ``_VerifyResult`` whose ``summary`` describes what was updated; an empty
+    summary means the screenshot couldn't be read.
     """
     try:
         probe = Image.open(io.BytesIO(image_bytes))
@@ -4631,10 +4897,8 @@ async def _verify_member_from_screenshot(
     mastery_rank = fields.mastery_rank
 
     summary: list[str] = []
-    store: dict = {}
 
     if profile_name:
-        store["in_game_name"] = profile_name
         summary.append(f"In-game name: **{_strip_clan_tag(profile_name)}**")
 
     if clan_name:
@@ -4644,7 +4908,6 @@ async def _verify_member_from_screenshot(
             _changed, status = await _add_role(
                 member, role, "Profile screenshot self-verification"
             )
-            store["clan"] = clan_label
             summary.append(f"Clan: {status}")
         else:
             summary.append(
@@ -4652,7 +4915,6 @@ async def _verify_member_from_screenshot(
             )
 
     if mastery_rank:
-        store["mastery_rank"] = mastery_rank
         m = re.match(r"\s*(MR|LR)\s*(\d+)", mastery_rank, re.IGNORECASE)
         if m:
             kind = m.group(1).upper()
@@ -4667,15 +4929,6 @@ async def _verify_member_from_screenshot(
                 )
         else:
             summary.append(f"Mastery Rank: **{mastery_rank}**")
-
-    if store:
-        await asyncio.to_thread(
-            analytics.upsert_member_profile,
-            guild_id=member.guild.id,
-            user_id=member.id,
-            last_verified_ts=int(time.time()),
-            **store,
-        )
 
     return _VerifyResult(summary, profile_name, mastery_rank)
 
@@ -4787,9 +5040,6 @@ async def profile_cmd(
     # Platform / Mastery / Syndicate) without the progress bar.
     try:
         await interaction.response.defer(ephemeral=ephemeral)
-        # Mirror the member's current roles into the durable store so the
-        # card (and stored snapshot) tracks any clan/platform changes.
-        await _sync_member_profile_from_roles(target)
         info = await _member_profile_info_lines(target)
         in_game_name = await _member_in_game_name(target)
         avatar_bytes = await _fetch_avatar_bytes(avatar_url)

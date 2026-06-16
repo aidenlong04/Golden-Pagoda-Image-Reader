@@ -322,7 +322,7 @@ class MemberProfileInfoLinesTests(unittest.TestCase):
         orig_plat = b.PLATFORM_ROLE_IDS
         orig_syn = b.SYNDICATE_ROLE_IDS
         orig_fetch = b._fetch_emoji_bytes
-        orig_get = b.analytics.get_member_profile
+        orig_get = b._member_profile_from_records
         orig_titles = b.analytics.list_member_titles
         # Map the configured MR ids onto the fake roles by name order.
         b.MR_ROLE_IDS = [
@@ -333,9 +333,11 @@ class MemberProfileInfoLinesTests(unittest.TestCase):
         b.PLATFORM_ROLE_IDS = {}
         b.SYNDICATE_ROLE_IDS = []
         b._fetch_emoji_bytes = _fake_fetch
-        b.analytics.get_member_profile = lambda *a, **k: (
-            {"mastery_rank": stored} if stored else None
-        )
+
+        async def _fake_profile(*a, **k):
+            return {"mastery_rank": stored} if stored else None
+
+        b._member_profile_from_records = _fake_profile
         b.analytics.list_member_titles = lambda *a, **k: []
         try:
             rows = asyncio.run(b._member_profile_info_lines(member))
@@ -345,7 +347,7 @@ class MemberProfileInfoLinesTests(unittest.TestCase):
             b.PLATFORM_ROLE_IDS = orig_plat
             b.SYNDICATE_ROLE_IDS = orig_syn
             b._fetch_emoji_bytes = orig_fetch
-            b.analytics.get_member_profile = orig_get
+            b._member_profile_from_records = orig_get
             b.analytics.list_member_titles = orig_titles
 
         mr = next((r for r in rows if r[0] == "Mastery Rank"), None)
@@ -462,7 +464,7 @@ class ManagePanelTests(unittest.TestCase):
 
     def test_cleared_state_reports_counts_and_drops_clear(self):
         snap = {"profile": None, "titles": []}
-        cleared = {"profiles": 1, "titles": 2, "events_anonymized": 3}
+        cleared = {"titles": 2, "events_anonymized": 3, "onboarding": 0}
         comps = self.b._manage_components(
             5, Mock(display_name="X"), self.b._MANAGE_DATA_PAGE, snap,
             cleared=cleared,
@@ -535,7 +537,7 @@ class OnLeaveClearTests(unittest.TestCase):
         def _fake_delete(*, guild_id, user_id):
             captured["guild_id"] = guild_id
             captured["user_id"] = user_id
-            return {"profiles": 1, "titles": 0, "events_anonymized": 2}
+            return {"titles": 0, "events_anonymized": 2, "onboarding": 0}
 
         orig = self.b.analytics.delete_member_data
         self.b.analytics.delete_member_data = _fake_delete
@@ -953,7 +955,7 @@ class ManageComponentsCharacterizationTests(unittest.TestCase):
         self.assertIn(f"manage:42:p:{self.b._MANAGE_DATA_PAGE}", ids)
 
     def test_data_page_cleared_shows_no_action_buttons(self):
-        cleared = {"profiles": 1, "titles": 1, "events_anonymized": 3}
+        cleared = {"titles": 1, "events_anonymized": 3, "onboarding": 0}
         result = self.b._manage_components(
             42, self.member, self.b._MANAGE_DATA_PAGE, self.snap,
             cleared=cleared,

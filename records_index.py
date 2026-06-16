@@ -23,8 +23,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Env-configurable to match the other ./data state paths (CATCHUP_STATE_PATH,
-# HEALTH_PATH, ANALYTICS_DB_PATH). Default lives under ./data.
+# Env-configurable to match the other ./data state paths (HEALTH_PATH,
+# ANALYTICS_DB_PATH). Default lives under ./data.
 RECORDS_INDEX_PATH = Path(
     os.getenv("RECORDS_INDEX_PATH", "./data/records_index.json")
 )

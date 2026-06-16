@@ -55,53 +55,6 @@ def test_disabled_when_path_unwritable(tmp_path, monkeypatch):
     assert s["total"] == 0
 
 
-def test_member_profile_roundtrip(analytics_module):
-    a = analytics_module
-    a.upsert_member_profile(
-        guild_id=2, user_id=5,
-        mastery_rank="MR 12", in_game_name="Tenno",
-        platform="PC", clan="Golden Pagoda", last_verified_ts=1000,
-    )
-    p = a.get_member_profile(2, 5)
-    assert p is not None
-    assert p["mastery_rank"] == "MR 12"
-    assert p["in_game_name"] == "Tenno"
-    assert p["platform"] == "PC"
-    assert p["clan"] == "Golden Pagoda"
-    assert p["last_verified_ts"] == 1000
-    assert p["updated_ts"] >= 0
-
-
-def test_member_profile_partial_update_preserves_fields(analytics_module):
-    a = analytics_module
-    a.upsert_member_profile(
-        guild_id=2, user_id=5,
-        mastery_rank="MR 12", in_game_name="Tenno",
-        platform="PC", clan="Golden Pagoda", last_verified_ts=1000,
-    )
-    # A mastery-only edit (e.g. the /profile dropdown) must not wipe the
-    # rest of the snapshot.
-    a.upsert_member_profile(guild_id=2, user_id=5, mastery_rank="LR 3")
-    p = a.get_member_profile(2, 5)
-    assert p["mastery_rank"] == "LR 3"
-    assert p["in_game_name"] == "Tenno"
-    assert p["platform"] == "PC"
-    assert p["clan"] == "Golden Pagoda"
-    assert p["last_verified_ts"] == 1000
-
-
-def test_member_profile_missing_returns_none(analytics_module):
-    assert analytics_module.get_member_profile(2, 999) is None
-
-
-def test_member_profile_isolated_by_guild(analytics_module):
-    a = analytics_module
-    a.upsert_member_profile(guild_id=2, user_id=5, mastery_rank="MR 12")
-    a.upsert_member_profile(guild_id=3, user_id=5, mastery_rank="MR 30")
-    assert a.get_member_profile(2, 5)["mastery_rank"] == "MR 12"
-    assert a.get_member_profile(3, 5)["mastery_rank"] == "MR 30"
-
-
 def test_award_and_list_titles_roundtrip(analytics_module):
     a = analytics_module
     a.award_title(
@@ -196,24 +149,18 @@ def test_titles_fail_soft_when_disabled(tmp_path, monkeypatch):
     assert analytics.revoke_title(guild_id=2, user_id=5, title="boot licker") is False
 
 
-def test_delete_member_data_clears_profile_and_titles(analytics_module):
+def test_delete_member_data_clears_titles(analytics_module):
     a = analytics_module
-    a.upsert_member_profile(
-        guild_id=2, user_id=5, mastery_rank="MR 12",
-        in_game_name="Tenno", platform="PC", clan="Golden Pagoda",
-    )
     a.award_title(guild_id=2, user_id=5, title="boot licker")
     a.award_title(guild_id=2, user_id=5, title="Sharpshooter")
     a.record_verification(outcome="pass", user_id=5, guild_id=2)
     a.record_verification(outcome="fail", user_id=5, guild_id=2)
 
     result = a.delete_member_data(guild_id=2, user_id=5)
-    assert result["profiles"] == 1
     assert result["titles"] == 2
     assert result["events_anonymized"] == 2
 
-    # Profile + titles are gone; aggregate event count is preserved.
-    assert a.get_member_profile(2, 5) is None
+    # Titles are gone; aggregate event count is preserved.
     assert a.list_member_titles(2, 5) == []
     assert a.summary()["total"] == 2
 
@@ -249,23 +196,21 @@ def test_events_user_guild_index_exists(analytics_module):
 
 def test_delete_member_data_scoped_to_user_and_guild(analytics_module):
     a = analytics_module
-    a.upsert_member_profile(guild_id=2, user_id=5, mastery_rank="MR 12")
-    a.upsert_member_profile(guild_id=2, user_id=6, mastery_rank="MR 30")
-    a.upsert_member_profile(guild_id=3, user_id=5, mastery_rank="LR 1")
+    a.award_title(guild_id=2, user_id=5, title="clear me")
     a.award_title(guild_id=2, user_id=6, title="keep me")
+    a.award_title(guild_id=3, user_id=5, title="keep me too")
 
     a.delete_member_data(guild_id=2, user_id=5)
 
     # Only (guild 2, user 5) is cleared; the other rows are untouched.
-    assert a.get_member_profile(2, 5) is None
-    assert a.get_member_profile(2, 6)["mastery_rank"] == "MR 30"
-    assert a.get_member_profile(3, 5)["mastery_rank"] == "LR 1"
+    assert a.list_member_titles(2, 5) == []
     assert [t["title"] for t in a.list_member_titles(2, 6)] == ["keep me"]
+    assert [t["title"] for t in a.list_member_titles(3, 5)] == ["keep me too"]
 
 
 def test_delete_member_data_missing_is_zero(analytics_module):
     result = analytics_module.delete_member_data(guild_id=2, user_id=999)
-    assert result == {"profiles": 0, "titles": 0, "events_anonymized": 0, "onboarding": 0}
+    assert result == {"titles": 0, "events_anonymized": 0, "onboarding": 0}
 
 
 def test_delete_member_data_fail_soft_when_disabled(tmp_path, monkeypatch):
@@ -274,12 +219,11 @@ def test_delete_member_data_fail_soft_when_disabled(tmp_path, monkeypatch):
     importlib.reload(analytics)
     # Must not raise; returns the zeroed audit dict.
     result = analytics.delete_member_data(guild_id=2, user_id=5)
-    assert result == {"profiles": 0, "titles": 0, "events_anonymized": 0, "onboarding": 0}
+    assert result == {"titles": 0, "events_anonymized": 0, "onboarding": 0}
 
 
 def test_delete_member_data_is_atomic_on_failure(analytics_module, monkeypatch):
     a = analytics_module
-    a.upsert_member_profile(guild_id=2, user_id=5, mastery_rank="MR 12")
     a.award_title(guild_id=2, user_id=5, title="keep me")
     a.record_verification(outcome="pass", user_id=5, guild_id=2)
 
@@ -310,8 +254,7 @@ def test_delete_member_data_is_atomic_on_failure(analytics_module, monkeypatch):
     # connection; re-validate over a fresh real connection.
 
     # The whole purge must roll back: nothing reported, nothing deleted.
-    assert result == {"profiles": 0, "titles": 0, "events_anonymized": 0, "onboarding": 0}
-    assert a.get_member_profile(2, 5)["mastery_rank"] == "MR 12"
+    assert result == {"titles": 0, "events_anonymized": 0, "onboarding": 0}
     assert [t["title"] for t in a.list_member_titles(2, 5)] == ["keep me"]
     with a._connect() as conn:
         row = conn.execute(
