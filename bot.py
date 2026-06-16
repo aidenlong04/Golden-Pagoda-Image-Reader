@@ -2512,6 +2512,92 @@ def _onboarding_welcome_components(
     ]
 
 
+# Hard-coded assets for the public "verified" welcome posted on a successful
+# onboarding pass / admin manual verify (mirrors the design JSON supplied by
+# the maintainer).
+_PASS_WELCOME_ACCENT = 13938486
+_PASS_WELCOME_GIF = "https://i.imgur.com/a3aDbfQ.gif"
+_PASS_WELCOME_STAFF_ROLE_ID = 1361846841934610565
+_PASS_WELCOME_SELF_ROLES_URL = (
+    "https://discord.com/channels/1361846841905381629/1392582268769271950"
+)
+_PASS_WELCOME_SELF_ROLES_EMOJI = {
+    "id": "1416857239599317022", "name": "ExcalNod", "animated": True,
+}
+
+
+def _onboarding_pass_welcome_components(member_id: int) -> list[dict]:
+    """Build the public "Welcome to the Golden Pagoda" message shown when a
+    member passes onboarding or is manually verified by an admin."""
+    return [
+        {
+            "type": 17,
+            "accent_color": _PASS_WELCOME_ACCENT,
+            "spoiler": False,
+            "components": [
+                {
+                    "type": 10,
+                    "content": (
+                        f"## Welcome to the Golden Pagoda, <@{member_id}>."
+                    ),
+                },
+                {
+                    "type": 12,
+                    "items": [{"media": {"url": _PASS_WELCOME_GIF}}],
+                },
+                {
+                    "type": 10,
+                    "content": "```The Lotus has guided you here. ```",
+                },
+                {"type": 14, "spacing": 1},
+                {
+                    "type": 10,
+                    "content": (
+                        f"\n> Our <@&{_PASS_WELCOME_STAFF_ROLE_ID}>  will reach "
+                        "out to confirm your clan details and update your roles. "
+                        "(OR if normal onboarding completed)\"> Each clan within "
+                        "the alliance walks a different path — but all serve the "
+                        "Origin System.\"\n"
+                    ),
+                },
+                {"type": 14, "divider": True, "spacing": 2},
+                {
+                    "type": 10,
+                    "content": (
+                        "-# *\"The Tenno are warriors, but they are not alone.\"*"
+                        " — The Lotus"
+                    ),
+                },
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 2,
+                            "style": 5,
+                            "label": "Self Roles",
+                            "emoji": _PASS_WELCOME_SELF_ROLES_EMOJI,
+                            "url": _PASS_WELCOME_SELF_ROLES_URL,
+                        }
+                    ],
+                },
+            ],
+        }
+    ]
+
+
+async def _post_onboarding_pass_welcome(member: discord.Member) -> None:
+    """Post the public verified-welcome to the server-entry channel."""
+    if ONBOARDING_CHANNEL_ID <= 0:
+        return
+    components = _onboarding_pass_welcome_components(member.id)
+    with contextlib.suppress(Exception):
+        await _post_channel_v2(
+            ONBOARDING_CHANNEL_ID,
+            components,
+            mention_user_ids=[member.id],
+        )
+
+
 async def _post_onboarding_welcome(member: discord.Member) -> bool:
     """Post a public welcome prompt in ONBOARDING_CHANNEL_ID and record it in the DB.
 
@@ -2585,16 +2671,30 @@ async def _onboarding_route_manual_review(
         guild_id=member.guild.id,
         user_id=member.id,
     )
-    # Notify the server-entry (onboarding) channel for staff to pick up.
+    # Notify the server-entry (onboarding) channel for staff to pick up, with
+    # a one-click approve button that grants the verified-member roles.
     review_channel_id = ONBOARDING_CHANNEL_ID or HELP_CHANNEL_ID
     if review_channel_id:
-        channel = client.get_channel(review_channel_id)
-        if isinstance(channel, discord.TextChannel):
-            with contextlib.suppress(discord.HTTPException):
-                await channel.send(
+        components = [{
+            "type": 17,
+            "accent_color": ACCENT_INCOMPLETE,
+            "components": [
+                {"type": 10, "content": (
                     f"\U0001F6E1\uFE0F Manual review needed: <@{member.id}> "
                     f"(`{member.id}`) — {reason}"
-                )
+                )},
+                {"type": 1, "components": [
+                    {
+                        "type": 2,
+                        "style": 3,
+                        "label": "Approve & Assign Roles",
+                        "custom_id": f"mreview:{member.id}:approve",
+                    }
+                ]},
+            ],
+        }]
+        with contextlib.suppress(Exception):
+            await _post_channel_v2(review_channel_id, components)
     ephemeral_text = (
         "\u2705 Got it — you've been placed in a manual review queue.\n"
         "-# A staff member will assign your roles. This may take a little while."
@@ -2604,6 +2704,88 @@ async def _onboarding_route_manual_review(
             interaction, 4,
             [{"type": 17, "accent_color": ACCENT_INCOMPLETE,
               "components": [{"type": 10, "content": ephemeral_text}]}],
+        )
+
+
+# Roles granted when a staff member approves a manual-review case via the
+# "Approve & Assign Roles" button on the alert.
+_MREVIEW_APPROVE_ROLE_IDS = (1361846841905381632, 1392585653971062815)
+
+
+async def _handle_mreview_interaction(
+    interaction: discord.Interaction, custom_id: str
+) -> None:
+    """Staff-only approve button on a manual-review alert.
+
+    ``custom_id`` format: ``mreview:<user_id>:approve``. Grants the
+    verified-member roles to the target and edits the alert to reflect who
+    approved. Requires Manage Server.
+    """
+    parts = custom_id.split(":")
+    try:
+        target_id = int(parts[1])
+    except (IndexError, ValueError):
+        return
+
+    user = interaction.user
+    guild = interaction.guild
+
+    # Staff gate.
+    if not (
+        isinstance(user, discord.Member)
+        and user.guild_permissions.manage_guild
+    ):
+        with contextlib.suppress(Exception):
+            await _interaction_callback(
+                interaction, 4,
+                [{"type": 17, "accent_color": ACCENT_FAIL,
+                  "components": [{"type": 10, "content": (
+                      "-# Only staff can approve reviews, Operator."
+                  )}]}],
+            )
+        return
+
+    if guild is None:
+        return
+
+    member = guild.get_member(target_id)
+    if member is None:
+        with contextlib.suppress(Exception):
+            await _interaction_callback(
+                interaction, 4,
+                [{"type": 17, "accent_color": ACCENT_INCOMPLETE,
+                  "components": [{"type": 10, "content": (
+                      "-# That member is no longer in the server."
+                  )}]}],
+            )
+        return
+
+    granted: list[str] = []
+    for rid in _MREVIEW_APPROVE_ROLE_IDS:
+        role = guild.get_role(rid)
+        if role is None:
+            continue
+        ok, _ = await _add_role(
+            member, role, f"Manual review approved by {user}"
+        )
+        if ok:
+            granted.append(role.name)
+
+    logger.info(
+        "mreview: %s approved %s; granted=%s",
+        user.id, member.id, granted,
+    )
+
+    approved_text = (
+        f"\u2705 Manual review approved for <@{member.id}> by <@{user.id}>."
+    )
+    # UPDATE_MESSAGE (type 7) — replace the alert (and its button) in place.
+    with contextlib.suppress(Exception):
+        await _interaction_callback(
+            interaction, 7,
+            [{"type": 17, "accent_color": ACCENT_PASS,
+              "components": [{"type": 10, "content": approved_text}]}],
+            ephemeral=False,
         )
 
 
@@ -2775,12 +2957,9 @@ class _OnboardingVerifyModal(discord.ui.Modal):
             "onboarding: %s verified via welcome prompt (clan=%s)",
             member.id, claimed_name,
         )
-        body = (
-            "\u2705 Verified! Your data has been recorded.\n"
-            + "\n".join(f"-# {line}" for line in summary)
-        )
-        with contextlib.suppress(discord.HTTPException):
-            await interaction.followup.send(body, ephemeral=True)
+        # Welcome-only response: post the public "Welcome to the Golden Pagoda"
+        # message to the server-entry channel (no ephemeral confirmation).
+        await _post_onboarding_pass_welcome(member)
         # Post a profile-card record to the member-records channel (fire-and-forget).
         _spawn_bg_task(_post_member_record(member, summary))
 
@@ -5183,20 +5362,17 @@ class _ManageScreenshotModal(discord.ui.Modal):
             await _interaction_edit_original_v2(interaction, components)
 
         if summary:
-            body = (
-                f"> Operator, <@{member.id}>'s data has been adjusted.\n"
-                + "\n".join(f"* -# {line}" for line in summary)
-            )
+            # Welcome-only response: post the public verified-welcome to the
+            # server-entry channel for the target member.
+            await _post_onboarding_pass_welcome(member)
         else:
-            body = (
-                "I couldn't read that screenshot. Upload a clearer PNG/JPG "
-                "with the title bar (PlayerName#NNN) and CLAN visible."
-            )
-        with contextlib.suppress(discord.HTTPException):
-            await interaction.followup.send(
-                body, ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.followup.send(
+                    "I couldn't read that screenshot. Upload a clearer PNG/JPG "
+                    "with the title bar (PlayerName#NNN) and CLAN visible.",
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
 
 
 async def _verify_member_from_screenshot(
@@ -5828,6 +6004,9 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         return
     if custom_id.startswith("onboard:"):
         await _handle_onboarding_interaction(interaction, custom_id)
+        return
+    if custom_id.startswith("mreview:"):
+        await _handle_mreview_interaction(interaction, custom_id)
         return
     if not custom_id.startswith("status:"):
         return
