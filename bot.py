@@ -3589,6 +3589,7 @@ def _status_page_bot(_interaction: discord.Interaction, _snap: dict) -> str:
     return (
         f"**Bot**\n"
         f"-# User: `{user}` (`{getattr(user, 'id', '?')}`)\n"
+        f"-# Host: `Local` (self-hosted on your device)\n"
         f"-# Health: `{hb_line}`\n"
         f"-# Uptime: `{uptime}` \u2022 Latency: `{latency_ms} ms`\n"
         f"-# Guilds: `{guilds}` \u2022 Members: `{members}`\n"
