@@ -2540,9 +2540,27 @@ _PASS_WELCOME_SELF_ROLES_EMOJI = {
 }
 
 
-def _onboarding_pass_welcome_components(member_id: int) -> list[dict]:
-    """Build the public "Welcome to the Golden Pagoda" message shown when a
-    member passes onboarding or is manually verified by an admin."""
+def _onboarding_pass_welcome_components(
+    member_id: int, *, manual_review: bool = False
+) -> list[dict]:
+    """Build the public "Welcome to the Golden Pagoda" message.
+
+    Shared by the onboarding-complete (pass) path and the manual-review path;
+    only the middle line differs:
+    - ``manual_review=False`` (normal onboarding completed): the lore line.
+    - ``manual_review=True``: a note that staff will reach out to confirm the
+      member's clan details and assign roles.
+    """
+    if manual_review:
+        body_line = (
+            f"\n> Our <@&{_PASS_WELCOME_STAFF_ROLE_ID}> will reach out to "
+            "confirm your clan details and update your roles.\n"
+        )
+    else:
+        body_line = (
+            "\n> *\"Each clan within the alliance walks a different path — but "
+            "all serve the Origin System.\"*\n"
+        )
     return [
         {
             "type": 17,
@@ -2566,13 +2584,7 @@ def _onboarding_pass_welcome_components(member_id: int) -> list[dict]:
                 {"type": 14, "spacing": 1},
                 {
                     "type": 10,
-                    "content": (
-                        f"\n> Our <@&{_PASS_WELCOME_STAFF_ROLE_ID}>  will reach "
-                        "out to confirm your clan details and update your roles. "
-                        "(OR if normal onboarding completed)\"> Each clan within "
-                        "the alliance walks a different path — but all serve the "
-                        "Origin System.\"\n"
-                    ),
+                    "content": body_line,
                 },
                 {"type": 14, "divider": True, "spacing": 2},
                 {
@@ -2599,11 +2611,15 @@ def _onboarding_pass_welcome_components(member_id: int) -> list[dict]:
     ]
 
 
-async def _post_onboarding_pass_welcome(member: discord.Member) -> None:
+async def _post_onboarding_pass_welcome(
+    member: discord.Member, *, manual_review: bool = False
+) -> None:
     """Post the public verified-welcome to the server-entry channel."""
     if ONBOARDING_CHANNEL_ID <= 0:
         return
-    components = _onboarding_pass_welcome_components(member.id)
+    components = _onboarding_pass_welcome_components(
+        member.id, manual_review=manual_review
+    )
     with contextlib.suppress(Exception):
         await _post_channel_v2(
             ONBOARDING_CHANNEL_ID,
@@ -2709,16 +2725,14 @@ async def _onboarding_route_manual_review(
         }]
         with contextlib.suppress(Exception):
             await _post_channel_v2(review_channel_id, components)
-    ephemeral_text = (
-        "\u2705 Got it — you've been placed in a manual review queue.\n"
-        "-# A staff member will assign your roles. This may take a little while."
-    )
-    with contextlib.suppress(discord.HTTPException):
-        await _interaction_callback(
-            interaction, 4,
-            [{"type": 17, "accent_color": ACCENT_INCOMPLETE,
-              "components": [{"type": 10, "content": ephemeral_text}]}],
-        )
+    # Member-facing response: post the public welcome card (a duplicate of the
+    # onboarding-complete card, with the manual-review text variant).
+    await _post_onboarding_pass_welcome(member, manual_review=True)
+    # Ack the triggering interaction so it doesn't error (the modal path already
+    # deferred; the dropdown path needs a fresh DEFERRED_UPDATE ack).
+    with contextlib.suppress(Exception):
+        if not interaction.response.is_done():
+            await _interaction_callback(interaction, 6, [])  # DEFERRED_UPDATE
 
 
 # Roles granted when a staff member approves a manual-review case via the
