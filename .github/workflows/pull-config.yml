@@ -29,7 +29,8 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.HETZNER_SSH_KEY }}" | base64 -d > ~/.ssh/hetzner
           chmod 600 ~/.ssh/hetzner
-          ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts
+          ssh-keygen -y -f ~/.ssh/hetzner > /dev/null  # validate
+          ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Pull + encrypt non-secret config
         env:
