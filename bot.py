@@ -2449,6 +2449,16 @@ _ONBOARDING_WELCOME_GIFS = (
 )
 
 
+# Matches default/unconfigured clan slot names like "Place Holder 2 Clan"
+# (case-insensitive, flexible spacing) so they never surface in onboarding.
+_PLACEHOLDER_CLAN_RE = re.compile(r"^\s*place\s*holder\b", re.IGNORECASE)
+
+
+def _is_placeholder_clan_name(name: str | None) -> bool:
+    """True for default placeholder clan names (e.g. "Place Holder 2 Clan")."""
+    return bool(name) and _PLACEHOLDER_CLAN_RE.match(name or "") is not None
+
+
 def _onboarding_welcome_components(
     member_id: int, guild: discord.Guild | None = None
 ) -> list[dict]:
@@ -2464,10 +2474,14 @@ def _onboarding_welcome_components(
     configured ``clan_name`` whose role actually resolves in ``guild`` are
     offered, so placeholder/unconfigured clans never appear. When ``guild`` is
     None we fall back to the env-level ``clan_name and role_id`` check.
+    Placeholder slots (e.g. "Place Holder 2 Clan") are skipped by name.
     """
     options: list[dict] = []
     for slot in CLAN_SLOTS:
         if not slot.clan_name or not slot.role_id:
+            continue
+        # Skip unconfigured placeholder slots by name.
+        if _is_placeholder_clan_name(slot.clan_name):
             continue
         # Mirror /status: a slot is only "real" if its role exists in the guild.
         if guild is not None and guild.get_role(slot.role_id) is None:
