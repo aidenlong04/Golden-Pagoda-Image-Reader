@@ -3750,6 +3750,21 @@ def _status_page_clans(interaction: discord.Interaction, _snap: dict) -> str:
     return "\n".join(lines)
 
 
+def _clan_sync_summary_line() -> str:
+    configured = [s for s in CLAN_SLOTS if s.clan_name]
+    if not configured:
+        return "-# Clan role IDs and emoji literals are auto-synced from the server and written back to the bot's local `.env` on connect."
+
+    resolved_roles = sum(1 for s in configured if s.role_id)
+    resolved_emojis = sum(1 for s in configured if s.emoji)
+    return (
+        f"-# Clan sync: roles {resolved_roles}/{len(configured)}; "
+        f"emojis {resolved_emojis}/{len(configured)}. "
+        "Role IDs and emoji literals are auto-synced from the server and "
+        "written back to the bot's local `.env` on connect."
+    )
+
+
 def _status_page_latency(_interaction: discord.Interaction, _snap: dict) -> str:
     """Render the live performance metrics page for /status."""
     from utils.retry import ocr_circuit_breaker
@@ -4529,6 +4544,8 @@ def _manage_components(
         else:
             lines.append("-# No stored profile data.")
         lines.append(f"-# Titles: `{len(titles)}`")
+        lines.append("")
+        lines.append(_clan_sync_summary_line())
         container_components = [{"type": 10, "content": "\n".join(lines)}]
         if member is not None:
             # Admin shortcut: OCR a fresh profile screenshot and write the
