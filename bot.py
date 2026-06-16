@@ -2585,9 +2585,10 @@ async def _onboarding_route_manual_review(
         guild_id=member.guild.id,
         user_id=member.id,
     )
-    # Notify staff channel.
-    if HELP_CHANNEL_ID:
-        channel = client.get_channel(HELP_CHANNEL_ID)
+    # Notify the server-entry (onboarding) channel for staff to pick up.
+    review_channel_id = ONBOARDING_CHANNEL_ID or HELP_CHANNEL_ID
+    if review_channel_id:
+        channel = client.get_channel(review_channel_id)
         if isinstance(channel, discord.TextChannel):
             with contextlib.suppress(discord.HTTPException):
                 await channel.send(
