@@ -1,0 +1,109 @@
+name: Server Ops (manual)
+
+# Manually-triggered maintenance workflow. Reuses the same HETZNER_SSH_KEY
+# secret as the deploy workflow to run a small, allow-listed set of ops on the
+# server without needing interactive SSH/console access.
+#
+# Run it from the GitHub UI: Actions -> "Server Ops (manual)" -> Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to do"
+        required: true
+        type: choice
+        options:
+          - env-show          # print non-secret env keys + whether secrets are set
+          - env-get           # print the value of a single key
+          - env-set           # set/replace a single key, then restart the service
+          - logs              # tail recent container logs
+        default: env-show
+      key:
+        description: "Env key (for env-get / env-set)"
+        required: false
+        type: string
+      value:
+        description: "Env value (for env-set only)"
+        required: false
+        type: string
+
+concurrency:
+  group: deploy-hetzner
+  cancel-in-progress: false
+
+jobs:
+  ops:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.HETZNER_SSH_KEY }}" | base64 -d > ~/.ssh/hetzner
+          chmod 600 ~/.ssh/hetzner
+          ssh-keygen -y -f ~/.ssh/hetzner > /dev/null  # validate
+          ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Run server op
+        env:
+          GP_ACTION: ${{ inputs.action }}
+          GP_KEY: ${{ inputs.key }}
+          GP_VALUE: ${{ inputs.value }}
+          GP_HOST: ${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}
+        run: |
+          set -eo pipefail
+          ssh -i ~/.ssh/hetzner "$GP_HOST" \
+            "GP_ACTION='$GP_ACTION' GP_KEY='$GP_KEY' GP_VALUE='$GP_VALUE' bash -s" <<'REMOTE'
+          set -eo pipefail
+          ENV_FILE=/opt/golden-pagoda/.env
+          # Keys that are safe to print verbatim (IDs / non-secret config).
+          # Anything not on this list is masked to "<set>"/"<unset>".
+          is_secret() {
+            case "$1" in
+              DISCORD_TOKEN|OCR_API_KEY|*_TOKEN|*_SECRET|*_KEY|*_PASSWORD) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          case "$GP_ACTION" in
+            env-show)
+              echo "== /opt/golden-pagoda/.env (secrets masked) =="
+              if [ ! -f "$ENV_FILE" ]; then echo "!! .env not found"; exit 0; fi
+              while IFS= read -r line; do
+                case "$line" in ''|\#*) continue ;; esac
+                k="${line%%=*}"; v="${line#*=}"
+                if is_secret "$k"; then
+                  if [ -n "$v" ]; then echo "$k=<set>"; else echo "$k=<unset>"; fi
+                else
+                  echo "$k=$v"
+                fi
+              done < "$ENV_FILE"
+              ;;
+            env-get)
+              [ -n "$GP_KEY" ] || { echo "!! key is required"; exit 1; }
+              v="$(grep -E "^${GP_KEY}=" "$ENV_FILE" | head -1 | cut -d= -f2-)" || true
+              if is_secret "$GP_KEY"; then
+                [ -n "$v" ] && echo "$GP_KEY=<set>" || echo "$GP_KEY=<unset>"
+              else
+                echo "$GP_KEY=$v"
+              fi
+              ;;
+            env-set)
+              [ -n "$GP_KEY" ] || { echo "!! key is required"; exit 1; }
+              sudo touch "$ENV_FILE"
+              if sudo grep -qE "^${GP_KEY}=" "$ENV_FILE"; then
+                sudo sed -i "s|^${GP_KEY}=.*|${GP_KEY}=${GP_VALUE}|" "$ENV_FILE"
+                echo "updated ${GP_KEY}"
+              else
+                echo "${GP_KEY}=${GP_VALUE}" | sudo tee -a "$ENV_FILE" > /dev/null
+                echo "appended ${GP_KEY}"
+              fi
+              sudo systemctl restart golden-pagoda
+              echo "restarted golden-pagoda.service"
+              ;;
+            logs)
+              sudo docker logs --tail 80 golden-pagoda 2>&1 || true
+              ;;
+            *)
+              echo "!! unknown action: $GP_ACTION"; exit 1 ;;
+          esac
+          REMOTE
