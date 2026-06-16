@@ -2316,6 +2316,10 @@ async def _post_channel_v2_with_file(
     payload: dict = {
         "flags": COMPONENTS_V2_FLAG,
         "components": components,
+        # Declare the uploaded file so the type-12 gallery's
+        # attachment://<file_name> reference resolves. Without this Discord
+        # rejects the message (400) and nothing posts.
+        "attachments": [{"id": 0, "filename": file_name}],
         "allowed_mentions": {"parse": []},
     }
     try:
