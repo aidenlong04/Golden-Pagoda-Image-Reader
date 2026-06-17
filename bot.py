@@ -2067,6 +2067,19 @@ _MREVIEW_APPROVE_ROLE_IDS = (1361846841905381632,)
 _VERIFIED_ROLE_IDS = (1392585653971062815,)
 
 
+def _member_is_verified(member: discord.Member) -> bool:
+    """True when the member holds the (separate-bot-owned) verified role.
+
+    Used to suppress verification prompts (the onboarding clan-select and the
+    /profile "Verify Profile Data" button) for members who are already
+    verified — those prompts only make sense for members still onboarding.
+    """
+    verified = {rid for rid in _VERIFIED_ROLE_IDS if rid}
+    if not verified:
+        return False
+    return any(r.id in verified for r in member.roles)
+
+
 async def _handle_mreview_interaction(
     interaction: discord.Interaction, custom_id: str
 ) -> None:
@@ -5455,7 +5468,8 @@ def _sync_profile_action_items(
     the screenshot-verify refresh so all three stay consistent: drop the
     existing "Assign <category>" link buttons + the screenshot button, then
     re-add link buttons for whatever's still missing and the screenshot
-    button while the in-game name is still unknown.
+    button while the in-game name is still unknown — but only for members who
+    aren't verified yet (verified members don't get verification prompts).
     """
     for item in list(view.children):
         if isinstance(item, _ScreenshotVerifyButton):
@@ -5469,7 +5483,7 @@ def _sync_profile_action_items(
         member.guild, _missing_assignable_categories(info)
     ):
         view.add_item(btn)
-    if not in_game_name:
+    if not in_game_name and not _member_is_verified(member):
         view.add_item(_ScreenshotVerifyButton(
             member=member,
             owner_id=owner_id,
@@ -5592,21 +5606,24 @@ async def profile_cmd(
                 info=info,
                 in_game_name=in_game_name,
             )
-        # Public record link: anyone viewing any profile can jump to the
-        # member's logged record(s). Added after the own-profile sync above
-        # (which rebuilds link buttons) so it isn't stripped. Newest last.
-        record_urls = await asyncio.to_thread(
-            _member_record_jump_urls, target.guild.id, target.id
-        )
-        if record_urls:
-            if view is None:
-                view = discord.ui.View(timeout=600)
-            view.add_item(discord.ui.Button(
-                style=discord.ButtonStyle.link,
-                label="View record",
-                url=record_urls[-1],
-                emoji=discord.PartialEmoji(name="\U0001F4CB"),
-            ))
+        # Record jump link — admins only. The records ("profile-log") channel
+        # is the source-of-truth log; only server managers can jump to a
+        # member's record(s) (non-managers usually can't see the channel
+        # anyway). Added after the own-profile sync above (which rebuilds link
+        # buttons) so it isn't stripped. Newest last.
+        if interaction.user.guild_permissions.manage_guild:
+            record_urls = await asyncio.to_thread(
+                _member_record_jump_urls, target.guild.id, target.id
+            )
+            if record_urls:
+                if view is None:
+                    view = discord.ui.View(timeout=600)
+                view.add_item(discord.ui.Button(
+                    style=discord.ButtonStyle.link,
+                    label="View record",
+                    url=record_urls[-1],
+                    emoji=discord.PartialEmoji(name="\U0001F4CB"),
+                ))
         if view is not None and view.children:
             send_kwargs["view"] = view
         await interaction.followup.send(**send_kwargs)

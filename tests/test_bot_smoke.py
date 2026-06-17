@@ -242,6 +242,65 @@ class MasteryEditorHelperTests(unittest.TestCase):
         self.assertIsInstance(modal.screenshot, discord.ui.FileUpload)
         self.assertEqual(modal.screenshot.max_values, 1)
 
+    def test_member_is_verified(self):
+        """``_member_is_verified`` is True only when the member holds one of
+        the configured verified-role IDs."""
+        b = self.bot_module
+
+        class _Role:
+            def __init__(self, rid):
+                self.id = rid
+
+        class _Member:
+            def __init__(self, role_ids):
+                self.roles = [_Role(r) for r in role_ids]
+
+        verified_id = b._VERIFIED_ROLE_IDS[0]
+        self.assertTrue(b._member_is_verified(_Member([verified_id, 999])))
+        self.assertFalse(b._member_is_verified(_Member([999, 1000])))
+        self.assertFalse(b._member_is_verified(_Member([])))
+
+    def test_sync_profile_action_items_hides_verify_for_verified(self):
+        """The /profile "Verify Profile Data" button is suppressed for members
+        who already hold the verified role — verification prompts only make
+        sense while a member is still onboarding. Unverified members without an
+        in-game name still get it."""
+        import discord
+        b = self.bot_module
+
+        class _Role:
+            def __init__(self, rid):
+                self.id = rid
+
+        class _Member:
+            def __init__(self, role_ids):
+                self.roles = [_Role(r) for r in role_ids]
+                self.guild = Mock()
+
+        verified_id = b._VERIFIED_ROLE_IDS[0]
+
+        def has_verify(view):
+            return any(
+                isinstance(c, b._ScreenshotVerifyButton)
+                for c in view.children
+            )
+
+        def build(role_ids, in_game_name):
+            view = discord.ui.View()
+            b._sync_profile_action_items(
+                view, member=_Member(role_ids), owner_id=1,
+                avatar_bytes=None, display_name="Tenno", info=[],
+                in_game_name=in_game_name,
+            )
+            return view
+
+        # Verified member, no in-game name -> NO verify button.
+        self.assertFalse(has_verify(build([verified_id], None)))
+        # Unverified member, no in-game name -> verify button present.
+        self.assertTrue(has_verify(build([999], None)))
+        # Any member WITH an in-game name -> no verify button.
+        self.assertFalse(has_verify(build([999], "Tenno#123")))
+
     def test_mr_bucket_role_for_maps_rank_to_bucket(self):
         b = self.bot_module
 
