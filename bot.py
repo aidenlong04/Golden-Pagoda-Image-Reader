@@ -1177,7 +1177,7 @@ async def _v2_multipart_request(
     ``files[1]``, ``files[2]``… so the payload's ``attachments`` ids line up.
     Returns the parsed JSON response when the server sends one, else None.
     Raises ``discord.HTTPException`` on any 4xx/5xx so callers can fall back
-    (``_send_v2``) or log (``_edit_message_v2_with_file``).
+    or log it (e.g. ``_post_channel_embed`` / ``_edit_channel_embed``).
     """
     form = aiohttp.FormData()
     form.add_field(
@@ -1209,39 +1209,6 @@ async def _v2_multipart_request(
             return await resp.json()
         except (aiohttp.ContentTypeError, ValueError):
             return None
-
-
-async def _edit_message_v2_with_file(
-    *,
-    channel_id: int,
-    message_id: int,
-    components: list[dict],
-    file_bytes: bytes,
-    file_name: str = "progress.png",
-    file_content_type: str = "image/png",
-) -> None:
-    """PATCH an existing V2 message and replace its single attachment.
-
-    UPDATE_MESSAGE (interaction callback type 7) is JSON-only and can't
-    swap attachments, so refreshing the progress card requires a direct
-    multipart PATCH to /channels/{cid}/messages/{mid}. The new attachment
-    keeps the same filename so any ``attachment://progress.png``
-    references inside components resolve to the fresh file.
-    """
-    payload = {
-        "components": components,
-        "attachments": [{"id": 0, "filename": file_name}],
-        "allowed_mentions": {"parse": []},
-    }
-    url = (
-        f"{_DISCORD_API_BASE}/channels/"
-        f"{channel_id}/messages/{message_id}"
-    )
-    await _v2_multipart_request(
-        "PATCH", url, payload=payload,
-        file_bytes=file_bytes, file_name=file_name,
-        file_content_type=file_content_type,
-    )
 
 
 async def _delete_message(channel_id: int, message_id: int) -> None:
@@ -1307,53 +1274,6 @@ async def _post_channel_v2(
                     pass
     except discord.HTTPException:
         logger.exception("_post_channel_v2: failed to post to channel %s", channel_id)
-    return None
-
-
-async def _post_channel_v2_with_file(
-    channel_id: int,
-    components: list[dict],
-    *,
-    file_bytes: bytes,
-    file_name: str = "record.png",
-    file_content_type: str = "image/png",
-) -> int | None:
-    """POST a standalone Components V2 message with a file attachment.
-
-    Like ``_post_channel_v2`` but sends multipart so a top-level type-12
-    media gallery referencing ``attachment://<file_name>`` resolves to the
-    attached file.  Returns the posted message ID or None on failure.
-    """
-    api_base = "https://discord.com/api/v10"
-    url = f"{api_base}/channels/{channel_id}/messages"
-    payload: dict = {
-        "flags": COMPONENTS_V2_FLAG,
-        "components": components,
-        # Declare the uploaded file so the type-12 gallery's
-        # attachment://<file_name> reference resolves. Without this Discord
-        # rejects the message (400) and nothing posts.
-        "attachments": [{"id": 0, "filename": file_name}],
-        "allowed_mentions": {"parse": []},
-    }
-    try:
-        data = await _v2_multipart_request(
-            "POST", url,
-            payload=payload,
-            file_bytes=file_bytes,
-            file_name=file_name,
-            file_content_type=file_content_type,
-        )
-        if isinstance(data, dict):
-            raw_id = data.get("id")
-            if isinstance(raw_id, (str, int)):
-                try:
-                    return int(raw_id)
-                except (TypeError, ValueError):
-                    pass
-    except discord.HTTPException:
-        logger.exception(
-            "_post_channel_v2_with_file: failed to post to channel %s", channel_id
-        )
     return None
 
 
@@ -1570,14 +1490,15 @@ async def on_member_update(
 
     # If the member just became "settled" — gaining the verified-member role
     # (normal verify / a manual grant) or the manual-review Honoured Friends
-    # grant — finish their onboarding: mark the prompt complete + strip the
-    # welcome dropdown so it looks done. Checked before the tracked-role gate
-    # because neither role is itself a tracked profile category.
+    # grant — finalize their onboarding (mark complete + strip dropdown) AND
+    # ensure they have a record (role-derived, partial). Checked before the
+    # tracked-role gate because neither settled role is itself a tracked
+    # profile category. Spawned as a background task.
     settled = {
         rid for rid in (_VERIFIED_ROLE_IDS + _MREVIEW_APPROVE_ROLE_IDS) if rid
     }
     if settled & after_ids and not (settled & before_ids):
-        _spawn_bg_task(_finalize_onboarding(after.guild.id, after.id))
+        _spawn_bg_task(_finalize_onboarding_with_record(after))
 
     tracked = _tracked_role_ids()
     if not tracked:
@@ -1765,14 +1686,42 @@ async def _remove_onboarding_dropdown(guild_id: int, user_id: int) -> None:
         )
 
 
+async def _finalize_onboarding_with_record(member: discord.Member) -> None:
+    """Finalize a member's onboarding AND ensure they have a canonical record.
+
+    Called from ``on_member_update`` when a member gains a verified/honoured
+    role outside the self-serve screenshot pipeline (e.g., another bot granted
+    verified, or manual role). Marks onboarding complete, strips the welcome
+    dropdown, and creates a role-derived record if one doesn't already exist.
+
+    The record will be partial (no in-game name / exact mastery / screenshot —
+    those are OCR-only) but ensures the member appears in the records channel.
+    Idempotent + fail-soft: no-ops gracefully. Spawned as a background task.
+    """
+    guild_id = member.guild.id
+    user_id = member.id
+    # Mark onboarding complete + strip dropdown.
+    await asyncio.to_thread(
+        analytics.complete_onboarding_prompt, guild_id, user_id
+    )
+    await _remove_onboarding_dropdown(guild_id, user_id)
+    # Ensure the member has a record (role-derived: partial, no OCR-only fields).
+    ids = await asyncio.to_thread(
+        records_index.get_record_message_ids, user_id
+    )
+    if not ids:
+        # No existing record — create one from current roles.
+        await _edit_or_create_member_record(member)
+
+
 async def _finalize_onboarding(guild_id: int, user_id: int) -> None:
     """Mark a member's onboarding complete and strip the welcome dropdown.
 
     Idempotent + fail-soft: no-ops when the member has no pending prompt.
-    Called whenever onboarding finishes outside the self-serve modal — when a
-    member gains the verified role (``on_member_update``) or an admin verifies
-    them via ``/manage`` — so the welcome prompt looks done and the reprompt
-    loop stops.
+    Called from modals + admin endpoints where the record is already written
+    or the caller doesn't have the member object. Use
+    ``_finalize_onboarding_with_record`` when you have the member and want to
+    ensure a record exists.
     """
     await asyncio.to_thread(
         analytics.complete_onboarding_prompt, guild_id, user_id
@@ -2498,52 +2447,6 @@ def _build_member_record_embed(
     return embed
 
 
-# Kept for the test-suite + any callers that still want the V2 component
-# shape; the live record path now posts an embed via _build_member_record_embed.
-def _build_member_record_components(
-    member: discord.Member,
-    summary_lines: list[str],
-) -> list[dict]:
-    """Build a /status-style V2 payload for the member-records channel.
-
-    Structure mirrors ``_status_components``:
-    - top-level text heading
-    - type-12 media gallery referencing ``attachment://record.png``
-    - gold-accented type-17 container with the verification summary
-    """
-    # Heading (outside the container, like /status "### 📊 Status — Title")
-    heading = f"### \U0001F4CB Member Record \u2014 {member.display_name}"
-
-    # Body text inside the container — the member's full profile lines from
-    # _member_record_profile_lines (e.g. "Clan: **Golden Tenno**", "Mastery
-    # Rank: **MR 12**") plus the member mention + join timestamp.
-    joined_str = ""
-    if member.joined_at:
-        joined_str = f"\n-# Joined: <t:{int(member.joined_at.timestamp())}:R>"
-    info_lines = [f"-# {line}" for line in summary_lines] if summary_lines else []
-    body_text = (
-        f"**{member.mention}** (`{member.id}`)"
-        + (f"  •  {member.display_name}" if member.display_name != str(member) else "")
-        + joined_str
-        + ("\n" + "\n".join(info_lines) if info_lines else "")
-    )
-
-    return [
-        {"type": 10, "content": heading},
-        {
-            "type": 12,
-            "items": [{"media": {"url": "attachment://record.png"}}],
-        },
-        {
-            "type": 17,
-            "accent_color": ACCENT_PASS,
-            "components": [
-                {"type": 10, "content": body_text},
-            ],
-        },
-    ]
-
-
 async def _create_member_record(
     member: discord.Member,
     summary_lines: list[str],
@@ -2590,43 +2493,6 @@ async def _create_member_record(
             message_id,
             channel_id=MEMBER_RECORDS_CHANNEL_ID,
         ))
-
-
-async def _edit_channel_message_v2(
-    channel_id: int,
-    message_id: int,
-    components: list[dict],
-    *,
-    keep_attachment_ids: list[int] | None = None,
-) -> None:
-    """PATCH an existing V2 message's components without re-uploading a file.
-
-    For role-change edits that only rewrite the container text. When the
-    message carries an attachment that the new components still reference
-    (``attachment://record.png``), pass its id in ``keep_attachment_ids`` so
-    Discord retains it instead of dropping it. Fail-soft.
-    """
-    from discord.http import Route
-
-    payload: dict = {
-        "flags": COMPONENTS_V2_FLAG,
-        "components": components,
-        "allowed_mentions": {"parse": []},
-    }
-    if keep_attachment_ids is not None:
-        payload["attachments"] = [{"id": int(a)} for a in keep_attachment_ids]
-    try:
-        await client.http.request(
-            Route(
-                "PATCH",
-                "/channels/{channel_id}/messages/{message_id}",
-                channel_id=channel_id,
-                message_id=message_id,
-            ),
-            json=payload,
-        )
-    except discord.HTTPException:
-        logger.exception("records: failed to edit message %s", message_id)
 
 
 async def _edit_member_record(
@@ -5086,40 +4952,22 @@ class _ScreenshotVerifyModal(discord.ui.Modal):
             )
             with contextlib.suppress(discord.HTTPException):
                 await interaction.followup.send(
-                    "Couldn't read that upload \u2014 try again.",
+                    "Couldn't read that upload — try again.",
                     ephemeral=True,
                 )
             return
 
         member = self._gp_member
-        result = await _verify_member_from_screenshot(
+        # Use the shared screenshot-ingest pipeline: OCR + re-fetch + record.
+        result, member = await _ingest_profile_screenshot(
             member,
             image_bytes=image_bytes,
-            filename=attachment.filename or "profile.png",
-            content_type=attachment.content_type or "image/png",
+            attachment=attachment,
+            finalize_onboarding=False,
         )
         summary = result.summary
 
-        # Re-fetch so the re-render reflects freshly assigned roles (the
-        # cached member.roles lags the role-add gateway event).
-        with contextlib.suppress(discord.HTTPException):
-            member = await member.guild.fetch_member(member.id)
-
-        # Refresh the member's canonical record (now that roles are fresh).
-        # Awaited — NOT a background task — so the re-read below sees the new
-        # in-game name + exact mastery. _edit_or_create_member_record
-        # invalidates the record-profile cache, so reading straight after is
-        # fresh; spawning it in the background instead would re-render from the
-        # stale record, leaving the old nickname headline + the "Verify
-        # Profile Data" button on a card that was just verified.
-        if summary:
-            await _edit_or_create_member_record(
-                member,
-                in_game_name=result.in_game_name,
-                mastery_rank=result.mastery_rank,
-                image_bytes=image_bytes,
-            )
-
+        # Refresh card from the (now-current) member roles and record.
         info = await _member_profile_info_lines(member)
         in_game_name = await _member_in_game_name(member)
         png = await _run_heavy(
@@ -5322,36 +5170,22 @@ class _ManageScreenshotModal(discord.ui.Modal):
             )
             with contextlib.suppress(discord.HTTPException):
                 await interaction.followup.send(
-                    "Couldn't read that upload \u2014 try again.",
+                    "Couldn't read that upload — try again.",
                     ephemeral=True,
                 )
             return
 
-        result = await _verify_member_from_screenshot(
+        # Use the shared screenshot-ingest pipeline: OCR + re-fetch + record +
+        # finalize. The /manage admin path sets finalize_onboarding=True since
+        # an admin verifying someone completes their onboarding (different from
+        # the member-initiated /profile flow where it's False).
+        result, member = await _ingest_profile_screenshot(
             member,
             image_bytes=image_bytes,
-            filename=attachment.filename or "profile.png",
-            content_type=attachment.content_type or "image/png",
+            attachment=attachment,
+            finalize_onboarding=True,
         )
         summary = result.summary
-
-        # Re-fetch so the record + panel reflect freshly assigned roles.
-        with contextlib.suppress(discord.HTTPException):
-            member = await member.guild.fetch_member(member.id)
-
-        # Refresh the member's canonical record before re-reading it for the
-        # panel (await so the snapshot below sees the new data).
-        if summary:
-            await _edit_or_create_member_record(
-                member,
-                in_game_name=result.in_game_name,
-                mastery_rank=result.mastery_rank,
-                image_bytes=image_bytes,
-            )
-            # An admin verifying via /manage finishes the member's onboarding:
-            # mark it complete + strip the welcome dropdown. The /manage path
-            # doesn't grant the verified role, so on_member_update won't.
-            await _finalize_onboarding(member.guild.id, member.id)
 
         # Refresh the /manage Overview page in place so the stored-profile
         # block reflects whatever the screenshot just wrote.
@@ -5454,6 +5288,50 @@ async def _verify_member_from_screenshot(
             summary.append(f"Mastery Rank: **{mastery_rank}**")
 
     return _VerifyResult(summary, profile_name, mastery_rank)
+
+
+async def _ingest_profile_screenshot(
+    member: discord.Member,
+    *,
+    image_bytes: bytes,
+    attachment: "discord.Attachment",
+    finalize_onboarding: bool = False,
+) -> tuple[_VerifyResult, discord.Member]:
+    """Shared core of every screenshot flow: OCR a profile screenshot, assign
+    every role it can, and write the member's canonical record.
+
+    Used by the member self-verify (``/profile``), the admin ``/manage`` panel
+    and the records-channel "Add/Update Screenshot" button so all three share
+    one pipeline. Returns the ``_VerifyResult`` plus the (re-fetched) member so
+    callers can refresh their own UI from freshly assigned roles.
+
+    The record write is awaited (not a background task) so a caller reading the
+    record straight afterwards sees the new in-game name + exact mastery; it
+    also invalidates the record-profile TTL cache. An empty ``result.summary``
+    means the screenshot couldn't be read — no record is written and no roles
+    are assigned. When ``finalize_onboarding`` is set, a successful read also
+    completes the member's onboarding (admin-initiated paths).
+    """
+    result = await _verify_member_from_screenshot(
+        member,
+        image_bytes=image_bytes,
+        filename=attachment.filename or "profile.png",
+        content_type=attachment.content_type or "image/png",
+    )
+    # Re-fetch so callers re-render from freshly assigned roles (the cached
+    # member.roles lags the role-add gateway event).
+    with contextlib.suppress(discord.HTTPException):
+        member = await member.guild.fetch_member(member.id)
+    if result.summary:
+        await _edit_or_create_member_record(
+            member,
+            in_game_name=result.in_game_name,
+            mastery_rank=result.mastery_rank,
+            image_bytes=image_bytes,
+        )
+        if finalize_onboarding:
+            await _finalize_onboarding(member.guild.id, member.id)
+    return result, member
 
 
 def _sync_profile_action_items(
