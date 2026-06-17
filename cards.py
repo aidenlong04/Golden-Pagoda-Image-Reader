@@ -12,6 +12,7 @@ from __future__ import annotations
 import functools
 import io
 import logging
+import os
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
@@ -69,9 +70,27 @@ def _load_font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
 @functools.lru_cache(maxsize=32)
 def _load_font_cached(size: int, bold: bool) -> ImageFont.FreeTypeFont:
     name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    win_dir = os.environ.get("WINDIR") or r"C:\\Windows"
+    windows_fonts = os.path.join(win_dir, "Fonts")
+    win_names = (
+        ["seguisb.ttf", "segoeuib.ttf", "arialbd.ttf", "calibrib.ttf"]
+        if bold
+        else ["segoeui.ttf", "arial.ttf", "calibri.ttf"]
+    )
+    mac_names = (
+        ["Arial Bold.ttf", "Helvetica.ttc"]
+        if bold
+        else ["Arial.ttf", "Helvetica.ttc"]
+    )
     candidates = [
+        # Linux (devcontainer / common distros)
         f"/usr/share/fonts/truetype/dejavu/{name}",
         f"/usr/share/fonts/dejavu/{name}",
+        # Windows
+        *[os.path.join(windows_fonts, n) for n in win_names],
+        # macOS
+        *[f"/System/Library/Fonts/Supplemental/{n}" for n in mac_names],
+        # Final bare-name fallback (works when font is discoverable by PIL)
         name,
     ]
     for path in candidates:
@@ -79,6 +98,11 @@ def _load_font_cached(size: int, bold: bool) -> ImageFont.FreeTypeFont:
             return ImageFont.truetype(path, size=size)
         except OSError:
             continue
+    logger.warning(
+        "cards: no truetype font found (size=%s, bold=%s); using PIL default",
+        size,
+        bold,
+    )
     return ImageFont.load_default()  # type: ignore[return-value]
 
 
