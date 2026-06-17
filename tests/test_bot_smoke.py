@@ -445,6 +445,29 @@ class MemberProfileInfoLinesTests(unittest.TestCase):
         self.assertEqual(label, "Mastery Rank")
         self.assertEqual(value, "28")
 
+    def test_pattern_fallback_when_mr_role_ids_empty(self):
+        # MR_ROLE_IDS unresolved (empty, e.g. the server's role names don't
+        # match MR_ROLE_NAMES) but the member holds a role named like a
+        # mastery bucket -> the name-pattern fallback still surfaces it so
+        # the card isn't missing the Mastery Rank row.
+        label, value = self._mastery_row(
+            role_names=["MR 16-21"],
+            mr_role_ids=[],
+            stored=None,
+        )
+        self.assertEqual(label, "Mastery Rank")
+        self.assertEqual(value, "16-21")
+
+    def test_pattern_fallback_legendary_when_ids_empty(self):
+        # Same fallback recognises a Legendary bucket by name.
+        label, value = self._mastery_row(
+            role_names=["Legendary 1-7"],
+            mr_role_ids=[],
+            stored=None,
+        )
+        self.assertEqual(label, "Legendary Rank")
+        self.assertEqual(value, "1-7")
+
 
 class ManagePanelTests(unittest.TestCase):
     """Tests for the /manage admin backup console (styled after /status)."""

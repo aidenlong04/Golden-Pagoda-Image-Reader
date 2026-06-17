@@ -968,6 +968,27 @@ def _role_categories_for(role_ids: set[int]) -> list[tuple[str, bool]]:
     return out
 
 
+def _member_mastery_roles(member: discord.Member) -> list["discord.Role"]:
+    """Return the member's mastery-bucket roles.
+
+    Prefers the configured ``MR_ROLE_IDS``; when the member holds none of
+    those (the list is unconfigured, or the server's role names don't match
+    ``MR_ROLE_NAMES`` exactly so the name->ID resolution never populated it),
+    falls back to any role whose *name* parses as an MR/LR bucket via
+    :func:`_parse_mr_bucket_range`. This keeps the Mastery Rank row resolving
+    from the member's actual roles even when exact-name config hasn't matched
+    — the same way Platform/Syndicate resolve from their ID lists.
+    """
+    mr_ids = set(MR_ROLE_IDS)
+    by_id = [r for r in member.roles if r.id in mr_ids]
+    if by_id:
+        return by_id
+    return [
+        r for r in member.roles
+        if _parse_mr_bucket_range(r.name) is not None
+    ]
+
+
 async def _member_profile_info_lines(
     member: discord.Member,
 ) -> list[tuple]:
@@ -1032,13 +1053,12 @@ async def _member_profile_info_lines(
     # member holds a Legendary (LR) bucket role, that wins even over a
     # lower stored rank — the Legendary role is the source of truth for
     # legendary status (a stale OCR'd "MR n" shouldn't hide it).
-    if MR_ROLE_IDS or mastery_override:
-        mr_ids = set(MR_ROLE_IDS)
+    member_mr_roles = _member_mastery_roles(member)
+    if MR_ROLE_IDS or member_mr_roles or mastery_override:
         legendary_role_name = next(
             (
-                r.name for r in member.roles
-                if r.id in mr_ids
-                and (_parse_mr_bucket_range(r.name) or ("", 0, 0))[0] == "LR"
+                r.name for r in member_mr_roles
+                if (_parse_mr_bucket_range(r.name) or ("", 0, 0))[0] == "LR"
             ),
             None,
         )
@@ -1050,7 +1070,7 @@ async def _member_profile_info_lines(
         elif mastery_override:
             mr_value = _format_mastery_display(mastery_override) or "\u2014"
         else:
-            mr_names = [r.name for r in member.roles if r.id in mr_ids]
+            mr_names = [r.name for r in member_mr_roles]
             mr_value = ", ".join(mr_names) if mr_names else "\u2014"
         rows.append((
             "Mastery Rank",
@@ -2369,9 +2389,8 @@ def _member_record_profile_lines(
     mr_value: str | None = None
     if mastery_rank and mastery_rank.strip():
         mr_value = mastery_rank.strip()
-    elif MR_ROLE_IDS:
-        mr_ids = set(MR_ROLE_IDS)
-        mr_names = [r.name for r in member.roles if r.id in mr_ids]
+    else:
+        mr_names = [r.name for r in _member_mastery_roles(member)]
         if mr_names:
             mr_value = ", ".join(mr_names)
     if mr_value:
