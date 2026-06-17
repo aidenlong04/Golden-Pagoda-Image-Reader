@@ -701,6 +701,18 @@ def _resolve_clan_emoji_literal(
             for norm, emoji in emojis:
                 if norm and norm == key:
                     return _emoji_literal(emoji)
+        # Emoji name that *extends* the full clan key, e.g. clan
+        # "kavatraiders" -> emoji "KavatRaiders_Emblem" ("kavatraidersemblem").
+        # Handles the "<Clan>_Emblem" naming used for clan emblems; the
+        # shortest extending name (closest to the clan) wins.
+        if len(full) >= 4:
+            best_ext: tuple[str, discord.Emoji] | None = None
+            for norm, emoji in emojis:
+                if norm.startswith(full):
+                    if best_ext is None or len(norm) < len(best_ext[0]):
+                        best_ext = (norm, emoji)
+            if best_ext is not None:
+                return _emoji_literal(best_ext[1])
         # Prefix of the full name (e.g. "kavat" -> "kavatraiders"); longest wins.
         best: tuple[str, discord.Emoji] | None = None
         for norm, emoji in emojis:
@@ -1553,12 +1565,22 @@ async def on_member_update(
     never creates one (records are born at verify / onboarding time).
     Fail-soft.
     """
+    before_ids = {r.id for r in before.roles}
+    after_ids = {r.id for r in after.roles}
+
+    # If the member just gained the verified-member role (manual-review
+    # approval, a manual grant, or any other path), finish their onboarding:
+    # mark the prompt complete + strip the welcome dropdown so it looks done.
+    # Checked before the tracked-role gate because the verified role isn't
+    # itself a tracked profile category.
+    verified = {rid for rid in _MREVIEW_APPROVE_ROLE_IDS if rid}
+    if verified & after_ids and not (verified & before_ids):
+        _spawn_bg_task(_finalize_onboarding(after.guild.id, after.id))
+
     tracked = _tracked_role_ids()
     if not tracked:
         return
-    if ({r.id for r in before.roles} & tracked) == (
-        {r.id for r in after.roles} & tracked
-    ):
+    if (before_ids & tracked) == (after_ids & tracked):
         return
     try:
         ids = await asyncio.to_thread(
@@ -1738,6 +1760,59 @@ async def _remove_onboarding_dropdown(guild_id: int, user_id: int) -> None:
         logger.debug(
             "onboarding: failed to strip dropdown from welcome message",
             exc_info=True,
+        )
+
+
+async def _finalize_onboarding(guild_id: int, user_id: int) -> None:
+    """Mark a member's onboarding complete and strip the welcome dropdown.
+
+    Idempotent + fail-soft: no-ops when the member has no pending prompt.
+    Called whenever onboarding finishes outside the self-serve modal — when a
+    member gains the verified role (``on_member_update``) or an admin verifies
+    them via ``/manage`` — so the welcome prompt looks done and the reprompt
+    loop stops.
+    """
+    await asyncio.to_thread(
+        analytics.complete_onboarding_prompt, guild_id, user_id
+    )
+    await _remove_onboarding_dropdown(guild_id, user_id)
+
+
+async def _reset_onboarding_select(guild_id: int, user_id: int) -> None:
+    """Re-render the onboarding welcome's clan-select to a fresh, unselected
+    state so the member can pick again.
+
+    Discord won't re-fire a string select when a member re-picks the value
+    they already chose, so after every pick we reset the select — letting a
+    member retry the *same* clan after a failed OCR attempt. No-ops once
+    onboarding is complete (the dropdown is gone by then). Fail-soft.
+    """
+    from discord.http import Route
+
+    row = await asyncio.to_thread(
+        analytics.get_onboarding_prompt, guild_id, user_id
+    )
+    if not row or row.get("completed"):
+        return
+    channel_id = row.get("channel_id")
+    message_id = row.get("message_id")
+    if not channel_id or not message_id:
+        return
+    guild = client.get_guild(guild_id)
+    components = _onboarding_welcome_components(user_id, guild)
+    try:
+        await client.http.request(
+            Route(
+                "PATCH",
+                "/channels/{channel_id}/messages/{message_id}",
+                channel_id=channel_id,
+                message_id=message_id,
+            ),
+            json={"components": components, "flags": COMPONENTS_V2_FLAG},
+        )
+    except discord.HTTPException:
+        logger.debug(
+            "onboarding: failed to reset clan select", exc_info=True
         )
 
 
@@ -2364,7 +2439,8 @@ def _build_member_record_embed(
     """
     joined_str = ""
     if member.joined_at:
-        joined_str = f"  •  joined <t:{int(member.joined_at.timestamp())}:R>"
+        joined_ts = int(member.joined_at.timestamp())
+        joined_str = f"  •  joined <t:{joined_ts}:F> (<t:{joined_ts}:R>)"
     name_extra = (
         f"  •  {member.display_name}"
         if member.display_name != str(member) else ""
@@ -2376,8 +2452,8 @@ def _build_member_record_embed(
         m = _RECORD_LINE_RE.match(line)
         if m:
             fields.append({
-                "name": m.group(1).strip(),
-                "value": f"**{m.group(2).strip()}**",
+                "name": f"{m.group(1).strip()}:",
+                "value": f"`{m.group(2).strip()}`",
                 "inline": True,
             })
         else:
@@ -2543,40 +2619,48 @@ async def _edit_member_record(
 ) -> None:
     """Edit an existing member record in place.
 
-    With a new screenshot, swaps the attachment via a multipart PATCH (and
-    refreshes the circular avatar); without one, rewrites only the embed and
-    retains whatever attachments the record already has (so the screenshot +
-    avatar survive a role-change edit). Fail-soft.
+    Always re-uploads the record's images (screenshot + circular avatar) via a
+    multipart PATCH so the embed's ``attachment://`` references resolve to
+    freshly-uploaded files and nothing renders loose. When no new screenshot is
+    supplied, the existing one is recovered from the record's current
+    attachment and re-uploaded — a JSON-only edit can't keep ``attachment://``
+    references resolvable for retained attachments, which left the screenshot +
+    avatar rendering as duplicate loose images below the embed. Fail-soft.
     """
-    if image_bytes:
-        avatar_bytes = await _render_record_avatar_bytes(
-            _member_avatar_url(member)
+    avatar_bytes = await _render_record_avatar_bytes(
+        _member_avatar_url(member)
+    )
+    if image_bytes is None:
+        # Recover the existing screenshot so we can re-upload it alongside the
+        # avatar (keeping it by id won't resolve attachment://record.png).
+        existing = await _fetch_record_message(channel_id, message_id)
+        existing_atts = [
+            a for a in (existing or {}).get("attachments", [])
+            if isinstance(a, dict)
+        ]
+        shot = next(
+            (
+                a for a in existing_atts
+                if a.get("filename") != "avatar.png"
+                and str(a.get("content_type") or "").startswith("image/")
+                and a.get("url")
+            ),
+            None,
         )
-        embed = _build_member_record_embed(
-            member, summary_lines,
-            has_image=True, has_avatar=bool(avatar_bytes),
-        )
+        if shot is not None:
+            image_bytes = await _fetch_cdn_bytes(str(shot["url"]))
+    embed = _build_member_record_embed(
+        member, summary_lines,
+        has_image=bool(image_bytes), has_avatar=bool(avatar_bytes),
+    )
+    if image_bytes or avatar_bytes:
         await _edit_channel_embed(
             channel_id, message_id, embed,
             file_bytes=image_bytes, file_name="record.png",
             avatar_bytes=avatar_bytes,
         )
-        return
-    existing = await _fetch_record_message(channel_id, message_id)
-    existing_atts = [
-        a for a in (existing or {}).get("attachments", [])
-        if isinstance(a, dict) and a.get("id") is not None
-    ]
-    attachment_ids = [int(a["id"]) for a in existing_atts]
-    has_avatar = any(a.get("filename") == "avatar.png" for a in existing_atts)
-    has_image = any(a.get("filename") != "avatar.png" for a in existing_atts)
-    embed = _build_member_record_embed(
-        member, summary_lines, has_image=has_image, has_avatar=has_avatar,
-    )
-    await _edit_channel_embed(
-        channel_id, message_id, embed,
-        keep_attachment_ids=attachment_ids or None,
-    )
+    else:
+        await _edit_channel_embed(channel_id, message_id, embed)
 
 
 async def _edit_or_create_member_record(
@@ -2770,12 +2854,14 @@ def _parse_record_embed(embeds: object) -> dict:
         for field in embed.get("fields") or []:
             if not isinstance(field, dict):
                 continue
-            name = str(field.get("name", "")).strip().lower()
+            name = str(field.get("name", "")).strip().rstrip(":").strip().lower()
             key = _RECORD_PROFILE_LABELS.get(name)
             if not key or key in out:
                 continue
             value = str(field.get("value", "")).strip()
-            if value.startswith("**") and value.endswith("**") and len(value) > 4:
+            if value.startswith("`") and value.endswith("`") and len(value) > 2:
+                value = value[1:-1].strip()
+            elif value.startswith("**") and value.endswith("**") and len(value) > 4:
                 value = value[2:-2].strip()
             if not value:
                 continue
@@ -2957,6 +3043,12 @@ async def _handle_onboarding_interaction(
             )
         except Exception:
             logger.exception("onboarding: failed to send verify modal")
+        else:
+            # Reset the dropdown so the member can re-pick the same clan and
+            # retry — Discord suppresses a string-select re-fire on an
+            # unchanged value, so without this a failed attempt can't be
+            # retried with the same clan.
+            _spawn_bg_task(_reset_onboarding_select(guild.id, member.id))
 
 
 async def _onboarding_reprompt_task() -> None:
@@ -4994,13 +5086,19 @@ class _ScreenshotVerifyModal(discord.ui.Modal):
             member = await member.guild.fetch_member(member.id)
 
         # Refresh the member's canonical record (now that roles are fresh).
+        # Awaited — NOT a background task — so the re-read below sees the new
+        # in-game name + exact mastery. _edit_or_create_member_record
+        # invalidates the record-profile cache, so reading straight after is
+        # fresh; spawning it in the background instead would re-render from the
+        # stale record, leaving the old nickname headline + the "Verify
+        # Profile Data" button on a card that was just verified.
         if summary:
-            _spawn_bg_task(_edit_or_create_member_record(
+            await _edit_or_create_member_record(
                 member,
                 in_game_name=result.in_game_name,
                 mastery_rank=result.mastery_rank,
                 image_bytes=image_bytes,
-            ))
+            )
 
         info = await _member_profile_info_lines(member)
         in_game_name = await _member_in_game_name(member)
@@ -5230,6 +5328,10 @@ class _ManageScreenshotModal(discord.ui.Modal):
                 mastery_rank=result.mastery_rank,
                 image_bytes=image_bytes,
             )
+            # An admin verifying via /manage finishes the member's onboarding:
+            # mark it complete + strip the welcome dropdown. The /manage path
+            # doesn't grant the verified role, so on_member_update won't.
+            await _finalize_onboarding(member.guild.id, member.id)
 
         # Refresh the /manage Overview page in place so the stored-profile
         # block reflects whatever the screenshot just wrote.

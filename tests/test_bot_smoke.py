@@ -1336,6 +1336,47 @@ class ClanEmojiResolveTests(unittest.TestCase):
             "<:kavatraiders:77>",
         )
 
+    def test_emblem_suffix_match(self):
+        # Clan emblems are named "<Clan>_Emblem" (e.g. KavatRaiders_Emblem),
+        # so the normalized emoji name *extends* the full clan key. This must
+        # resolve even though it's neither an exact nor a shortened-prefix
+        # match.
+        self._set_guild_emojis(
+            self._emoji("KavatRaiders_Emblem", 88),
+        )
+        self.assertEqual(
+            self.b._resolve_clan_emoji_literal("Kavat Raiders"),
+            "<:KavatRaiders_Emblem:88>",
+        )
+
+    def test_emblem_suffix_picks_correct_clan(self):
+        # Several "<Clan>_Emblem" emojis present: the one extending *this*
+        # clan's full key wins (no cross-clan bleed).
+        self._set_guild_emojis(
+            self._emoji("GoldenPagoda_Emblem", 1),
+            self._emoji("GoldenTenno_Emblem", 2),
+            self._emoji("GrandWarhorde_Emblem", 3),
+        )
+        self.assertEqual(
+            self.b._resolve_clan_emoji_literal("Golden Tenno"),
+            "<:GoldenTenno_Emblem:2>",
+        )
+        self.assertEqual(
+            self.b._resolve_clan_emoji_literal("Grand Warhorde"),
+            "<:GrandWarhorde_Emblem:3>",
+        )
+
+    def test_exact_beats_emblem_suffix(self):
+        # An exact-name emoji still wins over an "_Emblem"-suffixed one.
+        self._set_guild_emojis(
+            self._emoji("Apestorm_Emblem", 10),
+            self._emoji("Apestorm", 20),
+        )
+        self.assertEqual(
+            self.b._resolve_clan_emoji_literal("Apestorm"),
+            "<:Apestorm:20>",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

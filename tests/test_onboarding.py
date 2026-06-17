@@ -776,16 +776,17 @@ class MemberRecordComponentsTests(unittest.TestCase):
         self.assertEqual(embed.get("color"), self.bot.ACCENT_PASS)
 
     def test_summary_lines_become_fields(self):
-        """Key: **Value** summary lines become embed fields."""
+        """Key: **Value** summary lines become embed fields (name carries a
+        trailing colon; value is wrapped in backticks)."""
         member = self._make_member()
         summary = ["Clan: **Golden Pagoda**", "Mastery Rank: **MR 15**"]
         embed = self.bot._build_member_record_embed(member, summary)
         names = {f["name"] for f in embed["fields"]}
         body = str(embed["fields"])
-        self.assertIn("Clan", names)
-        self.assertIn("Mastery Rank", names)
-        self.assertIn("Golden Pagoda", body)
-        self.assertIn("MR 15", body)
+        self.assertIn("Clan:", names)
+        self.assertIn("Mastery Rank:", names)
+        self.assertIn("`Golden Pagoda`", body)
+        self.assertIn("`MR 15`", body)
 
     def test_member_id_appears_in_embed(self):
         """The member ID is always embedded in the record description."""
