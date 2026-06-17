@@ -1568,13 +1568,15 @@ async def on_member_update(
     before_ids = {r.id for r in before.roles}
     after_ids = {r.id for r in after.roles}
 
-    # If the member just gained the verified-member role (manual-review
-    # approval, a manual grant, or any other path), finish their onboarding:
-    # mark the prompt complete + strip the welcome dropdown so it looks done.
-    # Checked before the tracked-role gate because the verified role isn't
-    # itself a tracked profile category.
-    verified = {rid for rid in _MREVIEW_APPROVE_ROLE_IDS if rid}
-    if verified & after_ids and not (verified & before_ids):
+    # If the member just became "settled" — gaining the verified-member role
+    # (normal verify / a manual grant) or the manual-review Honoured Friends
+    # grant — finish their onboarding: mark the prompt complete + strip the
+    # welcome dropdown so it looks done. Checked before the tracked-role gate
+    # because neither role is itself a tracked profile category.
+    settled = {
+        rid for rid in (_VERIFIED_ROLE_IDS + _MREVIEW_APPROVE_ROLE_IDS) if rid
+    }
+    if settled & after_ids and not (settled & before_ids):
         _spawn_bg_task(_finalize_onboarding(after.guild.id, after.id))
 
     tracked = _tracked_role_ids()
@@ -2055,9 +2057,14 @@ async def _onboarding_route_manual_review(
 
 # When a staff member approves a manual-review case via the "Verify" button on
 # the alert, the pending-review + unverified gate roles are removed and the
-# verified-member role is granted.
+# Honoured Friends role is granted.
 _MREVIEW_REMOVE_ROLE_IDS = (1459326361968574555, 1381447170229538917)
 _MREVIEW_APPROVE_ROLE_IDS = (1361846841905381632,)
+
+# The "verified member" role — owned and assigned by a SEPARATE bot; this bot
+# never grants it. We only *observe* it: a member is "settled" (onboarding can
+# be finalized) once they gain this OR the Honoured Friends manual-review grant.
+_VERIFIED_ROLE_IDS = (1392585653971062815,)
 
 
 async def _handle_mreview_interaction(
