@@ -822,7 +822,7 @@ def _render_profile_card_png(
     draw = ImageDraw.Draw(canvas)
 
     eyebrow_font = _load_font(sc(14), bold=True)
-    name_font = _load_font(sc(28), bold=True)
+    name_font = _load_font(sc(40), bold=True)
 
     # Header rows anchored around the avatar's midline: eyebrow, headline,
     # an optional small subtitle (server nick), then the platform/syndicate
