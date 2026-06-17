@@ -685,9 +685,9 @@ def _render_profile_card_png(
     # Header zone holds the avatar + eyebrow + headline + (optional
     # subtitle) + platform/syndicate icon row. It grows a touch when a
     # subtitle is shown so the small nick line has breathing room.
-    header_h = 152 if subtitle else 140
-    clan_pill_h = 20
-    mr_pill_h = 32
+    header_h = 172 if subtitle else 158
+    clan_pill_h = 26
+    mr_pill_h = 40
 
     # The card is a two-column composition: a wide left content column
     # (identity + Clan/Mastery pills) and a narrow right column that
@@ -704,14 +704,14 @@ def _render_profile_card_png(
 
     # Ornament metrics for the titles crest (logical units, shared with the
     # drawing pass so the panel height matches the rendered crest exactly).
-    _T_EB_H = 16        # eyebrow band
-    _T_EB_GAP = 9       # eyebrow -> top flourish
+    _T_EB_H = 18        # eyebrow band
+    _T_EB_GAP = 10      # eyebrow -> top flourish
     _T_FL_H = 2         # flourish line thickness
-    _T_FL_GAP = 12      # flourish <-> first title
-    _T_MORE_GAP = 9     # titles -> "+N more"
-    _T_MORE_H = 16      # "+N more" band
-    _T_NAME_FS = 11     # title text size (matches the clan name)
-    _T_NAME_LH = 17     # per-title row height
+    _T_FL_GAP = 13      # flourish <-> first title
+    _T_MORE_GAP = 10    # titles -> "+N more"
+    _T_MORE_H = 18      # "+N more" band
+    _T_NAME_FS = 14     # title text size (matches the clan name)
+    _T_NAME_LH = 21     # per-title row height
 
     # Each shown title is laid out on a single line, ellipsized to fit the
     # column at the clan-name text size.
@@ -765,7 +765,7 @@ def _render_profile_card_png(
     # stack must also clear the avatar's bottom — when there's no subtitle
     # the icon row rides high enough that the clan row would otherwise
     # collide with the circular avatar's lower edge.
-    icon_row_cy = header_h // 2 + (42 if subtitle else 34)
+    icon_row_cy = header_h // 2 + (50 if subtitle else 42)
     avatar_bottom = (
         (header_h - _PROGRESS_AVATAR_SIZE) // 2 + _PROGRESS_AVATAR_SIZE
     )
@@ -821,18 +821,18 @@ def _render_profile_card_png(
     text_x = sc(pad) + avatar_px + sc(22)
     draw = ImageDraw.Draw(canvas)
 
-    eyebrow_font = _load_font(sc(14), bold=True)
-    name_font = _load_font(sc(40), bold=True)
+    eyebrow_font = _load_font(sc(17), bold=True)
+    name_font = _load_font(sc(44), bold=True)
 
     # Header rows anchored around the avatar's midline: eyebrow, headline,
     # an optional small subtitle (server nick), then the platform/syndicate
     # icon row. The identity block's right edge is bounded by the Titles-
     # panel divider so nothing crowds into the right column.
     cy = sc(header_h) // 2
-    eyebrow_cy = cy - sc(32 if subtitle else 28)
-    name_cy = cy - sc(8 if subtitle else 2)
-    subtitle_cy = cy + sc(15)
-    plat_cy = cy + sc(42 if subtitle else 34)
+    eyebrow_cy = cy - sc(40 if subtitle else 34)
+    name_cy = cy - sc(10 if subtitle else 2)
+    subtitle_cy = cy + sc(19)
+    plat_cy = cy + sc(50 if subtitle else 42)
 
     # Thin gold rule between the avatar and the identity text — a refined
     # divider spanning the eyebrow + name rows.
@@ -862,7 +862,7 @@ def _render_profile_card_png(
 
     # Server nickname as a small muted subtitle beneath the in-game handle.
     if subtitle:
-        sub_font = _load_font(sc(12), bold=True)
+        sub_font = _load_font(sc(14), bold=True)
         max_sub_w = name_right_bound - text_x
         sub_txt = _ellipsize(draw, subtitle, sub_font, max_sub_w)
         draw.text(
@@ -877,7 +877,7 @@ def _render_profile_card_png(
     # unset).
     row_cx = text_x
     if platform_row is not None and platform_row[2]:
-        plat_icon_px = sc(26)
+        plat_icon_px = sc(30)
         glow_d = plat_icon_px * 2
         gcx = row_cx + plat_icon_px // 2
         glow = Image.new("RGBA", (glow_d, glow_d), (0, 0, 0, 0))
@@ -911,7 +911,7 @@ def _render_profile_card_png(
                 fill=(scolor or _PROGRESS_MUTED) + (255,),
             )
             row_cx += syn_icon_px + sc(9)
-        syn_font = _load_font(sc(15), bold=True)
+        syn_font = _load_font(sc(17), bold=True)
         max_w = name_right_bound - row_cx
         nm = _ellipsize(draw, sname or "", syn_font, max_w)
         draw.text(
@@ -944,8 +944,8 @@ def _render_profile_card_png(
     # badge's left edge below it so the under-avatar stack shares one clean
     # left margin.
     if clan_row is not None and clan_pill_top is not None:
-        clan_value_font = _load_font(sc(11), bold=True)
-        clan_icon_px = sc(15)
+        clan_value_font = _load_font(sc(15), bold=True)
+        clan_icon_px = sc(20)
         clan_icon_gap = sc(7)
         clan_val = clan_row[1] or "\u2014"
         clan_emoji = clan_row[2]
@@ -970,9 +970,9 @@ def _render_profile_card_png(
     # Mastery Rank capsule badge beneath the header (gold-tinted fill +
     # hairline gold border), sized to its content.
     if mastery_row is not None and mr_pill_top is not None:
-        mr_label_font = _load_font(sc(13), bold=True)
-        mr_value_font = _load_font(sc(14), bold=True)
-        mr_icon_px = sc(18)
+        mr_label_font = _load_font(sc(16), bold=True)
+        mr_value_font = _load_font(sc(18), bold=True)
+        mr_icon_px = sc(23)
         mr_icon_gap = sc(8)
         badge_pad_x = sc(14)
         mr_label, mr_value = _mastery_label_value(mastery_row[1])
@@ -1015,7 +1015,7 @@ def _render_profile_card_png(
     # the member holds others. Anchored high so the eyebrow sits level with
     # the identity header.
     cxc = sc((panel_x0 + panel_x1) // 2)
-    title_eyebrow_font = _load_font(sc(13), bold=True)
+    title_eyebrow_font = _load_font(sc(15), bold=True)
     flourish_half_w = sc(right_panel_w // 2 - 26)
 
     def _title_flourish(cy: int) -> None:
@@ -1089,7 +1089,7 @@ def _render_profile_card_png(
         yl += _T_EB_GAP
         draw.text(
             (cxc, sc(yl + 10)), "None yet",
-            font=_load_font(sc(12), bold=True),
+            font=_load_font(sc(14), bold=True),
             fill=_PROGRESS_MUTED, anchor="mm",
         )
 
