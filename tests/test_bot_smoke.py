@@ -179,7 +179,47 @@ class MasteryEditorHelperTests(unittest.TestCase):
         self.assertEqual(
             b._parse_mr_bucket_range("Legendary 1-8"), ("LR", 1, 8)
         )
+        # Per-rank role names parse as a single-value range (lo == hi).
+        self.assertEqual(b._parse_mr_bucket_range("MR 28"), ("MR", 28, 28))
+        self.assertEqual(b._parse_mr_bucket_range("MR 1"), ("MR", 1, 1))
+        self.assertEqual(
+            b._parse_mr_bucket_range("Legendary 3"), ("LR", 3, 3)
+        )
         self.assertIsNone(b._parse_mr_bucket_range("no digits"))
+
+    def test_mr_bucket_role_for_matches_individual_ranks(self):
+        """Per-rank role names (MR 28 / Legendary 3) resolve exactly."""
+        b = self.bot_module
+
+        class _Role:
+            def __init__(self, rid, name):
+                self.id = rid
+                self.name = name
+
+        roles = {n: _Role(n, f"MR {n}") for n in range(1, 31)}
+        roles.update({100 + n: _Role(100 + n, f"Legendary {n}") for n in range(1, 9)})
+
+        class _Guild:
+            def get_role(self, rid):
+                return roles.get(rid)
+
+        original = b.MR_ROLE_IDS
+        b.MR_ROLE_IDS = list(roles.keys())
+        try:
+            guild = _Guild()
+            self.assertEqual(b._mr_bucket_role_for(guild, "MR", 28).name, "MR 28")
+            self.assertEqual(b._mr_bucket_role_for(guild, "MR", 1).name, "MR 1")
+            self.assertEqual(b._mr_bucket_role_for(guild, "MR", 30).name, "MR 30")
+            self.assertEqual(
+                b._mr_bucket_role_for(guild, "LR", 3).name, "Legendary 3"
+            )
+            self.assertEqual(
+                b._mr_bucket_role_for(guild, "LR", 8).name, "Legendary 8"
+            )
+            # A rank with no configured role returns None (safe no-op upstream).
+            self.assertIsNone(b._mr_bucket_role_for(guild, "MR", 31))
+        finally:
+            b.MR_ROLE_IDS = original
 
     def test_mastery_select_options_within_discord_cap(self):
         first, second = self.bot_module._mastery_select_options()
@@ -1295,6 +1335,22 @@ class EnvRewriteRoundtripTests(unittest.TestCase):
         self.env_path.write_text("BAR=1\n")
         self.assertTrue(self.b._update_env_id_list("NEW_IDS", [4, 5]))
         self.assertEqual(self.env_path.read_text(), "BAR=1\n\nNEW_IDS=4,5\n")
+
+    def test_update_env_value_replaces_then_appends(self):
+        # Replaces an existing KEY=value line in place (commas in the value
+        # are fine — this is how MR_ROLE_NAMES is persisted).
+        self.env_path.write_text("MR_ROLE_NAMES=MR 1-10,LR 1-7\nBAR=1\n")
+        self.assertTrue(
+            self.b._update_env_value("MR_ROLE_NAMES", "MR 1,MR 2,Legendary 1")
+        )
+        self.assertEqual(
+            self.env_path.read_text(),
+            "MR_ROLE_NAMES=MR 1,MR 2,Legendary 1\nBAR=1\n",
+        )
+        # Missing key path appends after a blank separator.
+        self.env_path.write_text("BAR=1\n")
+        self.assertTrue(self.b._update_env_value("NEW_KEY", "hello"))
+        self.assertEqual(self.env_path.read_text(), "BAR=1\n\nNEW_KEY=hello\n")
 
 
 class ProfileAccessGateTests(unittest.TestCase):

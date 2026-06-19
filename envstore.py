@@ -140,7 +140,15 @@ def _update_env_platform_ids(ids: dict[str, int | None]) -> bool:
 
 def _update_env_id_list(env_key: str, ids: list[int]) -> bool:
     """Rewrite (or append) ``ENV_KEY=id1,id2,...`` in the .env file."""
-    value = ",".join(str(i) for i in ids)
+    return _update_env_value(env_key, ",".join(str(i) for i in ids))
+
+
+def _update_env_value(env_key: str, value: str) -> bool:
+    """Rewrite (or append) ``ENV_KEY=value`` in the .env file (generic string).
+
+    Shared skeleton for the id-list writer and any caller that needs to persist
+    a single ``KEY=value`` line (e.g. a resolved comma-joined name list).
+    """
     seen = False
 
     def replace(line: str) -> str | None:

@@ -61,6 +61,7 @@ from envstore import (  # noqa: F401  (some re-exported for tests via bot.*)
     _update_env_clan_slots,
     _update_env_id_list,
     _update_env_platform_ids,
+    _update_env_value,
 )
 # Card rendering lives in cards.py; re-exported for internal callers + tests.
 from cards import (  # noqa: F401  (test-facing re-exports resolved as bot.*)
@@ -207,7 +208,10 @@ ONBOARDING_POLL_SECONDS = _int_env("ONBOARDING_POLL_SECONDS", 600)
 # the source of truth at runtime (and can be hand-edited as a fallback).
 MR_ROLE_NAMES: list[str] = _csv(
     "MR_ROLE_NAMES",
-    "MR 1-10,MR 11-15,MR 16-22,MR 22-29,MR 30,LR 1-7",
+    ",".join(
+        [f"MR {n}" for n in range(1, 31)]
+        + [f"Legendary {n}" for n in range(1, 9)]
+    ),
 )
 SYNDICATE_ROLE_NAMES: list[str] = _csv(
     "SYNDICATE_ROLE_NAMES",
@@ -1049,8 +1053,8 @@ async def _member_profile_info_lines(
             rows.append(("Platform", "\u2014", None))
 
     # Mastery Rank — prefer the exact stored rank; otherwise fall back to
-    # the coarse role-bucket name(s) the member holds. Exception: if the
-    # member holds a Legendary (LR) bucket role, that wins even over a
+    # the per-rank role name(s) the member holds. Exception: if the
+    # member holds a Legendary (LR) role, that wins even over a
     # lower stored rank — the Legendary role is the source of truth for
     # legendary status (a stale OCR'd "MR n" shouldn't hide it).
     member_mr_roles = _member_mastery_roles(member)

@@ -73,6 +73,32 @@ class ParseMasteryRankTests(unittest.TestCase):
         text = "MASTERY RANK\n200\n14\nCLAN\n"
         self.assertEqual(parse_mastery_rank(text), "MR 14")
 
+    def test_extracts_legendary_same_line(self) -> None:
+        text = "MASTERY RANK\nLEGENDARY 3\nCLAN\nGolden Pagoda"
+        self.assertEqual(parse_mastery_rank(text), "LR 3")
+
+    def test_extracts_legendary_number_on_next_line(self) -> None:
+        text = "MASTERY RANK\nLEGENDARY RANK\n2\nCLAN"
+        self.assertEqual(parse_mastery_rank(text), "LR 2")
+
+    def test_extracts_legendary_shorthand(self) -> None:
+        text = "MASTERY RANK\nLR 5\nCLAN"
+        self.assertEqual(parse_mastery_rank(text), "LR 5")
+
+    def test_legendary_wins_over_credit_leak(self) -> None:
+        # The legendary marker must win even when the top-bar credit count
+        # leaks onto the line just below the header.
+        text = "MASTERY RANK\n3,837,977\nLEGENDARY 1\nCLAN"
+        self.assertEqual(parse_mastery_rank(text), "LR 1")
+
+    def test_legendary_label_then_credits_then_number(self) -> None:
+        text = "MASTERY RANK\nLEGENDARY RANK\n2,037,372\n4\nCLAN"
+        self.assertEqual(parse_mastery_rank(text), "LR 4")
+
+    def test_plain_numeric_unaffected_by_legendary_scan(self) -> None:
+        text = "MASTERY RANK\n28\nCLAN\nGolden Pagoda"
+        self.assertEqual(parse_mastery_rank(text), "MR 28")
+
 
 class FindClanSlotTests(unittest.TestCase):
     def test_matches_case_insensitively(self) -> None:

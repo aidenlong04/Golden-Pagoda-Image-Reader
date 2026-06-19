@@ -54,13 +54,46 @@ _MASTERY_HEADER_RE = re.compile(r"MASTERY\s*RANK", re.IGNORECASE)
 _THOUSANDS_RE = re.compile(r"\d[\d,\s\.]*\d{3}\b")
 _LONG_DIGITS_RE = re.compile(r"\b\d{4,}\b")
 _SMALL_INT_RE = re.compile(r"\b(\d{1,3})\b")
+# Legendary rank markers: the post-MR-30 prestige tier reads "LEGENDARY n" (or
+# the shorthand "LR n") on the badge. A Legendary rank is just a higher form of
+# mastery, so it's parsed to "LR n" and assigned the matching Legendary role.
+_LEGENDARY_RE = re.compile(r"LEGEND", re.IGNORECASE)
+_LR_TOKEN_RE = re.compile(r"\bL\.?R\.?\s*\d{1,2}\b", re.IGNORECASE)
+
+
+def _legendary_rank_in_window(window: list[str]) -> str | None:
+    """Find a Legendary rank ("LEGENDARY n" / "LR n") in the lines after a
+    MASTERY RANK header. Returns ``"LR n"`` or None.
+
+    Scanned before the ordinary numeric path because a Legendary badge can read
+    as a bare small integer the MR path would mistake for a normal rank.
+    """
+    for i, candidate in enumerate(window):
+        if not candidate:
+            continue
+        if not (_LEGENDARY_RE.search(candidate) or _LR_TOKEN_RE.search(candidate)):
+            continue
+        # The rank number on the same line ("LEGENDARY 3" / "LR 3")...
+        same = re.search(r"\d{1,2}", candidate)
+        if same:
+            return f"LR {int(same.group())}"
+        # ...otherwise the next standalone small int (skipping XP/credit runs).
+        for nxt in window[i + 1:]:
+            if not nxt or _THOUSANDS_RE.search(nxt) or _LONG_DIGITS_RE.search(nxt):
+                continue
+            m = _SMALL_INT_RE.search(nxt)
+            if m:
+                return f"LR {int(m.group(1))}"
+    return None
 
 
 def parse_mastery_rank(ocr_text: str) -> str | None:
     """Return the mastery rank as a display string (e.g. 'MR 12' or 'Unranked').
 
-    Looks below a 'MASTERY RANK' header for the first non-empty line. Accepts
-    either a numeric rank or the literal 'UNRANKED'. Returns None if absent.
+    Looks below a 'MASTERY RANK' header for the first non-empty line. Accepts a
+    numeric rank ('MR n'), a Legendary rank ('LR n' — the post-MR-30 prestige
+    tier, a higher form of mastery), or the literal 'UNRANKED'. Returns None if
+    absent.
     """
     if not ocr_text:
         return None
@@ -72,7 +105,13 @@ def parse_mastery_rank(ocr_text: str) -> str | None:
         # an offset HUD), the credit count from the top bar can leak onto
         # the line right after the header, pushing the actual badge
         # number a few lines further down.
-        for candidate in lines[index + 1 : index + 10]:
+        window = lines[index + 1 : index + 10]
+        # Legendary outranks a bare number — check it across the whole window
+        # before the ordinary numeric scan can mistake the badge for "MR n".
+        legendary = _legendary_rank_in_window(window)
+        if legendary is not None:
+            return legendary
+        for candidate in window:
             if not candidate:
                 continue
             upper = candidate.upper()
