@@ -26,6 +26,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -101,6 +102,25 @@ def _parse_args() -> argparse.Namespace:
             "Run the full verify pipeline, which ALSO assigns clan + "
             "mastery-bucket roles from the screenshot. Default: off "
             "(record-only enrichment, no role changes)."
+        ),
+    )
+    parser.add_argument(
+        "--mastery-only",
+        action="store_true",
+        help=(
+            "OCR each record and assign ONLY the mastery (MR/LR) role from "
+            "the read rank, leaving clan / platform / syndicate AND the "
+            "record message untouched. Safe bulk migration with no "
+            "clan-swap risk. Takes precedence over --assign-roles."
+        ),
+    )
+    parser.add_argument(
+        "--prune-dead",
+        action="store_true",
+        help=(
+            "Audit + clean only: drop record message ids from the index "
+            "that 404 (deleted messages). No OCR or role changes. Combine "
+            "with --dry-run to preview without writing the index."
         ),
     )
     parser.add_argument(
@@ -395,6 +415,52 @@ class EnrichClient(discord.Client):
         )
         return "rebuilt"
 
+    async def _prune_dead(
+        self, channel, index: dict, index_path, *, dry_run: bool
+    ) -> None:
+        """Drop record message ids from the index that 404 (deleted).
+
+        Walks every indexed id (not just the newest), fetches it, and removes
+        the ones Discord reports as Unknown Message. Transient fetch errors
+        keep the id (only a definitive 404 prunes). Fail-soft.
+        """
+        users = index.get("users", {})
+        checked = pruned = emptied = 0
+        for uid_str in list(users.keys()):
+            ids = users.get(uid_str) or []
+            live: list = []
+            for mid in ids:
+                checked += 1
+                try:
+                    await channel.fetch_message(int(mid))
+                    live.append(mid)
+                except discord.NotFound:
+                    pruned += 1
+                    logger.info(
+                        "prune: user %s record %s is 404 — dropping",
+                        uid_str, mid,
+                    )
+                except (discord.HTTPException, ValueError):
+                    logger.warning(
+                        "prune: user %s record %s fetch error — keeping",
+                        uid_str, mid, exc_info=True,
+                    )
+                    live.append(mid)
+                await asyncio.sleep(0.3)
+            if live != ids:
+                if live:
+                    users[uid_str] = live
+                else:
+                    del users[uid_str]
+                    emptied += 1
+        logger.info(
+            "Prune complete: checked=%d pruned=%d users_emptied=%d dry_run=%s",
+            checked, pruned, emptied, dry_run,
+        )
+        if not dry_run and pruned:
+            records_index.save_index(index, index_path)
+            logger.info("prune: saved cleaned index to %s", index_path)
+
     async def _run(self) -> None:
         a = self._args
         # --rebuild gets its own resume state so it doesn't inherit the
@@ -431,6 +497,12 @@ class EnrichClient(discord.Client):
 
         index = records_index.load_index(a.index_path)
         users = index.get("users", {})
+
+        if a.prune_dead:
+            await self._prune_dead(
+                channel, index, a.index_path, dry_run=a.dry_run,
+            )
+            return
 
         done = set() if (a.force or a.user_id or a.refresh_only) else (
             _load_state(a.state_path)
@@ -543,6 +615,49 @@ class EnrichClient(discord.Client):
                 )
                 continue
 
+            if a.mastery_only:
+                # OCR + assign ONLY the mastery role; never touch clan /
+                # platform / syndicate or rewrite the record (so a stale
+                # screenshot can't move a clan-switcher). The role change
+                # lets the live bot's on_member_update refresh the record.
+                fields = await bot._ocr_profile_fields(
+                    img, "record.png", content_type,
+                )
+                mastery_rank = fields.mastery_rank if fields.ok else None
+                m = re.match(
+                    r"\s*(MR|LR)\s*(\d+)\s*$", mastery_rank or "",
+                    re.IGNORECASE,
+                )
+                if not m:
+                    ocr_empty += 1
+                    logger.info(
+                        "user %s (%s): mastery=%r not a rank — no change",
+                        uid, member.display_name, mastery_rank,
+                    )
+                    continue
+                kind, value = m.group(1).upper(), int(m.group(2))
+                if a.dry_run:
+                    logger.info(
+                        "user %s (%s): would assign mastery %s %d",
+                        uid, member.display_name, kind, value,
+                    )
+                    continue
+                status = await bot._apply_mastery_bucket(member, kind, value)
+                logger.info(
+                    "user %s (%s): mastery %s %d -> %s",
+                    uid, member.display_name, kind, value, status,
+                )
+                if status == "assigned":
+                    ocr_ok += 1
+                    wrote += 1
+                    done.add(uid)
+                else:
+                    ocr_empty += 1
+                if wrote and wrote % 10 == 0:
+                    _save_state(a.state_path, done)
+                await asyncio.sleep(1.5)
+                continue
+
             if a.assign_roles:
                 result = await bot._verify_member_from_screenshot(
                     member, image_bytes=img,
@@ -612,6 +727,12 @@ class EnrichClient(discord.Client):
                 "Refresh complete: processed=%d re-rendered=%d "
                 "skipped_left=%d dry_run=%s",
                 processed, wrote, skipped_left, a.dry_run,
+            )
+        elif a.mastery_only:
+            logger.info(
+                "Mastery-only complete: processed=%d assigned=%d "
+                "skipped_norank=%d skipped_left=%d dry_run=%s",
+                processed, wrote, ocr_empty, skipped_left, a.dry_run,
             )
         else:
             logger.info(
