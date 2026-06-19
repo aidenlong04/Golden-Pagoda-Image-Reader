@@ -7,6 +7,7 @@ Covers:
 """
 from __future__ import annotations
 
+import asyncio
 import importlib
 import time
 import unittest
@@ -694,6 +695,87 @@ class RepromptSweepTests(unittest.IsolatedAsyncioTestCase):
 
             mock_post.assert_not_awaited()
             mock_delete.assert_called_once_with(1, 400)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent record-write serialization (duplicate-log regression guard)
+# ---------------------------------------------------------------------------
+
+class RecordWriteLockTests(unittest.IsolatedAsyncioTestCase):
+    """Concurrent record writes for one member must not duplicate the record.
+
+    Regression guard for the duplicate "Member Record" logs: the onboarding
+    screenshot write and the role-grant refresh can fire for the same member
+    within the same second. Without per-member serialization both observe an
+    empty records_index (the index write lags the post) and each create a
+    record. ``_edit_or_create_member_record`` holds a per-member lock so the
+    second writer observes the first's freshly-indexed record and edits it in
+    place. This test fails (two creates) if the lock is removed.
+    """
+
+    async def asyncSetUp(self):
+        import bot as bot_module
+        self.bot = bot_module
+        # Drop any lock bound to a previous test's (now-closed) event loop.
+        self.bot._RECORD_WRITE_LOCKS.clear()
+
+    async def test_concurrent_edit_or_create_makes_single_record(self):
+        bot = self.bot
+        member = MagicMock()
+        member.id = 4242
+        member.guild = MagicMock()
+        member.guild.id = 7
+
+        index: dict[int, list[int]] = {}
+        next_id = {"v": 1000}
+
+        async def fake_create(m, summary_lines, *, image_bytes=None):
+            # Simulate the post latency that precedes the index write — the
+            # exact window that produced duplicate records before the lock.
+            await asyncio.sleep(0.01)
+            next_id["v"] += 1
+            index.setdefault(m.id, []).append(next_id["v"])
+
+        edits: list[int] = []
+
+        async def fake_edit(
+            channel_id, message_id, m, summary_lines, *, image_bytes=None
+        ):
+            edits.append(message_id)
+
+        def fake_get_ids(user_id):
+            return list(index.get(user_id, []))
+
+        with (
+            patch.object(bot, "MEMBER_RECORDS_CHANNEL_ID", 555),
+            patch.object(bot, "_create_member_record", side_effect=fake_create),
+            patch.object(bot, "_edit_member_record", side_effect=fake_edit),
+            patch.object(bot, "_records_channel_id", return_value=555),
+            patch.object(
+                bot, "_member_record_profile_lines",
+                return_value=["In-game name: **Viroella#826**"],
+            ),
+            patch.object(
+                bot, "_member_profile_from_records",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(bot, "_invalidate_record_profile_cache"),
+            patch.object(
+                bot.records_index, "get_record_message_ids",
+                side_effect=fake_get_ids,
+            ),
+        ):
+            await asyncio.gather(
+                bot._edit_or_create_member_record(
+                    member, in_game_name="Viroella#826",
+                    mastery_rank="MR 25", image_bytes=b"shot",
+                ),
+                bot._edit_or_create_member_record(member),
+            )
+
+        # Exactly one record created; the second writer edited it in place.
+        self.assertEqual(len(index.get(member.id, [])), 1)
+        self.assertEqual(len(edits), 1)
 
 
 # ---------------------------------------------------------------------------

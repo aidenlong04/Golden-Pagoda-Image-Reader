@@ -2504,14 +2504,16 @@ async def _create_member_record(
         member.id, MEMBER_RECORDS_CHANNEL_ID,
     )
     # Keep the user_id -> record message_ids index fresh for fast lookups
-    # (records_index). File IO runs off the event loop.
+    # (records_index). Awaited (not spawned) so the new id is in the index
+    # before the per-member write lock is released — otherwise a concurrent
+    # writer could still see an empty index and post a duplicate record.
     if message_id is not None:
-        _spawn_bg_task(asyncio.to_thread(
+        await asyncio.to_thread(
             records_index.add_record,
             member.id,
             message_id,
             channel_id=MEMBER_RECORDS_CHANNEL_ID,
-        ))
+        )
 
 
 async def _edit_member_record(
@@ -2554,6 +2556,19 @@ async def _edit_member_record(
         )
         if shot is not None:
             image_bytes = await _fetch_cdn_bytes(str(shot["url"]))
+            if image_bytes is None:
+                # The record HAS a screenshot but it couldn't be re-downloaded
+                # (transient CDN failure). Rewriting the embed now would drop
+                # the screenshot permanently (has_image=False, only the avatar
+                # gets re-uploaded), so abort this refresh and leave the record
+                # untouched — a later edit recovers the image and applies the
+                # field changes then.
+                logger.warning(
+                    "records: skipping edit for %s \u2014 could not recover the "
+                    "existing screenshot (CDN fetch failed); preserving it",
+                    member.id,
+                )
+                return
     embed = _build_member_record_embed(
         member, summary_lines,
         has_image=bool(image_bytes), has_avatar=bool(avatar_bytes),
@@ -2566,6 +2581,29 @@ async def _edit_member_record(
         )
     else:
         await _edit_channel_embed(channel_id, message_id, embed)
+
+
+_RECORD_WRITE_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _record_write_lock(user_id: int) -> asyncio.Lock:
+    """Per-member lock serializing record writes.
+
+    Without it, two concurrent ``_edit_or_create_member_record`` calls for the
+    same member (e.g. the onboarding screenshot write and the
+    ``on_member_update`` / ``_finalize_onboarding_with_record`` refresh fired
+    ~simultaneously when the separate verified-role bot grants its role) can
+    both read an empty ``records_index`` — the index write lags the post — and
+    each create a *duplicate* record, so the screenshot only lands on one of
+    them. Serializing per member makes the second writer observe the first's
+    freshly-indexed record and edit it in place instead. Created lazily on the
+    running loop; keyed by the globally-unique user id (matches the index key).
+    """
+    lock = _RECORD_WRITE_LOCKS.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _RECORD_WRITE_LOCKS[user_id] = lock
+    return lock
 
 
 async def _edit_or_create_member_record(
@@ -2592,37 +2630,43 @@ async def _edit_or_create_member_record(
     if not MEMBER_RECORDS_CHANNEL_ID:
         return
     try:
-        # Preserve the OCR-only fields (in-game handle + exact Mastery Rank)
-        # from the existing record when the caller didn't supply them — a
-        # role-change refresh must not clobber data that isn't role-derivable.
-        if in_game_name is None or mastery_rank is None:
-            existing = await _member_profile_from_records(
-                member.guild.id, member.id
+        # Serialize per member so a concurrent edit-or-create (e.g. the
+        # onboarding screenshot write racing the role-change refresh) can't
+        # post a duplicate record — the second writer waits, then observes the
+        # first's freshly-indexed record and edits it in place.
+        async with _record_write_lock(member.id):
+            # Preserve the OCR-only fields (in-game handle + exact Mastery
+            # Rank) from the existing record when the caller didn't supply
+            # them — a role-change refresh must not clobber data that isn't
+            # role-derivable.
+            if in_game_name is None or mastery_rank is None:
+                existing = await _member_profile_from_records(
+                    member.guild.id, member.id
+                )
+                if existing:
+                    if in_game_name is None:
+                        in_game_name = existing.get("in_game_name")
+                    if mastery_rank is None:
+                        mastery_rank = existing.get("mastery_rank")
+            summary_lines = _member_record_profile_lines(
+                member, in_game_name=in_game_name, mastery_rank=mastery_rank,
             )
-            if existing:
-                if in_game_name is None:
-                    in_game_name = existing.get("in_game_name")
-                if mastery_rank is None:
-                    mastery_rank = existing.get("mastery_rank")
-        summary_lines = _member_record_profile_lines(
-            member, in_game_name=in_game_name, mastery_rank=mastery_rank,
-        )
-        if extra_lines:
-            summary_lines = summary_lines + list(extra_lines)
-        ids = await asyncio.to_thread(
-            records_index.get_record_message_ids, member.id
-        )
-        channel_id = _records_channel_id()
-        if ids and channel_id:
-            await _edit_member_record(
-                channel_id, ids[-1], member, summary_lines,
-                image_bytes=image_bytes,
+            if extra_lines:
+                summary_lines = summary_lines + list(extra_lines)
+            ids = await asyncio.to_thread(
+                records_index.get_record_message_ids, member.id
             )
-        else:
-            await _create_member_record(
-                member, summary_lines, image_bytes=image_bytes,
-            )
-        _invalidate_record_profile_cache(member.guild.id, member.id)
+            channel_id = _records_channel_id()
+            if ids and channel_id:
+                await _edit_member_record(
+                    channel_id, ids[-1], member, summary_lines,
+                    image_bytes=image_bytes,
+                )
+            else:
+                await _create_member_record(
+                    member, summary_lines, image_bytes=image_bytes,
+                )
+            _invalidate_record_profile_cache(member.guild.id, member.id)
     except Exception:
         logger.exception(
             "records: edit_or_create failed for %s", member.id
@@ -4580,30 +4624,77 @@ async def _handle_manage_interaction(
         await _interaction_callback(interaction, 7, components)  # UPDATE_MESSAGE
 
 
+# CDN GETs (avatar / emoji / record-screenshot recovery) retry transient
+# failures so a momentary blip can't, e.g., drop a member-record screenshot in
+# _edit_member_record. Only network errors / timeouts / 429 / 5xx are retried;
+# a non-transient response (403/404/…) returns None immediately so a genuinely
+# missing asset stays fast.
+_CDN_RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+_CDN_RETRY_BASE = 0.5
+_CDN_RETRY_MAX_DELAY = 4.0
+
+
 async def _fetch_cdn_bytes(
-    url: str, *, accept: str = "image/png,image/*;q=0.8"
+    url: str, *, accept: str = "image/png,image/*;q=0.8", attempts: int = 3,
 ) -> bytes | None:
     """GET ``url`` via the shared session; return the body or None on failure.
 
     Discord's CDN 403s requests without a recognisable User-Agent, so we
-    always send one. Shared by the avatar and emoji fetchers.
+    always send one. Shared by the avatar, emoji, and record-screenshot
+    fetchers. Transient failures (network error / timeout / 429 / 5xx) are
+    retried up to ``attempts`` times with short exponential back-off (honouring
+    a ``Retry-After`` header when present); a non-transient response (e.g.
+    403/404) returns None immediately.
     """
-    try:
-        headers = {
-            "User-Agent": "DiscordBot (https://github.com/aidenlong04/Golden-Pagoda-Image-Reader, 1.0)",
-            "Accept": accept,
-        }
-        timeout = aiohttp.ClientTimeout(total=8)
-        session = await _get_http_session()
-        async with session.get(url, headers=headers, timeout=timeout) as resp:
-            if resp.status != 200:
-                logger.warning("cdn fetch returned HTTP %s for %s", resp.status, url)
-                return None
-            data = await resp.read()
-            return data or None
-    except Exception:
-        logger.warning("cdn fetch failed for %s", url, exc_info=True)
-        return None
+    from utils.retry import exponential_backoff
+
+    headers = {
+        "User-Agent": "DiscordBot (https://github.com/aidenlong04/Golden-Pagoda-Image-Reader, 1.0)",
+        "Accept": accept,
+    }
+    timeout = aiohttp.ClientTimeout(total=8)
+    attempts = max(1, attempts)
+    for attempt in range(1, attempts + 1):
+        delay: float | None = None
+        try:
+            session = await _get_http_session()
+            async with session.get(
+                url, headers=headers, timeout=timeout
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    return data or None
+                if resp.status not in _CDN_RETRYABLE_STATUS:
+                    logger.warning(
+                        "cdn fetch returned HTTP %s for %s", resp.status, url
+                    )
+                    return None
+                # Transient HTTP status — honour Retry-After when present.
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    delay = (
+                        min(float(retry_after), _CDN_RETRY_MAX_DELAY)
+                        if retry_after else None
+                    )
+                except (TypeError, ValueError):
+                    delay = None
+                logger.warning(
+                    "cdn fetch returned HTTP %s for %s (attempt %d/%d)",
+                    resp.status, url, attempt, attempts,
+                )
+        except Exception:
+            logger.warning(
+                "cdn fetch failed for %s (attempt %d/%d)",
+                url, attempt, attempts, exc_info=True,
+            )
+        if attempt >= attempts:
+            break
+        if delay is None:
+            delay = exponential_backoff(
+                attempt, base=_CDN_RETRY_BASE, cap=_CDN_RETRY_MAX_DELAY
+            )
+        await asyncio.sleep(delay)
+    return None
 
 
 async def _fetch_avatar_bytes(url: str) -> bytes | None:
