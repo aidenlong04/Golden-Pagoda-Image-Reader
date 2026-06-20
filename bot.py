@@ -12,6 +12,7 @@ import sys
 import time
 import warnings
 from collections.abc import Callable, Iterable
+from datetime import datetime, timezone
 from typing import NamedTuple
 
 # Suppress discord.py's audioop DeprecationWarning on Python 3.12. The bot
@@ -1711,15 +1712,19 @@ async def _remove_onboarding_dropdown(guild_id: int, user_id: int) -> None:
 
 
 async def _finalize_onboarding_with_record(member: discord.Member) -> None:
-    """Finalize a member's onboarding AND ensure they have a canonical record.
+    """Finalize a member's onboarding when they gain a verified/honoured role.
 
     Called from ``on_member_update`` when a member gains a verified/honoured
     role outside the self-serve screenshot pipeline (e.g., another bot granted
-    verified, or manual role). Marks onboarding complete, strips the welcome
-    dropdown, and creates a role-derived record if one doesn't already exist.
+    verified, or a manual role). Marks onboarding complete and strips the
+    welcome dropdown.
 
-    The record will be partial (no in-game name / exact mastery / screenshot —
-    those are OCR-only) but ensures the member appears in the records channel.
+    It deliberately does **not** create a record: a member record is born only
+    from a screenshot upload (onboarding verify / ``/profile`` verify /
+    ``/manage`` screenshot), so a bare verified-role grant for a member who
+    never uploaded one must not leave an empty, screenshot-less "Member Record"
+    log behind. When the member already has a record, its role-derived fields
+    are refreshed in place (the screenshot + OCR-only fields are preserved).
     Idempotent + fail-soft: no-ops gracefully. Spawned as a background task.
     """
     guild_id = member.guild.id
@@ -1729,12 +1734,12 @@ async def _finalize_onboarding_with_record(member: discord.Member) -> None:
         analytics.complete_onboarding_prompt, guild_id, user_id
     )
     await _remove_onboarding_dropdown(guild_id, user_id)
-    # Ensure the member has a record (role-derived: partial, no OCR-only fields).
+    # Refresh an EXISTING record's role-derived fields; never create a new,
+    # screenshot-less one from a bare role grant.
     ids = await asyncio.to_thread(
         records_index.get_record_message_ids, user_id
     )
-    if not ids:
-        # No existing record — create one from current roles.
+    if ids:
         await _edit_or_create_member_record(member)
 
 
@@ -2458,7 +2463,8 @@ def _build_member_record_embed(
         "color": ACCENT_PASS,
         "description": description,
         "fields": fields,
-        "footer": {"text": "Golden Pagoda  \u00b7  Member Records"},
+        "footer": {"text": "Last edited"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     avatar = getattr(member, "display_avatar", None)
     if has_avatar:
@@ -2666,10 +2672,27 @@ async def _edit_or_create_member_record(
                     channel_id, ids[-1], member, summary_lines,
                     image_bytes=image_bytes,
                 )
-            else:
+            elif image_bytes is not None or extra_lines:
+                # A record is BORN only when it carries evidence: the member's
+                # uploaded screenshot, or an explicit manual-review note. A
+                # purely role-derived refresh (verified-role grant, mastery /
+                # IGN edit, role change) that finds no existing record must NOT
+                # mint a screenshot-less "profile" log — that empty record is
+                # exactly the missing-screenshot log this guard prevents. Such
+                # members get a real record when they actually upload a
+                # screenshot (onboarding verify / /profile verify / /manage
+                # screenshot update).
                 await _create_member_record(
                     member, summary_lines, image_bytes=image_bytes,
                 )
+            else:
+                logger.debug(
+                    "records: no existing record for %s and no screenshot / "
+                    "review note supplied — not creating a screenshot-less "
+                    "record",
+                    member.id,
+                )
+                return
             _invalidate_record_profile_cache(member.guild.id, member.id)
     except Exception:
         logger.exception(
@@ -2766,6 +2789,24 @@ def _collect_v2_text(components: object) -> str:
     return "\n".join(parts)
 
 
+_EXACT_MASTERY_RE = re.compile(r"^(MR|LR)\s*(\d+)$", re.IGNORECASE)
+
+
+def _is_exact_mastery_rank(value: str) -> bool:
+    """True when ``value`` is an exact ``MR n`` / ``LR n`` rank with a real
+    (>= 1) number.
+
+    The records channel stores the exact OCR rank and prefers it over the
+    coarse role bucket on every refresh, so a bogus ``MR 0`` (a stray UI/credit
+    digit the OCR misread) would otherwise stick forever and never update to
+    the member's real rank. Rejecting rank 0 here drops that bad value on read
+    so the role bucket wins instead. Rank roles run MR 1-30 / Legendary 1-8 and
+    the mastery editor already requires ``> 0``, so 0 is never a real rank.
+    """
+    m = _EXACT_MASTERY_RE.match(value or "")
+    return bool(m) and int(m.group(2)) >= 1
+
+
 def _parse_record_profile_text(text: str) -> dict:
     """Parse a record body's ``Key: **Value**`` lines into a profile dict.
 
@@ -2781,9 +2822,7 @@ def _parse_record_profile_text(text: str) -> dict:
         if not key or key in out:
             continue
         value = m.group(2).strip()
-        if key == "mastery_rank" and not re.match(
-            r"^(MR|LR)\s*\d+$", value, re.IGNORECASE
-        ):
+        if key == "mastery_rank" and not _is_exact_mastery_rank(value):
             continue
         out[key] = value
     return out
@@ -2818,9 +2857,7 @@ def _parse_record_embed(embeds: object) -> dict:
                 value = value[2:-2].strip()
             if not value:
                 continue
-            if key == "mastery_rank" and not re.match(
-                r"^(MR|LR)\s*\d+$", value, re.IGNORECASE
-            ):
+            if key == "mastery_rank" and not _is_exact_mastery_rank(value):
                 continue
             out[key] = value
     return out

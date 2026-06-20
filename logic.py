@@ -126,9 +126,11 @@ def parse_mastery_rank(ocr_text: str) -> str | None:
             m = _SMALL_INT_RE.search(candidate)
             if m:
                 value = int(m.group(1))
-                # Warframe MR currently caps well under 100; treat
-                # anything above 50 as a stray match and keep scanning.
-                if value > 50:
+                # MR badges run 1-30; a 0 (or a stray > 50) below the header is
+                # a misread UI/credit digit, not a real rank. Skip it and keep
+                # scanning — otherwise a bogus "MR 0" is stored and then
+                # preferred over the member's real rank role on every refresh.
+                if value < 1 or value > 50:
                     continue
                 return f"MR {value}"
     return None

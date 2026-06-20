@@ -73,6 +73,16 @@ class ParseMasteryRankTests(unittest.TestCase):
         text = "MASTERY RANK\n200\n14\nCLAN\n"
         self.assertEqual(parse_mastery_rank(text), "MR 14")
 
+    def test_skips_stray_zero_below_header(self) -> None:
+        # A bare "0" below the header is a misread UI digit, not MR 0 — there
+        # is no MR 0 role and storing "MR 0" sticks forever (preferred over the
+        # real rank role). With no other candidate the parse returns None.
+        self.assertIsNone(parse_mastery_rank("MASTERY RANK\n0\nCLAN\n"))
+
+    def test_skips_zero_then_reads_real_rank(self) -> None:
+        text = "MASTERY RANK\n0\n25\nCLAN\n"
+        self.assertEqual(parse_mastery_rank(text), "MR 25")
+
     def test_extracts_legendary_same_line(self) -> None:
         text = "MASTERY RANK\nLEGENDARY 3\nCLAN\nGolden Pagoda"
         self.assertEqual(parse_mastery_rank(text), "LR 3")

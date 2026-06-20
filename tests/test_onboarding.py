@@ -779,6 +779,84 @@ class RecordWriteLockTests(unittest.IsolatedAsyncioTestCase):
 
 
 # ---------------------------------------------------------------------------
+# Record creation policy (missing-screenshot regression guard)
+# ---------------------------------------------------------------------------
+
+class RecordCreationPolicyTests(unittest.IsolatedAsyncioTestCase):
+    """A member record must be BORN only with evidence: the member's uploaded
+    screenshot, or an explicit manual-review note. A purely role-derived
+    refresh (verified-role grant, mastery / IGN edit, role change) that finds
+    no existing record must NOT mint a brand-new, screenshot-less "Member
+    Record" log. Regression guard for empty profile logs appearing with no
+    screenshot. ``_edit_or_create_member_record`` still edits an existing
+    record in any case (the role-derived refresh path).
+    """
+
+    async def asyncSetUp(self):
+        import bot as bot_module
+        self.bot = bot_module
+        self.bot._RECORD_WRITE_LOCKS.clear()
+
+    def _make_member(self):
+        member = MagicMock()
+        member.id = 909090
+        member.guild = MagicMock()
+        member.guild.id = 11
+        return member
+
+    async def _run(self, *, existing_ids, **call_kwargs):
+        bot = self.bot
+        member = self._make_member()
+        create = AsyncMock()
+        edit = AsyncMock()
+        with (
+            patch.object(bot, "MEMBER_RECORDS_CHANNEL_ID", 555),
+            patch.object(bot, "_create_member_record", new=create),
+            patch.object(bot, "_edit_member_record", new=edit),
+            patch.object(bot, "_records_channel_id", return_value=555),
+            patch.object(
+                bot, "_member_record_profile_lines",
+                return_value=["Clan: **Golden Tenno**"],
+            ),
+            patch.object(
+                bot, "_member_profile_from_records",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(bot, "_invalidate_record_profile_cache"),
+            patch.object(
+                bot.records_index, "get_record_message_ids",
+                side_effect=lambda uid: list(existing_ids),
+            ),
+        ):
+            await bot._edit_or_create_member_record(member, **call_kwargs)
+        return create, edit
+
+    async def test_role_derived_refresh_does_not_create(self):
+        # No screenshot, no review note, no existing record -> nothing posted.
+        create, edit = await self._run(existing_ids=[])
+        create.assert_not_called()
+        edit.assert_not_called()
+
+    async def test_screenshot_creates_record(self):
+        create, edit = await self._run(existing_ids=[], image_bytes=b"shot")
+        create.assert_awaited_once()
+        edit.assert_not_called()
+
+    async def test_review_note_creates_record(self):
+        # Manual-review "pending" records are intentionally screenshot-less.
+        create, edit = await self._run(
+            existing_ids=[], extra_lines=["Manual review pending — x"],
+        )
+        create.assert_awaited_once()
+        edit.assert_not_called()
+
+    async def test_role_derived_refresh_edits_existing_record(self):
+        create, edit = await self._run(existing_ids=[12345])
+        edit.assert_awaited_once()
+        create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Member record card components
 # ---------------------------------------------------------------------------
 
@@ -903,6 +981,37 @@ class MemberRecordComponentsTests(unittest.TestCase):
         )
         parsed = self.bot._parse_record_embed([embed])
         self.assertNotIn("mastery_rank", parsed)
+
+    def test_parser_drops_zero_mastery_rank(self):
+        """A bogus 'MR 0' is rejected on read so it can't stick in the record
+        (it would otherwise be preferred over the real rank role forever)."""
+        member = self._make_member()
+        embed = self.bot._build_member_record_embed(
+            member, ["Mastery Rank: **MR 0**"]
+        )
+        parsed = self.bot._parse_record_embed([embed])
+        self.assertNotIn("mastery_rank", parsed)
+
+    def test_is_exact_mastery_rank(self):
+        b = self.bot
+        self.assertTrue(b._is_exact_mastery_rank("MR 27"))
+        self.assertTrue(b._is_exact_mastery_rank("LR 3"))
+        self.assertFalse(b._is_exact_mastery_rank("MR 0"))
+        self.assertFalse(b._is_exact_mastery_rank("LR 0"))
+        self.assertFalse(b._is_exact_mastery_rank("MR 10-15"))
+        self.assertFalse(b._is_exact_mastery_rank("Unranked"))
+        self.assertFalse(b._is_exact_mastery_rank(""))
+
+    def test_footer_is_last_edited_with_timestamp(self):
+        """The record footer reads 'Last edited' and carries an ISO timestamp
+        (rendered next to the footer text as the last-edited time)."""
+        member = self._make_member()
+        embed = self.bot._build_member_record_embed(member, [])
+        self.assertEqual(embed.get("footer", {}).get("text"), "Last edited")
+        self.assertIsInstance(embed.get("timestamp"), str)
+        # Parseable ISO 8601 (the format Discord expects for embed.timestamp).
+        from datetime import datetime
+        datetime.fromisoformat(embed["timestamp"])
 
 
 class RecordAttachmentPlanTests(unittest.TestCase):
