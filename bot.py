@@ -383,12 +383,31 @@ async def _health_task() -> None:
         await asyncio.sleep(HEALTH_INTERVAL)
 
 
+def _bg_task_done(task: asyncio.Task) -> None:
+    """Done-callback for background tasks: drop the strong reference and,
+    crucially, *retrieve* the task result so an exception can't vanish
+    silently (a bare ``set.discard`` callback never calls ``.result()``,
+    so a crashed background task only surfaces as a late "Task exception
+    was never retrieved" warning at GC time). Cancellation is expected on
+    shutdown and is not logged as an error."""
+    _BG_TASKS.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "background task %s failed: %r",
+            task.get_name(), exc, exc_info=exc,
+        )
+
+
 def _spawn_bg_task(coro) -> asyncio.Task:
     """Schedule a coroutine on the running loop and keep a strong reference
-    so the GC can't reap it mid-await. Self-cleans on completion."""
+    so the GC can't reap it mid-await. Self-cleans on completion and logs
+    any unhandled exception via ``_bg_task_done``."""
     task = asyncio.create_task(coro)
     _BG_TASKS.add(task)
-    task.add_done_callback(_BG_TASKS.discard)
+    task.add_done_callback(_bg_task_done)
     return task
 
 
@@ -959,20 +978,6 @@ def _tracked_role_ids() -> set[int]:
     return {rid for _name, ids in _role_categories() for rid in ids}
 
 
-def _role_categories_for(role_ids: set[int]) -> list[tuple[str, bool]]:
-    """Return (name, has) for each *enabled* category given a member's roles.
-
-    A category is enabled when its role-id list is non-empty. Disabled
-    categories don't appear, so an unconfigured server won't show 0% forever.
-    """
-    out: list[tuple[str, bool]] = []
-    for name, ids in _role_categories():
-        if not ids:
-            continue
-        out.append((name, any(rid in role_ids for rid in ids)))
-    return out
-
-
 def _member_mastery_roles(member: discord.Member) -> list["discord.Role"]:
     """Return the member's mastery-bucket roles.
 
@@ -1012,8 +1017,15 @@ async def _member_profile_info_lines(
 
     # The records channel is the source of truth for the exact picked/OCR'd
     # Mastery Rank (Discord roles only carry coarse buckets), so prefer it for
-    # the Mastery Rank row when present.
-    stored = await _member_profile_from_records(member.guild.id, member.id)
+    # the Mastery Rank row when present. The record read (HTTP/cache) and the
+    # titles query (SQLite in a worker thread) are independent I/O, so kick
+    # them off concurrently rather than paying their latency back-to-back.
+    stored, title_rows = await asyncio.gather(
+        _member_profile_from_records(member.guild.id, member.id),
+        asyncio.to_thread(
+            analytics.list_member_titles, member.guild.id, member.id
+        ),
+    )
     mastery_override = (stored or {}).get("mastery_rank")
 
     # Clan — match the member's clan role to its slot for name + emoji.
@@ -1102,10 +1114,8 @@ async def _member_profile_info_lines(
         rows.append(("Syndicate", factions))
 
     # Titles — cosmetic achievement labels awarded via /titles, newest
-    # first. Surfaced as compact gold chips on the profile card.
-    title_rows = await asyncio.to_thread(
-        analytics.list_member_titles, member.guild.id, member.id
-    )
+    # first (fetched concurrently with the record read above). Surfaced as
+    # compact gold chips on the profile card.
     if title_rows:
         rows.append(("Titles", [r["title"] for r in title_rows]))
 

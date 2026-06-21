@@ -105,8 +105,8 @@ def _connect() -> Iterator[sqlite3.Connection]:
         # reopens cleanly instead of reusing a broken handle.
         try:
             _conn.close()
-        except Exception:
-            pass
+        except sqlite3.Error:
+            logger.debug("analytics: error closing broken write conn", exc_info=True)
         _conn = None
         raise
 
@@ -143,8 +143,8 @@ def _connect_read() -> Iterator[sqlite3.Connection]:
     except sqlite3.Error:
         try:
             _read_conn.close()
-        except Exception:
-            pass
+        except sqlite3.Error:
+            logger.debug("analytics: error closing broken read conn", exc_info=True)
         _read_conn = None
         raise
 
