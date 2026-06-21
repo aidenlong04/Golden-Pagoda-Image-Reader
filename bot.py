@@ -169,6 +169,8 @@ def _emoji_id_from_literal(raw: str | None) -> int | None:
 
 # Components V2 reply styling.
 COMPONENTS_V2_FLAG = 1 << 15  # 32768 — IS_COMPONENTS_V2
+# Suppress all automatic pings; callers add explicit user IDs when needed.
+_ALLOWED_MENTIONS_NONE = {"parse": []}
 ACCENT_PASS = _int_env("ACCENT_PASS", 0xD4A857)        # gold
 ACCENT_FAIL = _int_env("ACCENT_FAIL", 0xED4245)        # red
 ACCENT_INCOMPLETE = _int_env("ACCENT_INCOMPLETE", 0x99AAB5)  # grey
@@ -383,12 +385,31 @@ async def _health_task() -> None:
         await asyncio.sleep(HEALTH_INTERVAL)
 
 
+def _bg_task_done(task: asyncio.Task) -> None:
+    """Done-callback for background tasks: drop the strong reference and,
+    crucially, *retrieve* the task result so an exception can't vanish
+    silently (a bare ``set.discard`` callback never calls ``.result()``,
+    so a crashed background task only surfaces as a late "Task exception
+    was never retrieved" warning at GC time). Cancellation is expected on
+    shutdown and is not logged as an error."""
+    _BG_TASKS.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "background task %s failed: %r",
+            task.get_name(), exc, exc_info=exc,
+        )
+
+
 def _spawn_bg_task(coro) -> asyncio.Task:
     """Schedule a coroutine on the running loop and keep a strong reference
-    so the GC can't reap it mid-await. Self-cleans on completion."""
+    so the GC can't reap it mid-await. Self-cleans on completion and logs
+    any unhandled exception via ``_bg_task_done``."""
     task = asyncio.create_task(coro)
     _BG_TASKS.add(task)
-    task.add_done_callback(_BG_TASKS.discard)
+    task.add_done_callback(_bg_task_done)
     return task
 
 
@@ -959,20 +980,6 @@ def _tracked_role_ids() -> set[int]:
     return {rid for _name, ids in _role_categories() for rid in ids}
 
 
-def _role_categories_for(role_ids: set[int]) -> list[tuple[str, bool]]:
-    """Return (name, has) for each *enabled* category given a member's roles.
-
-    A category is enabled when its role-id list is non-empty. Disabled
-    categories don't appear, so an unconfigured server won't show 0% forever.
-    """
-    out: list[tuple[str, bool]] = []
-    for name, ids in _role_categories():
-        if not ids:
-            continue
-        out.append((name, any(rid in role_ids for rid in ids)))
-    return out
-
-
 def _member_mastery_roles(member: discord.Member) -> list["discord.Role"]:
     """Return the member's mastery-bucket roles.
 
@@ -1012,8 +1019,15 @@ async def _member_profile_info_lines(
 
     # The records channel is the source of truth for the exact picked/OCR'd
     # Mastery Rank (Discord roles only carry coarse buckets), so prefer it for
-    # the Mastery Rank row when present.
-    stored = await _member_profile_from_records(member.guild.id, member.id)
+    # the Mastery Rank row when present. The record read (HTTP/cache) and the
+    # titles query (SQLite in a worker thread) are independent I/O, so kick
+    # them off concurrently rather than paying their latency back-to-back.
+    stored, title_rows = await asyncio.gather(
+        _member_profile_from_records(member.guild.id, member.id),
+        asyncio.to_thread(
+            analytics.list_member_titles, member.guild.id, member.id
+        ),
+    )
     mastery_override = (stored or {}).get("mastery_rank")
 
     # Clan — match the member's clan role to its slot for name + emoji.
@@ -1102,10 +1116,8 @@ async def _member_profile_info_lines(
         rows.append(("Syndicate", factions))
 
     # Titles — cosmetic achievement labels awarded via /titles, newest
-    # first. Surfaced as compact gold chips on the profile card.
-    title_rows = await asyncio.to_thread(
-        analytics.list_member_titles, member.guild.id, member.id
-    )
+    # first (fetched concurrently with the record read above). Surfaced as
+    # compact gold chips on the profile card.
     if title_rows:
         rows.append(("Titles", [r["title"] for r in title_rows]))
 
@@ -1262,6 +1274,21 @@ async def _delete_after(channel_id: int, message_id: int, delay: float) -> None:
     await _delete_message(channel_id, message_id)
 
 
+def _extract_message_id(data: object) -> int | None:
+    """Pull the integer message ID out of a Discord HTTP response body.
+
+    Returns None when ``data`` isn't a dict or carries no parseable ``id``.
+    """
+    if isinstance(data, dict):
+        raw_id = data.get("id")
+        if isinstance(raw_id, (str, int)):
+            try:
+                return int(raw_id)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
 async def _post_channel_v2(
     channel_id: int,
     components: list[dict],
@@ -1290,13 +1317,7 @@ async def _post_channel_v2(
     )
     try:
         data = await client.http.request(route, json=payload)
-        if isinstance(data, dict):
-            raw_id = data.get("id")
-            if isinstance(raw_id, (str, int)):
-                try:
-                    return int(raw_id)
-                except (TypeError, ValueError):
-                    pass
+        return _extract_message_id(data)
     except discord.HTTPException:
         logger.exception("_post_channel_v2: failed to post to channel %s", channel_id)
     return None
@@ -1350,7 +1371,7 @@ async def _post_channel_embed(
     the posted message id or None on failure.
     """
     url = f"{_DISCORD_API_BASE}/channels/{channel_id}/messages"
-    payload: dict = {"embeds": [embed], "allowed_mentions": {"parse": []}}
+    payload: dict = {"embeds": [embed], "allowed_mentions": _ALLOWED_MENTIONS_NONE}
     primary_bytes, primary_name, extra_files, attachments = (
         _record_attachment_plan(file_bytes, file_name, avatar_bytes)
     )
@@ -1372,13 +1393,7 @@ async def _post_channel_embed(
                 ),
                 json=payload,
             )
-        if isinstance(data, dict):
-            raw_id = data.get("id")
-            if isinstance(raw_id, (str, int)):
-                try:
-                    return int(raw_id)
-                except (TypeError, ValueError):
-                    pass
+        return _extract_message_id(data)
     except discord.HTTPException:
         logger.exception(
             "_post_channel_embed: failed to post to channel %s", channel_id
@@ -1404,7 +1419,7 @@ async def _edit_channel_embed(
     file only the embed JSON is rewritten; pass ``keep_attachment_ids`` to
     retain already-attached files (screenshot + avatar). Fail-soft.
     """
-    payload: dict = {"embeds": [embed], "allowed_mentions": {"parse": []}}
+    payload: dict = {"embeds": [embed], "allowed_mentions": _ALLOWED_MENTIONS_NONE}
     primary_bytes, primary_name, extra_files, attachments = (
         _record_attachment_plan(file_bytes, file_name, avatar_bytes)
     )
@@ -1642,6 +1657,33 @@ def _onboarding_welcome_components(
 _SELECT_COMPONENT_TYPES = frozenset({3, 5, 6, 7, 8})
 
 
+async def _patch_message_v2_components(
+    channel_id: int,
+    message_id: int,
+    components: list[dict],
+    *,
+    debug_msg: str,
+) -> None:
+    """PATCH a Components V2 message's component tree in place. Fail-soft.
+
+    ``debug_msg`` is logged (with traceback) if the request fails.
+    """
+    from discord.http import Route
+
+    try:
+        await client.http.request(
+            Route(
+                "PATCH",
+                "/channels/{channel_id}/messages/{message_id}",
+                channel_id=channel_id,
+                message_id=message_id,
+            ),
+            json={"components": components, "flags": COMPONENTS_V2_FLAG},
+        )
+    except discord.HTTPException:
+        logger.debug(debug_msg, exc_info=True)
+
+
 def _strip_select_rows(components: list[dict]) -> list[dict]:
     """Return ``components`` with any action row containing a select removed."""
     out: list[dict] = []
@@ -1694,21 +1736,10 @@ async def _remove_onboarding_dropdown(guild_id: int, user_id: int) -> None:
     stripped = _strip_select_rows(components)
     if stripped == components:
         return  # no select row present (already stripped)
-    try:
-        await client.http.request(
-            Route(
-                "PATCH",
-                "/channels/{channel_id}/messages/{message_id}",
-                channel_id=channel_id,
-                message_id=message_id,
-            ),
-            json={"components": stripped, "flags": COMPONENTS_V2_FLAG},
-        )
-    except discord.HTTPException:
-        logger.debug(
-            "onboarding: failed to strip dropdown from welcome message",
-            exc_info=True,
-        )
+    await _patch_message_v2_components(
+        channel_id, message_id, stripped,
+        debug_msg="onboarding: failed to strip dropdown from welcome message",
+    )
 
 
 async def _finalize_onboarding_with_record(member: discord.Member) -> None:
@@ -1767,8 +1798,6 @@ async def _reset_onboarding_select(guild_id: int, user_id: int) -> None:
     member retry the *same* clan after a failed OCR attempt. No-ops once
     onboarding is complete (the dropdown is gone by then). Fail-soft.
     """
-    from discord.http import Route
-
     row = await asyncio.to_thread(
         analytics.get_onboarding_prompt, guild_id, user_id
     )
@@ -1780,20 +1809,10 @@ async def _reset_onboarding_select(guild_id: int, user_id: int) -> None:
         return
     guild = client.get_guild(guild_id)
     components = _onboarding_welcome_components(user_id, guild)
-    try:
-        await client.http.request(
-            Route(
-                "PATCH",
-                "/channels/{channel_id}/messages/{message_id}",
-                channel_id=channel_id,
-                message_id=message_id,
-            ),
-            json={"components": components, "flags": COMPONENTS_V2_FLAG},
-        )
-    except discord.HTTPException:
-        logger.debug(
-            "onboarding: failed to reset clan select", exc_info=True
-        )
+    await _patch_message_v2_components(
+        channel_id, message_id, components,
+        debug_msg="onboarding: failed to reset clan select",
+    )
 
 
 # Hard-coded assets for the public "verified" welcome posted on a successful
@@ -3658,7 +3677,7 @@ async def _interaction_callback(
             "data": {
                 "flags": flags,
                 "components": components,
-                "allowed_mentions": {"parse": []},
+                "allowed_mentions": _ALLOWED_MENTIONS_NONE,
             },
         },
     )
@@ -3689,7 +3708,7 @@ async def _interaction_edit_original_v2(
         route,
         json={
             "components": components,
-            "allowed_mentions": {"parse": []},
+            "allowed_mentions": _ALLOWED_MENTIONS_NONE,
         },
     )
 
