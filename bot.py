@@ -169,6 +169,8 @@ def _emoji_id_from_literal(raw: str | None) -> int | None:
 
 # Components V2 reply styling.
 COMPONENTS_V2_FLAG = 1 << 15  # 32768 — IS_COMPONENTS_V2
+# Suppress all automatic pings; callers add explicit user IDs when needed.
+_ALLOWED_MENTIONS_NONE = {"parse": []}
 ACCENT_PASS = _int_env("ACCENT_PASS", 0xD4A857)        # gold
 ACCENT_FAIL = _int_env("ACCENT_FAIL", 0xED4245)        # red
 ACCENT_INCOMPLETE = _int_env("ACCENT_INCOMPLETE", 0x99AAB5)  # grey
@@ -1272,6 +1274,21 @@ async def _delete_after(channel_id: int, message_id: int, delay: float) -> None:
     await _delete_message(channel_id, message_id)
 
 
+def _extract_message_id(data: object) -> int | None:
+    """Pull the integer message ID out of a Discord HTTP response body.
+
+    Returns None when ``data`` isn't a dict or carries no parseable ``id``.
+    """
+    if isinstance(data, dict):
+        raw_id = data.get("id")
+        if isinstance(raw_id, (str, int)):
+            try:
+                return int(raw_id)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
 async def _post_channel_v2(
     channel_id: int,
     components: list[dict],
@@ -1300,13 +1317,7 @@ async def _post_channel_v2(
     )
     try:
         data = await client.http.request(route, json=payload)
-        if isinstance(data, dict):
-            raw_id = data.get("id")
-            if isinstance(raw_id, (str, int)):
-                try:
-                    return int(raw_id)
-                except (TypeError, ValueError):
-                    pass
+        return _extract_message_id(data)
     except discord.HTTPException:
         logger.exception("_post_channel_v2: failed to post to channel %s", channel_id)
     return None
@@ -1360,7 +1371,7 @@ async def _post_channel_embed(
     the posted message id or None on failure.
     """
     url = f"{_DISCORD_API_BASE}/channels/{channel_id}/messages"
-    payload: dict = {"embeds": [embed], "allowed_mentions": {"parse": []}}
+    payload: dict = {"embeds": [embed], "allowed_mentions": _ALLOWED_MENTIONS_NONE}
     primary_bytes, primary_name, extra_files, attachments = (
         _record_attachment_plan(file_bytes, file_name, avatar_bytes)
     )
@@ -1382,13 +1393,7 @@ async def _post_channel_embed(
                 ),
                 json=payload,
             )
-        if isinstance(data, dict):
-            raw_id = data.get("id")
-            if isinstance(raw_id, (str, int)):
-                try:
-                    return int(raw_id)
-                except (TypeError, ValueError):
-                    pass
+        return _extract_message_id(data)
     except discord.HTTPException:
         logger.exception(
             "_post_channel_embed: failed to post to channel %s", channel_id
@@ -1414,7 +1419,7 @@ async def _edit_channel_embed(
     file only the embed JSON is rewritten; pass ``keep_attachment_ids`` to
     retain already-attached files (screenshot + avatar). Fail-soft.
     """
-    payload: dict = {"embeds": [embed], "allowed_mentions": {"parse": []}}
+    payload: dict = {"embeds": [embed], "allowed_mentions": _ALLOWED_MENTIONS_NONE}
     primary_bytes, primary_name, extra_files, attachments = (
         _record_attachment_plan(file_bytes, file_name, avatar_bytes)
     )
@@ -3668,7 +3673,7 @@ async def _interaction_callback(
             "data": {
                 "flags": flags,
                 "components": components,
-                "allowed_mentions": {"parse": []},
+                "allowed_mentions": _ALLOWED_MENTIONS_NONE,
             },
         },
     )
@@ -3699,7 +3704,7 @@ async def _interaction_edit_original_v2(
         route,
         json={
             "components": components,
-            "allowed_mentions": {"parse": []},
+            "allowed_mentions": _ALLOWED_MENTIONS_NONE,
         },
     )
 
