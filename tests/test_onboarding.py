@@ -1094,3 +1094,212 @@ class ChannelConstantTests(unittest.TestCase):
         """MEMBER_RECORDS_CHANNEL_ID is an integer (0 when unset)."""
         import bot as bot_module
         self.assertIsInstance(bot_module.MEMBER_RECORDS_CHANNEL_ID, int)
+
+
+# ---------------------------------------------------------------------------
+# Profile screenshot cache + "Not Affiliated" halt-until-verify flow
+# ---------------------------------------------------------------------------
+
+class ScreenshotCacheTests(unittest.TestCase):
+    """The per-user in-memory screenshot byte cache helpers."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.bot = bot_module
+        self.bot._screenshot_cache.clear()
+
+    def tearDown(self):
+        self.bot._screenshot_cache.clear()
+
+    def test_set_get_and_replace(self):
+        self.bot._cache_screenshot(42, b"first")
+        self.assertEqual(self.bot._get_cached_screenshot(42), b"first")
+        # A new screenshot replaces (drops) the old one.
+        self.bot._cache_screenshot(42, b"second")
+        self.assertEqual(self.bot._get_cached_screenshot(42), b"second")
+
+    def test_falsy_bytes_ignored(self):
+        self.bot._cache_screenshot(42, b"keep")
+        self.bot._cache_screenshot(42, None)
+        self.bot._cache_screenshot(42, b"")
+        self.assertEqual(self.bot._get_cached_screenshot(42), b"keep")
+
+    def test_evict(self):
+        self.bot._cache_screenshot(42, b"x")
+        self.bot._evict_cached_screenshot(42)
+        self.assertIsNone(self.bot._get_cached_screenshot(42))
+        # Evicting a missing entry is a no-op.
+        self.bot._evict_cached_screenshot(999)
+
+
+class EditMemberRecordCacheTests(unittest.IsolatedAsyncioTestCase):
+    """_edit_member_record prefers the cached screenshot over a CDN re-fetch."""
+
+    async def asyncSetUp(self):
+        import bot as bot_module
+        self.bot = bot_module
+        self.bot._screenshot_cache.clear()
+
+    def tearDown(self):
+        self.bot._screenshot_cache.clear()
+
+    async def test_edit_draws_image_from_cache(self):
+        member = MagicMock()
+        member.id = 555
+        self.bot._cache_screenshot(555, b"cached-shot")
+
+        with (
+            patch.object(self.bot, "_render_record_avatar_bytes",
+                         new_callable=AsyncMock, return_value=b"av"),
+            patch.object(self.bot, "_fetch_record_message",
+                         new_callable=AsyncMock) as mock_fetch,
+            patch.object(self.bot, "_build_member_record_embed",
+                         return_value={"embed": 1}),
+            patch.object(self.bot, "_edit_channel_embed",
+                         new_callable=AsyncMock) as mock_edit,
+        ):
+            await self.bot._edit_member_record(
+                10, 20, member, ["line"], image_bytes=None
+            )
+
+        # The CDN recovery path must NOT run when the cache has the bytes.
+        mock_fetch.assert_not_awaited()
+        mock_edit.assert_awaited_once()
+        self.assertEqual(mock_edit.call_args.kwargs["file_bytes"], b"cached-shot")
+
+
+class NoClanModalHaltTests(unittest.IsolatedAsyncioTestCase):
+    """The 'Not Affiliated' modal caches the screenshot but runs no OCR."""
+
+    async def asyncSetUp(self):
+        import bot as bot_module
+        self.bot = bot_module
+        self.bot._screenshot_cache.clear()
+
+    def tearDown(self):
+        self.bot._screenshot_cache.clear()
+
+    async def test_submit_caches_and_does_not_verify(self):
+        member = MagicMock()
+        member.id = 321
+        member.guild = MagicMock()
+        member.guild.get_member = MagicMock(return_value=member)
+
+        modal = self.bot._OnboardingNoClanModal(member=member)
+        attachment = MagicMock()
+        attachment.read = AsyncMock(return_value=b"shot-bytes")
+        attachment.filename = "p.png"
+        attachment.content_type = "image/png"
+        modal.screenshot = MagicMock()
+        modal.screenshot.values = [attachment]
+
+        interaction = MagicMock()
+        interaction.response = AsyncMock()
+
+        with (
+            patch.object(self.bot, "_verify_member_from_screenshot",
+                         new_callable=AsyncMock) as mock_verify,
+            patch.object(self.bot, "_onboarding_route_manual_review",
+                         new_callable=AsyncMock) as mock_route,
+        ):
+            await modal.on_submit(interaction)
+
+        # No OCR/verification at submit time — verification is halted.
+        mock_verify.assert_not_awaited()
+        # Screenshot is cached for the later moderator-triggered verify.
+        self.assertEqual(self.bot._get_cached_screenshot(321), b"shot-bytes")
+        # Routed to manual review with the screenshot, no OCR fields.
+        mock_route.assert_awaited_once()
+        self.assertEqual(
+            mock_route.call_args.kwargs["image_bytes"], b"shot-bytes"
+        )
+        self.assertNotIn("in_game_name", mock_route.call_args.kwargs)
+        self.assertNotIn("mastery_rank", mock_route.call_args.kwargs)
+
+
+class MreviewCachedVerifyTests(unittest.IsolatedAsyncioTestCase):
+    """The staff Verify button OCRs the cached screenshot then grants roles."""
+
+    async def asyncSetUp(self):
+        import bot as bot_module
+        self.bot = bot_module
+        self.bot._screenshot_cache.clear()
+
+    def tearDown(self):
+        self.bot._screenshot_cache.clear()
+
+    def _make_interaction(self, target_id: int) -> MagicMock:
+        interaction = MagicMock()
+        import discord
+        interaction.user = MagicMock(spec=discord.Member)
+        interaction.user.id = 99
+        interaction.user.guild_permissions = MagicMock()
+        interaction.user.guild_permissions.manage_guild = True
+        member = MagicMock()
+        member.id = target_id
+        member.roles = []
+        member.display_name = "Tester"
+        guild = MagicMock()
+        guild.get_member = MagicMock(return_value=member)
+        guild.get_role = MagicMock(return_value=None)
+        guild.fetch_member = AsyncMock(return_value=member)
+        interaction.guild = guild
+        interaction.message = MagicMock()
+        interaction.message.id = 1
+        interaction.message.channel = MagicMock()
+        interaction.message.channel.id = 2
+        interaction.followup = AsyncMock()
+        return interaction
+
+    async def test_verify_runs_ocr_from_cache(self):
+        target_id = 4242
+        self.bot._cache_screenshot(target_id, b"cached")
+        interaction = self._make_interaction(target_id)
+
+        verify_result = self.bot._VerifyResult(
+            summary=["Clan: assigned"], in_game_name="Op", mastery_rank="MR 10"
+        )
+        with (
+            patch.object(self.bot, "_interaction_callback",
+                         new_callable=AsyncMock),
+            patch.object(self.bot, "_verify_member_from_screenshot",
+                         new_callable=AsyncMock,
+                         return_value=verify_result) as mock_verify,
+            patch.object(self.bot, "_edit_or_create_member_record",
+                         new_callable=AsyncMock) as mock_record,
+            patch.object(self.bot, "_spawn_bg_task"),
+            patch.object(self.bot, "_delete_message", new=MagicMock()),
+        ):
+            await self.bot._handle_mreview_interaction(
+                interaction, f"mreview:{target_id}:approve"
+            )
+
+        mock_verify.assert_awaited_once()
+        self.assertEqual(
+            mock_verify.call_args.kwargs["image_bytes"], b"cached"
+        )
+        # A readable result writes the record with the OCR fields.
+        mock_record.assert_awaited_once()
+        self.assertEqual(
+            mock_record.call_args.kwargs["in_game_name"], "Op"
+        )
+
+    async def test_verify_without_cache_skips_ocr(self):
+        target_id = 4243
+        interaction = self._make_interaction(target_id)
+
+        with (
+            patch.object(self.bot, "_interaction_callback",
+                         new_callable=AsyncMock),
+            patch.object(self.bot, "_verify_member_from_screenshot",
+                         new_callable=AsyncMock) as mock_verify,
+            patch.object(self.bot, "_edit_or_create_member_record",
+                         new_callable=AsyncMock),
+            patch.object(self.bot, "_spawn_bg_task"),
+            patch.object(self.bot, "_delete_message", new=MagicMock()),
+        ):
+            await self.bot._handle_mreview_interaction(
+                interaction, f"mreview:{target_id}:approve"
+            )
+
+        mock_verify.assert_not_awaited()

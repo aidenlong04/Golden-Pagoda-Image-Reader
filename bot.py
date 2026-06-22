@@ -1507,6 +1507,8 @@ async def on_member_remove(member: discord.Member) -> None:
     label = getattr(member, "display_name", None) or getattr(
         member, "name", "member"
     )
+    # Drop the member's cached screenshot bytes (privacy + memory).
+    _evict_cached_screenshot(member.id)
     _spawn_bg_task(
         _clear_member_data_on_leave(guild.id, member.id, str(label))
     )
@@ -2129,6 +2131,42 @@ async def _handle_mreview_interaction(
             )
         return
 
+    # Ack the click up front (DEFERRED_UPDATE) before any slow work (OCR can
+    # take seconds) so the interaction doesn't time out. Capture the message
+    # first — we delete it once approval completes.
+    msg = interaction.message
+    with contextlib.suppress(Exception):
+        await _interaction_callback(interaction, 6, [])  # DEFERRED_UPDATE
+
+    # Run the verification that the "Not Affiliated" submission deferred: OCR
+    # the member's cached screenshot now, assigning whatever roles it can read
+    # and refreshing their record. Manual approval (role grant below) proceeds
+    # regardless of the OCR outcome — the moderator has vouched for them.
+    image_bytes = _get_cached_screenshot(target_id)
+    if image_bytes is not None:
+        try:
+            result = await _verify_member_from_screenshot(
+                member,
+                image_bytes=image_bytes,
+                filename="profile.png",
+                content_type="image/png",
+            )
+            if result.summary:
+                # Re-fetch so the record write sees freshly assigned roles.
+                with contextlib.suppress(discord.HTTPException):
+                    member = await guild.fetch_member(target_id)
+                await _edit_or_create_member_record(
+                    member,
+                    in_game_name=result.in_game_name,
+                    mastery_rank=result.mastery_rank,
+                    image_bytes=image_bytes,
+                )
+        except Exception:
+            logger.exception(
+                "mreview: verification from cached screenshot failed for %s",
+                target_id,
+            )
+
     reason = f"Manual review approved by {user}"
     removed: list[str] = []
     for rid in _MREVIEW_REMOVE_ROLE_IDS:
@@ -2163,11 +2201,7 @@ async def _handle_mreview_interaction(
     )
 
     # The manual-review welcome persists until approval. Now that roles are
-    # granted, delete it: ack the click (DEFERRED_UPDATE) then remove the
-    # message so it doesn't linger.
-    msg = interaction.message
-    with contextlib.suppress(Exception):
-        await _interaction_callback(interaction, 6, [])  # DEFERRED_UPDATE
+    # granted, delete it (the click was already acked up front).
     if msg is not None:
         _spawn_bg_task(_delete_message(msg.channel.id, msg.id))
     # Ephemeral confirmation to the approving staff member — plain-text
@@ -2381,9 +2415,12 @@ class _OnboardingNoClanModal(discord.ui.Modal):
     """Modal opened from the onboarding welcome prompt when a member clicks
     "Not listed / No". Collects a Warframe profile screenshot so the member's
     manual-review record still carries their screenshot (matching the clan
-    paths), then routes the member to manual review — their clan isn't one of
-    the configured slots, so no clan role is auto-assigned, but any platform /
-    mastery the OCR can read is still applied and stored.
+    paths), then routes the member to manual review.
+
+    A member declaring "Not Affiliated" is NOT verified here: the screenshot is
+    cached and the record is filed, but no OCR runs and no roles are assigned.
+    Verification is halted until a moderator clicks the staff "Verify" button on
+    the manual-review welcome, which OCRs the cached screenshot then.
     """
 
     def __init__(self, *, member: discord.Member) -> None:
@@ -2409,8 +2446,6 @@ class _OnboardingNoClanModal(discord.ui.Modal):
 
         files = list(self.screenshot.values or [])
         image_bytes: bytes | None = None
-        in_game_name: str | None = None
-        mastery_rank: str | None = None
         attachment = files[0] if files else None
         if attachment is not None:
             try:
@@ -2426,25 +2461,16 @@ class _OnboardingNoClanModal(discord.ui.Modal):
         # responsive.
         member = guild.get_member(member.id) or member
 
+        # "Not Affiliated": do NOT OCR / verify here. Cache the screenshot so a
+        # moderator can run verification later via the "Verify" button, and
+        # route the member to manual review (the record carries the screenshot,
+        # no roles assigned).
         if image_bytes is not None:
-            # OCR the screenshot to assign whatever roles it can (platform /
-            # mastery) and capture the OCR-only fields for the record. The
-            # member is still routed to manual review — they declared their
-            # clan isn't listed, so no clan role is forced.
-            result = await _verify_member_from_screenshot(
-                member,
-                image_bytes=image_bytes,
-                filename=attachment.filename or "profile.png",
-                content_type=attachment.content_type or "image/png",
-            )
-            in_game_name = result.in_game_name
-            mastery_rank = result.mastery_rank
+            _cache_screenshot(member.id, image_bytes)
 
         await _onboarding_route_manual_review(
             interaction, member, "selected 'Not Affiliated'",
             image_bytes=image_bytes,
-            in_game_name=in_game_name,
-            mastery_rank=mastery_rank,
         )
 
 
@@ -2642,6 +2668,10 @@ async def _edit_member_record(
         _member_avatar_url(member)
     )
     if image_bytes is None:
+        # Prefer the in-memory cache (the member's most recent screenshot) so
+        # the edit re-uploads it without a CDN round-trip.
+        image_bytes = _get_cached_screenshot(member.id)
+    if image_bytes is None:
         # Recover the existing screenshot so we can re-upload it alongside the
         # avatar (keeping it by id won't resolve attachment://record.png).
         existing = await _fetch_record_message(channel_id, message_id)
@@ -2739,6 +2769,11 @@ async def _edit_or_create_member_record(
         # post a duplicate record — the second writer waits, then observes the
         # first's freshly-indexed record and edits it in place.
         async with _record_write_lock(member.id):
+            # Cache the freshly-supplied screenshot (replacing any prior one)
+            # so later record edits + the staff manual-verify path can re-use it
+            # without a CDN round-trip.
+            if image_bytes is not None:
+                _cache_screenshot(member.id, image_bytes)
             # Preserve the OCR-only fields (in-game handle + exact Mastery
             # Rank) from the existing record when the caller didn't supply
             # them — a role-change refresh must not clobber data that isn't
@@ -2829,6 +2864,37 @@ def _member_record_jump_urls(guild_id: int, user_id: int) -> list[str]:
 
 _RECORD_PROFILE_TTL_SECONDS = 60.0
 _record_profile_cache: dict[tuple[int, int], tuple[float, dict | None]] = {}
+
+# In-memory cache of each member's most recent profile screenshot bytes, keyed
+# by user id. It is populated whenever a member submits a screenshot (every
+# record write that carries an image), and a fresh screenshot simply replaces
+# the previous one (old bytes dropped). Two readers draw from it:
+#   * a record edit re-uploads the cached screenshot instead of re-fetching it
+#     from the Discord CDN (`_edit_member_record`); and
+#   * the staff "Verify" button on a halted "not affiliated" submission OCRs the
+#     cached screenshot to assign roles (the submission itself runs no OCR).
+# The entry is evicted when the member leaves the server (`on_member_remove`).
+_screenshot_cache: dict[int, bytes] = {}
+
+
+def _cache_screenshot(user_id: int, image_bytes: bytes | None) -> None:
+    """Store the member's latest profile screenshot, replacing any prior one.
+
+    A falsy ``image_bytes`` is ignored so a record refresh without a new
+    screenshot never clears a previously cached one.
+    """
+    if image_bytes:
+        _screenshot_cache[user_id] = image_bytes
+
+
+def _get_cached_screenshot(user_id: int) -> bytes | None:
+    """Return the member's most recent cached screenshot bytes, if any."""
+    return _screenshot_cache.get(user_id)
+
+
+def _evict_cached_screenshot(user_id: int) -> None:
+    """Drop the member's cached screenshot (on leave)."""
+    _screenshot_cache.pop(user_id, None)
 
 # Maps a record body label to the profile dict key it populates. Mirrors the
 # lines emitted by :func:`_member_record_profile_lines`.
