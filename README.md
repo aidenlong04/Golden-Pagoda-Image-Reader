@@ -30,8 +30,13 @@ When a new member joins the server:
 2. Clicking a **clan button** opens a screenshot upload modal. The screenshot
    is OCR-verified: the clan the member *claims* must match what the OCR reads
    before any clan role is granted.
-3. **"Not listed / No"** assigns the `INCOMPLETE_ROLE_ID` (pending-review role),
-   notifies the staff channel (`HELP_CHANNEL_ID`), and acknowledges ephemerally.
+3. **"Not listed / No"** opens a screenshot upload modal but does **not**
+   verify: the screenshot is cached and the member is assigned the
+   `INCOMPLETE_ROLE_ID` (pending-review role), with a manual-review record
+   filed for staff. **No OCR runs and no roles are assigned** until a moderator
+   clicks the staff **Verify** button on the manual-review welcome — that
+   button OCRs the cached screenshot, assigns whatever roles it can read, and
+   grants the verified role.
 4. If the member **hasn't completed onboarding within `ONBOARDING_REPROMPT_HOURS`
    hours** (default 5), the bot re-posts a fresh welcome and deletes the old one.
    A configurable cap (`ONBOARDING_MAX_REPROMPTS`, default 3) prevents pinging
