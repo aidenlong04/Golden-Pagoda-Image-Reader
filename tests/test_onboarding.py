@@ -408,7 +408,9 @@ class OnboardingOwnershipGatingTests(unittest.IsolatedAsyncioTestCase):
             mock_cb.assert_awaited()
 
     async def test_owner_none_button_calls_manual_review(self):
-        """The owner clicking 'not listed' triggers _onboarding_route_manual_review."""
+        """The owner clicking 'not listed' must open the screenshot modal."""
+        import bot as bot_module
+
         target_uid = 1111
         custom_id = f"onboard:{target_uid}:none"
 
@@ -418,11 +420,17 @@ class OnboardingOwnershipGatingTests(unittest.IsolatedAsyncioTestCase):
         interaction = self._make_interaction(target_uid)
         interaction.guild.get_member = MagicMock(return_value=member_mock)
 
+        send_modal_mock = AsyncMock()
+        interaction.response.send_modal = send_modal_mock
+
         with patch.object(
-            self.bot, "_onboarding_route_manual_review", new_callable=AsyncMock
-        ) as mock_review:
-            await self.bot._handle_onboarding_interaction(interaction, custom_id)
-            mock_review.assert_awaited_once()
+            bot_module, "_reset_onboarding_select", new_callable=AsyncMock
+        ):
+            await bot_module._handle_onboarding_interaction(interaction, custom_id)
+
+        send_modal_mock.assert_awaited_once()
+        args = send_modal_mock.call_args[0]
+        self.assertIsInstance(args[0], bot_module._OnboardingNoClanModal)
 
     async def test_owner_clan_button_opens_modal(self):
         """The owner clicking a clan button must open the screenshot modal."""
@@ -490,7 +498,9 @@ class OnboardingOwnershipGatingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(args[0], bot_module._OnboardingVerifyModal)
 
     async def test_owner_dropdown_none_calls_manual_review(self):
-        """Selecting 'Not listed / No' from the dropdown triggers manual review."""
+        """Selecting 'Not listed / No' from the dropdown opens the screenshot modal."""
+        import bot as bot_module
+
         target_uid = 1111
         custom_id = f"onboard:{target_uid}:clanselect"
 
@@ -501,11 +511,17 @@ class OnboardingOwnershipGatingTests(unittest.IsolatedAsyncioTestCase):
         interaction.guild.get_member = MagicMock(return_value=member_mock)
         interaction.data = {"values": ["none"]}
 
+        send_modal_mock = AsyncMock()
+        interaction.response.send_modal = send_modal_mock
+
         with patch.object(
-            self.bot, "_onboarding_route_manual_review", new_callable=AsyncMock
-        ) as mock_review:
-            await self.bot._handle_onboarding_interaction(interaction, custom_id)
-            mock_review.assert_awaited_once()
+            bot_module, "_reset_onboarding_select", new_callable=AsyncMock
+        ):
+            await bot_module._handle_onboarding_interaction(interaction, custom_id)
+
+        send_modal_mock.assert_awaited_once()
+        args = send_modal_mock.call_args[0]
+        self.assertIsInstance(args[0], bot_module._OnboardingNoClanModal)
 # ---------------------------------------------------------------------------
 
 class RepromptSweepTests(unittest.IsolatedAsyncioTestCase):

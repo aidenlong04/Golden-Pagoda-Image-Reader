@@ -2010,6 +2010,8 @@ async def _onboarding_route_manual_review(
     reason: str,
     *,
     image_bytes: bytes | None = None,
+    in_game_name: str | None = None,
+    mastery_rank: str | None = None,
 ) -> None:
     """Assign the incomplete review role, notify the help channel, and ack."""
     await _add_incomplete_role(member)
@@ -2037,6 +2039,8 @@ async def _onboarding_route_manual_review(
     _spawn_bg_task(
         _edit_or_create_member_record(
             member,
+            in_game_name=in_game_name,
+            mastery_rank=mastery_rank,
             extra_lines=[f"Manual review pending — {reason}"],
             image_bytes=image_bytes,
         )
@@ -2371,6 +2375,77 @@ class _OnboardingVerifyModal(discord.ui.Modal):
             mastery_rank=result.mastery_rank,
             image_bytes=image_bytes,
         ))
+
+
+class _OnboardingNoClanModal(discord.ui.Modal):
+    """Modal opened from the onboarding welcome prompt when a member clicks
+    "Not listed / No". Collects a Warframe profile screenshot so the member's
+    manual-review record still carries their screenshot (matching the clan
+    paths), then routes the member to manual review — their clan isn't one of
+    the configured slots, so no clan role is auto-assigned, but any platform /
+    mastery the OCR can read is still applied and stored.
+    """
+
+    def __init__(self, *, member: discord.Member) -> None:
+        super().__init__(title="Submit Profile Screenshot", timeout=600)
+        self._gp_member = member
+        self.screenshot = discord.ui.FileUpload(
+            min_values=1, max_values=1, required=True,
+        )
+        self.add_item(discord.ui.Label(
+            text="Profile screenshot",
+            description=(
+                "Upload a screenshot of your Warframe profile "
+                "(title bar + CLAN section visible)."
+            ),
+            component=self.screenshot,
+        ))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        member = self._gp_member
+        guild = member.guild
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.defer(ephemeral=True)
+
+        files = list(self.screenshot.values or [])
+        image_bytes: bytes | None = None
+        in_game_name: str | None = None
+        mastery_rank: str | None = None
+        attachment = files[0] if files else None
+        if attachment is not None:
+            try:
+                image_bytes = await attachment.read()
+            except Exception:
+                logger.warning(
+                    "onboarding (no-clan): attachment read failed",
+                    exc_info=True,
+                )
+                image_bytes = None
+
+        # Prefer the cached member (no REST round-trip) so the submit stays
+        # responsive.
+        member = guild.get_member(member.id) or member
+
+        if image_bytes is not None:
+            # OCR the screenshot to assign whatever roles it can (platform /
+            # mastery) and capture the OCR-only fields for the record. The
+            # member is still routed to manual review — they declared their
+            # clan isn't listed, so no clan role is forced.
+            result = await _verify_member_from_screenshot(
+                member,
+                image_bytes=image_bytes,
+                filename=attachment.filename or "profile.png",
+                content_type=attachment.content_type or "image/png",
+            )
+            in_game_name = result.in_game_name
+            mastery_rank = result.mastery_rank
+
+        await _onboarding_route_manual_review(
+            interaction, member, "selected 'Not Affiliated'",
+            image_bytes=image_bytes,
+            in_game_name=in_game_name,
+            mastery_rank=mastery_rank,
+        )
 
 
 def _member_record_profile_lines(
@@ -3024,9 +3099,19 @@ async def _handle_onboarding_interaction(
         return
 
     if slot_token == "none":
-        await _onboarding_route_manual_review(
-            interaction, member, "selected 'Not Affiliated'"
-        )
+        try:
+            await interaction.response.send_modal(
+                _OnboardingNoClanModal(member=member)
+            )
+        except Exception:
+            logger.exception(
+                "onboarding: failed to send no-clan screenshot modal"
+            )
+        else:
+            # Reset the dropdown so the member can re-fire "Not listed / No"
+            # (Discord suppresses a string-select re-fire on an unchanged
+            # value), mirroring the clan path.
+            _spawn_bg_task(_reset_onboarding_select(guild.id, member.id))
         return
 
     if slot_token is not None:
