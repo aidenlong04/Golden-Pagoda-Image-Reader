@@ -3145,8 +3145,10 @@ async def _store_member_profile_snapshot(
     fields: dict[str, object] = {}
     if in_game_name is not None:
         fields["in_game_name"] = in_game_name.strip() or None
-    if mastery_rank is not None and _is_exact_mastery_rank(mastery_rank.strip()):
-        fields["mastery_rank"] = mastery_rank.strip()
+    if mastery_rank is not None:
+        mr = mastery_rank.strip()
+        if _is_exact_mastery_rank(mr):
+            fields["mastery_rank"] = mr
     # Always refresh the role-derived platform/clan from the rendered lines.
     parsed = _parse_record_profile_text("\n".join(summary_lines))
     fields["platform"] = parsed.get("platform")

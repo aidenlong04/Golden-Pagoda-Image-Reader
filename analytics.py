@@ -420,17 +420,21 @@ def get_member_profile(guild_id: int, user_id: int) -> dict | None:
 
 # Sentinel marking "caller did not supply this field" so an upsert can tell
 # "leave the stored value untouched" (preserve) from "clear this value".
-_UNSET = object()
+_PRESERVE_EXISTING = object()
+
+# The only columns an upsert may write — a fixed allowlist so the dynamic
+# column interpolation below can never reach an unexpected identifier.
+_MEMBER_PROFILE_COLUMNS = ("in_game_name", "mastery_rank", "platform", "clan")
 
 
 def upsert_member_profile(
     *,
     guild_id: int,
     user_id: int,
-    in_game_name: object = _UNSET,
-    mastery_rank: object = _UNSET,
-    platform: object = _UNSET,
-    clan: object = _UNSET,
+    in_game_name: object = _PRESERVE_EXISTING,
+    mastery_rank: object = _PRESERVE_EXISTING,
+    platform: object = _PRESERVE_EXISTING,
+    clan: object = _PRESERVE_EXISTING,
     updated_ts: int | None = None,
 ) -> None:
     """Insert or update a member's durable profile snapshot.
@@ -444,6 +448,12 @@ def upsert_member_profile(
     if _disabled:
         return
     ts = int(updated_ts if updated_ts is not None else time.time())
+    supplied = {
+        "in_game_name": in_game_name,
+        "mastery_rank": mastery_rank,
+        "platform": platform,
+        "clan": clan,
+    }
     with _lock:
         _init()
         if _disabled:
@@ -451,18 +461,15 @@ def upsert_member_profile(
         try:
             with _connect() as conn:
                 # Build the INSERT with the supplied columns; omitted columns
-                # fall back to their existing value on conflict (COALESCE on a
-                # per-column basis via the excluded-vs-stored choice below).
+                # keep their stored value on conflict. Column names come only
+                # from the fixed ``_MEMBER_PROFILE_COLUMNS`` allowlist, never
+                # from caller input, so the interpolation below is safe.
                 set_clauses = ["updated_ts=excluded.updated_ts"]
                 cols = ["guild_id", "user_id", "updated_ts"]
                 vals: list[object] = [guild_id, user_id, ts]
-                for name, value in (
-                    ("in_game_name", in_game_name),
-                    ("mastery_rank", mastery_rank),
-                    ("platform", platform),
-                    ("clan", clan),
-                ):
-                    if value is _UNSET:
+                for name in _MEMBER_PROFILE_COLUMNS:
+                    value = supplied[name]
+                    if value is _PRESERVE_EXISTING:
                         continue
                     cols.append(name)
                     vals.append(value)
