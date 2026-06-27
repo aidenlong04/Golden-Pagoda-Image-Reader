@@ -5763,9 +5763,16 @@ async def profile_cmd(
     # Platform / Mastery / Syndicate) without the progress bar.
     try:
         await interaction.response.defer(ephemeral=ephemeral)
-        info = await _member_profile_info_lines(target)
+        # The role-derived info read (record + titles) and the avatar CDN fetch
+        # are independent I/O, so run them concurrently rather than paying both
+        # round-trips back-to-back. The in-game-name read reuses the record that
+        # _member_profile_info_lines just warmed in the 60s TTL cache, so it
+        # stays sequential (a cache hit, no extra HTTP) and never double-fetches.
+        info, avatar_bytes = await asyncio.gather(
+            _member_profile_info_lines(target),
+            _fetch_avatar_bytes(avatar_url),
+        )
         in_game_name = await _member_in_game_name(target)
-        avatar_bytes = await _fetch_avatar_bytes(avatar_url)
         png = await _run_heavy(
             _render_profile_card_png,
             avatar_bytes=avatar_bytes,
