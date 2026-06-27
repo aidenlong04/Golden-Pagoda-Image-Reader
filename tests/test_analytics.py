@@ -210,7 +210,7 @@ def test_delete_member_data_scoped_to_user_and_guild(analytics_module):
 
 def test_delete_member_data_missing_is_zero(analytics_module):
     result = analytics_module.delete_member_data(guild_id=2, user_id=999)
-    assert result == {"titles": 0, "events_anonymized": 0, "onboarding": 0}
+    assert result == {"titles": 0, "events_anonymized": 0, "onboarding": 0, "profile": 0}
 
 
 def test_delete_member_data_fail_soft_when_disabled(tmp_path, monkeypatch):
@@ -219,7 +219,7 @@ def test_delete_member_data_fail_soft_when_disabled(tmp_path, monkeypatch):
     importlib.reload(analytics)
     # Must not raise; returns the zeroed audit dict.
     result = analytics.delete_member_data(guild_id=2, user_id=5)
-    assert result == {"titles": 0, "events_anonymized": 0, "onboarding": 0}
+    assert result == {"titles": 0, "events_anonymized": 0, "onboarding": 0, "profile": 0}
 
 
 def test_delete_member_data_is_atomic_on_failure(analytics_module, monkeypatch):
@@ -254,7 +254,7 @@ def test_delete_member_data_is_atomic_on_failure(analytics_module, monkeypatch):
     # connection; re-validate over a fresh real connection.
 
     # The whole purge must roll back: nothing reported, nothing deleted.
-    assert result == {"titles": 0, "events_anonymized": 0, "onboarding": 0}
+    assert result == {"titles": 0, "events_anonymized": 0, "onboarding": 0, "profile": 0}
     assert [t["title"] for t in a.list_member_titles(2, 5)] == ["keep me"]
     with a._connect() as conn:
         row = conn.execute(
@@ -263,3 +263,71 @@ def test_delete_member_data_is_atomic_on_failure(analytics_module, monkeypatch):
     assert row["user_id"] == 5  # telemetry NOT anonymised — rolled back
 
 
+
+
+# ---------------------------------------------------------------------------
+# member_profile durable store (the profile source of truth)
+# ---------------------------------------------------------------------------
+
+def test_member_profile_upsert_and_get(analytics_module):
+    a = analytics_module
+    assert a.get_member_profile(1, 2) is None
+    a.upsert_member_profile(
+        guild_id=1, user_id=2,
+        in_game_name="Viro#1", mastery_rank="MR 25",
+        platform="PC", clan="Golden",
+    )
+    p = a.get_member_profile(1, 2)
+    assert p["in_game_name"] == "Viro#1"
+    assert p["mastery_rank"] == "MR 25"
+    assert p["platform"] == "PC"
+    assert p["clan"] == "Golden"
+    assert isinstance(p["last_verified_ts"], int)
+
+
+def test_member_profile_omitted_fields_preserved(analytics_module):
+    # A role-derived refresh that omits the OCR-only fields must not clobber
+    # them; supplying platform alone updates only platform.
+    a = analytics_module
+    a.upsert_member_profile(
+        guild_id=1, user_id=2,
+        in_game_name="Viro#1", mastery_rank="MR 25",
+        platform="PC", clan="Golden",
+    )
+    a.upsert_member_profile(guild_id=1, user_id=2, platform="Xbox")
+    p = a.get_member_profile(1, 2)
+    assert p["in_game_name"] == "Viro#1"
+    assert p["mastery_rank"] == "MR 25"
+    assert p["platform"] == "Xbox"
+    assert p["clan"] == "Golden"
+
+
+def test_member_profile_explicit_none_clears(analytics_module):
+    # Passing None explicitly clears a field (distinct from omitting it).
+    a = analytics_module
+    a.upsert_member_profile(guild_id=1, user_id=2, platform="PC", clan="Golden")
+    a.upsert_member_profile(guild_id=1, user_id=2, platform=None)
+    p = a.get_member_profile(1, 2)
+    assert "platform" not in p
+    assert p["clan"] == "Golden"
+
+
+def test_member_profile_scoped_per_guild_user(analytics_module):
+    a = analytics_module
+    a.upsert_member_profile(guild_id=1, user_id=2, in_game_name="A#1")
+    a.upsert_member_profile(guild_id=1, user_id=3, in_game_name="B#2")
+    a.upsert_member_profile(guild_id=9, user_id=2, in_game_name="C#3")
+    assert a.get_member_profile(1, 2)["in_game_name"] == "A#1"
+    assert a.get_member_profile(1, 3)["in_game_name"] == "B#2"
+    assert a.get_member_profile(9, 2)["in_game_name"] == "C#3"
+
+
+def test_delete_member_data_clears_profile(analytics_module):
+    a = analytics_module
+    a.upsert_member_profile(guild_id=2, user_id=5, in_game_name="Gone#1")
+    a.upsert_member_profile(guild_id=2, user_id=6, in_game_name="Keep#2")
+    out = a.delete_member_data(guild_id=2, user_id=5)
+    assert out["profile"] == 1
+    assert a.get_member_profile(2, 5) is None
+    # A different member in the same guild is untouched.
+    assert a.get_member_profile(2, 6)["in_game_name"] == "Keep#2"

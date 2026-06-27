@@ -15,7 +15,7 @@ utils/metrics.py latency + heavy-job metrics (metrics_snapshot, ocr_latency, hea
 records_index.py JSON user_id -> [record message_ids] index — stdlib only
 envstore.py      .env rewriters (_rewrite_env_file skeleton) — imports logic.ClanSlot
 ocr_engine.py    Ollama -> OCR.space -> Tesseract chain — imports config, utils.retry
-analytics.py     SQLite (events, member_titles, onboarding_prompts), fail-soft — stdlib sqlite3
+analytics.py     SQLite (events, member_titles, onboarding_prompts, member_profile), fail-soft — stdlib sqlite3
 cards.py         Pillow/numpy card rendering — imports logic._mastery_label_value
 bot.py           Discord client, slash commands, V2 helpers, verify/role/onboarding/records flow
                  imports: logic, analytics, config, ocr_engine, envstore, cards, utils.metrics
@@ -64,10 +64,14 @@ so tests can resolve them as `bot.*`.
   `http://localhost:11434`) -> OCR.space (`https://api.ocr.space`, engine 3)
   -> local Tesseract. Invoked from `bot.py` only via `_run_heavy`.
 - **SQLite** (`analytics.py`): `ANALYTICS_DB_PATH`. Always called from `bot.py`
-  through `asyncio.to_thread` — never on the event loop.
-- **Records channel HTTP**: read/write the per-member record message
-  (`_fetch_record_message`, `_edit_channel_message_v2`); the channel is the
-  source of truth for profile data.
+  through `asyncio.to_thread` — never on the event loop. The `member_profile`
+  table is the source of truth for the OCR-only profile fields (in-game name +
+  exact Mastery Rank) plus a role-derived platform/clan snapshot.
+- **Records channel HTTP**: write the per-member record message (the screenshot
+  + a rendered profile embed) via `_fetch_record_message` /
+  `_edit_channel_message_v2`. The channel is a *presentation mirror*, not parsed
+  back on the hot path; the legacy parse-back path runs only as a one-time lazy
+  backfill into the `member_profile` store.
 - **CDN fetches**: avatars + custom emojis via `_fetch_cdn_bytes`
   (`https://cdn.discordapp.com/...`), cached per id in `_EMOJI_BYTES_CACHE`.
 - **Local files**: `.env` rewrites (`envstore.py`), records index JSON

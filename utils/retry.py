@@ -14,12 +14,13 @@ Tunable via env vars (read once at import time):
 from __future__ import annotations
 
 import logging
-import os
 import random
 import threading
 import time
 from collections.abc import Callable
 from typing import TypeVar
+
+from config import _float_env, _int_env
 
 logger = logging.getLogger(__name__)
 
@@ -229,27 +230,13 @@ class CircuitBreaker:
 # Module-level OCR circuit-breaker instance (shared by ocr_engine.py)
 # ---------------------------------------------------------------------------
 
-def _int_env_local(name: str, default: int) -> int:
-    try:
-        return int((os.getenv(name) or "").strip() or default)
-    except ValueError:
-        return default
-
-
-def _float_env_local(name: str, default: float) -> float:
-    try:
-        return float((os.getenv(name) or "").strip() or default)
-    except ValueError:
-        return default
-
-
 # Tunable defaults read once at import time.
-OCR_RETRY_MAX_ATTEMPTS: int = _int_env_local("OCR_RETRY_MAX_ATTEMPTS", 3)
-OCR_RETRY_BASE_DELAY: float = _float_env_local("OCR_RETRY_BASE_DELAY", 1.0)
-OCR_RETRY_MAX_DELAY: float = _float_env_local("OCR_RETRY_MAX_DELAY", 30.0)
+OCR_RETRY_MAX_ATTEMPTS: int = _int_env("OCR_RETRY_MAX_ATTEMPTS", 3)
+OCR_RETRY_BASE_DELAY: float = _float_env("OCR_RETRY_BASE_DELAY", 1.0)
+OCR_RETRY_MAX_DELAY: float = _float_env("OCR_RETRY_MAX_DELAY", 30.0)
 
 ocr_circuit_breaker: CircuitBreaker = CircuitBreaker(
-    failure_threshold=_int_env_local("OCR_CIRCUIT_BREAKER_THRESHOLD", 5),
-    recovery_seconds=_float_env_local("OCR_CIRCUIT_BREAKER_RECOVERY", 60.0),
+    failure_threshold=_int_env("OCR_CIRCUIT_BREAKER_THRESHOLD", 5),
+    recovery_seconds=_float_env("OCR_CIRCUIT_BREAKER_RECOVERY", 60.0),
     name="ocr.space",
 )

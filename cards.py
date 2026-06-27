@@ -133,12 +133,18 @@ def _vertical_gradient(
     return Image.fromarray(arr, mode="RGBA")
 
 
+@functools.lru_cache(maxsize=8)
 def _rounded_mask(width: int, height: int, radius: int) -> Image.Image:
     """Antialiased rounded-rectangle alpha mask (rendered at 2x).
 
     The card is already drawn at ``_PROGRESS_SS`` so a 2x mask is plenty
     of edge antialiasing without the memory cost of a 4x buffer on the
     full panel.
+
+    Memoised: the mask depends only on its (width, height, radius) and is
+    used purely as a read-only paste/composite mask, so the same handful of
+    card geometries reuse one buffer instead of rebuilding the supersampled
+    rounded-rect + LANCZOS downscale on every render (~20% of a render).
     """
     scale = 2
     mask = Image.new("L", (width * scale, height * scale), 0)
@@ -147,6 +153,25 @@ def _rounded_mask(width: int, height: int, radius: int) -> Image.Image:
         radius=radius * scale, fill=255,
     )
     return mask.resize((width, height), Image.LANCZOS)
+
+
+@functools.lru_cache(maxsize=8)
+def _avatar_shadow_layer(
+    size: tuple[int, int],
+    box: tuple[int, int, int, int],
+    blur: int,
+) -> Image.Image:
+    """Full-canvas RGBA layer holding the soft drop shadow under the avatar.
+
+    The shadow is a single blurred ellipse whose geometry is fixed by the
+    card size + avatar placement, so the (otherwise per-render) full-canvas
+    Gaussian blur — the single most expensive blur in a profile render — is
+    memoised across the handful of card layouts. Composited read-only via
+    ``alpha_composite``, so sharing one buffer is safe.
+    """
+    shadow = Image.new("RGBA", size, (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).ellipse(box, fill=(0, 0, 0, 120))
+    return shadow.filter(ImageFilter.GaussianBlur(blur))
 
 
 def _radial_gradient(
@@ -830,15 +855,14 @@ def _render_profile_card_png(
     avatar = _circular_avatar(avatar_bytes, avatar_px)
     avatar_y = sc((header_h - _PROGRESS_AVATAR_SIZE) // 2)
 
-    shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    ImageDraw.Draw(shadow).ellipse(
+    shadow = _avatar_shadow_layer(
+        canvas.size,
         (
             sc(pad) + sc(6), avatar_y + avatar_px - sc(10),
             sc(pad) + avatar_px - sc(6), avatar_y + avatar_px + sc(14),
         ),
-        fill=(0, 0, 0, 120),
+        sc(7),
     )
-    shadow = shadow.filter(ImageFilter.GaussianBlur(sc(7)))
     canvas.alpha_composite(shadow)
     canvas.alpha_composite(avatar, (sc(pad), avatar_y))
 

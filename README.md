@@ -154,7 +154,7 @@ full env reference.
 
 ## Data retention / on-leave clear
 
-The bot keeps a small durable per-member store (`member_profiles` +
+The bot keeps a small durable per-member store (`member_profile` +
 `member_titles` in the analytics SQLite DB) so profile cards survive restarts.
 When a member **leaves, is kicked, or is banned**, `on_member_remove` fires an
 automatic "on-leave data clear": their stored profile and awarded titles are
