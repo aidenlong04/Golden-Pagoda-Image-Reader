@@ -2755,8 +2755,9 @@ async def _edit_or_create_member_record(
     + mastery + syndicate), derived from their current roles plus the OCR-only
     fields (``in_game_name`` / ``mastery_rank``), with any ``extra_lines``
     (e.g. a manual-review note) appended. Edits the existing record in place
-    when one exists; posts a new one only when none does. Invalidates the
-    record-profile TTL cache so reads see the change immediately.
+    when one exists; posts a new one only when none does. Persists the
+    structured profile snapshot to the durable ``member_profile`` store (the
+    source of truth) after the record write.
 
     Fail-soft: exceptions are logged but never propagate (called as a
     background task from the onboarding / re-verify / role-change paths).
@@ -2822,7 +2823,15 @@ async def _edit_or_create_member_record(
                     member.id,
                 )
                 return
-            _invalidate_record_profile_cache(member.guild.id, member.id)
+            # Persist the structured profile snapshot to the durable store
+            # (the source of truth). Done after the record write so the store
+            # and its presentation mirror move together.
+            await _store_member_profile_snapshot(
+                member,
+                in_game_name=in_game_name,
+                mastery_rank=mastery_rank,
+                summary_lines=summary_lines,
+            )
     except Exception:
         logger.exception(
             "records: edit_or_create failed for %s", member.id
@@ -2853,17 +2862,17 @@ def _member_record_jump_urls(guild_id: int, user_id: int) -> list[str]:
     ]
 
 
-# ---------- Records channel as the profile source of truth ------------------
+# ---------- Member profile durable store (SQLite) ---------------------------
 
-# The member-records ("profile-log") channel is the source of truth for the
-# two profile fields that aren't recoverable from Discord roles — the in-game
-# handle and the exact Mastery Rank. Instead of a durable SQLite cache, those
-# are read back by parsing the member's record message. A tiny in-memory TTL
-# cache keeps repeated reads (e.g. /profile then /manage) cheap without going
-# stale: dynamic edits invalidate the entry, and entries expire on their own.
-
-_RECORD_PROFILE_TTL_SECONDS = 60.0
-_record_profile_cache: dict[tuple[int, int], tuple[float, dict | None]] = {}
+# The durable ``member_profile`` SQLite table (analytics.py) is the source of
+# truth for the two profile fields that aren't recoverable from Discord roles —
+# the in-game handle and the exact Mastery Rank — plus a role-derived
+# platform/clan snapshot for the /manage console. The records ("profile-log")
+# channel is now a pure presentation mirror (screenshot + a rendered profile
+# embed); it is never parsed back for structured data on the hot path. Reads
+# hit local SQLite, so no TTL cache is needed; the one remaining fall-through to
+# the channel is a one-time lazy backfill for records written before this store
+# existed.
 
 # In-memory cache of each member's most recent profile screenshot bytes, keyed
 # by user id. It is populated whenever a member submits a screenshot (every
@@ -3049,9 +3058,11 @@ async def _read_member_profile_from_records(
     guild_id: int, user_id: int
 ) -> dict | None:
     """Read a member's profile (in-game name + exact mastery, plus the
-    role-derived clan/platform snapshot) from their newest record message.
+    role-derived clan/platform snapshot) from their newest record *message*.
 
-    Returns a dict shaped like the old durable store
+    This is the legacy parse-back path, kept solely as a one-time lazy backfill
+    for records written before the durable ``member_profile`` store existed.
+    Returns a dict shaped like the durable store
     (``in_game_name`` / ``mastery_rank`` / ``platform`` / ``clan`` /
     ``last_verified_ts``) or None when no record exists / can't be read.
     """
@@ -3085,21 +3096,73 @@ async def _read_member_profile_from_records(
 async def _member_profile_from_records(
     guild_id: int, user_id: int
 ) -> dict | None:
-    """Records-backed replacement for the old durable-store read, with a
-    short-lived in-memory TTL cache."""
-    cache_key = (guild_id, user_id)
-    now = time.monotonic()
-    cached = _record_profile_cache.get(cache_key)
-    if cached is not None and (now - cached[0]) < _RECORD_PROFILE_TTL_SECONDS:
-        return cached[1]
-    profile = await _read_member_profile_from_records(guild_id, user_id)
-    _record_profile_cache[cache_key] = (now, profile)
-    return profile
+    """Return a member's stored profile from the durable ``member_profile``
+    SQLite store (the source of truth).
+
+    On a store miss, falls back once to parsing the member's legacy record
+    *message* and backfills the result into the store, so deployments that
+    predate the store don't lose the in-game name / exact Mastery Rank. After
+    that one read the channel is never parsed for this member again.
+    """
+    stored = await asyncio.to_thread(
+        analytics.get_member_profile, guild_id, user_id
+    )
+    if stored:
+        return stored
+    legacy = await _read_member_profile_from_records(guild_id, user_id)
+    if legacy:
+        await asyncio.to_thread(
+            analytics.upsert_member_profile,
+            guild_id=guild_id,
+            user_id=user_id,
+            in_game_name=legacy.get("in_game_name"),
+            mastery_rank=legacy.get("mastery_rank"),
+            platform=legacy.get("platform"),
+            clan=legacy.get("clan"),
+            updated_ts=legacy.get("last_verified_ts"),
+        )
+    return legacy
 
 
-def _invalidate_record_profile_cache(guild_id: int, user_id: int) -> None:
-    """Drop a member's cached record profile so the next read re-fetches."""
-    _record_profile_cache.pop((guild_id, user_id), None)
+async def _store_member_profile_snapshot(
+    member: discord.Member,
+    *,
+    in_game_name: str | None,
+    mastery_rank: str | None,
+    summary_lines: list[str],
+) -> None:
+    """Persist a member's profile snapshot to the durable store after a record
+    write.
+
+    The OCR-only fields (``in_game_name`` / exact ``mastery_rank``) are only
+    written when supplied — a role-derived refresh that passes ``None`` leaves
+    the stored value untouched. ``mastery_rank`` is stored only when it is an
+    exact ``MR n`` / ``LR n`` rank (a bogus ``MR 0`` never sticks). The
+    role-derived ``platform`` / ``clan`` snapshot is parsed from the
+    already-rendered ``summary_lines`` so it tracks the member's current roles.
+    Fail-soft.
+    """
+    fields: dict[str, object] = {}
+    if in_game_name is not None:
+        fields["in_game_name"] = in_game_name.strip() or None
+    if mastery_rank is not None and _is_exact_mastery_rank(mastery_rank.strip()):
+        fields["mastery_rank"] = mastery_rank.strip()
+    # Always refresh the role-derived platform/clan from the rendered lines.
+    parsed = _parse_record_profile_text("\n".join(summary_lines))
+    fields["platform"] = parsed.get("platform")
+    fields["clan"] = parsed.get("clan")
+    try:
+        await asyncio.to_thread(
+            analytics.upsert_member_profile,
+            guild_id=member.guild.id,
+            user_id=member.id,
+            **fields,
+        )
+    except Exception:
+        logger.debug(
+            "records: profile store write failed for %s", member.id,
+            exc_info=True,
+        )
 
 
 async def _handle_onboarding_interaction(
@@ -3963,9 +4026,9 @@ def _button_emoji_from_literal(raw: str | None) -> dict | None:
 async def _manage_snapshot(guild_id: int, user_id: int) -> dict:
     """Gather a member's profile + titles for the /manage panel.
 
-    Reads the profile from the records channel (source of truth) and the
-    awarded titles off the event loop (SQLite), fail-soft. Returns
-    ``{"profile", "titles", "records"}``.
+    Reads the profile from the durable ``member_profile`` store (source of
+    truth) and the awarded titles off the event loop (SQLite), fail-soft.
+    Returns ``{"profile", "titles", "records"}``.
     """
     profile = await _member_profile_from_records(guild_id, user_id)
     titles = await asyncio.to_thread(

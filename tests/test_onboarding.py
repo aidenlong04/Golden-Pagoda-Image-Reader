@@ -775,7 +775,6 @@ class RecordWriteLockTests(unittest.IsolatedAsyncioTestCase):
                 bot, "_member_profile_from_records",
                 new=AsyncMock(return_value=None),
             ),
-            patch.object(bot, "_invalidate_record_profile_cache"),
             patch.object(
                 bot.records_index, "get_record_message_ids",
                 side_effect=fake_get_ids,
@@ -838,7 +837,6 @@ class RecordCreationPolicyTests(unittest.IsolatedAsyncioTestCase):
                 bot, "_member_profile_from_records",
                 new=AsyncMock(return_value=None),
             ),
-            patch.object(bot, "_invalidate_record_profile_cache"),
             patch.object(
                 bot.records_index, "get_record_message_ids",
                 side_effect=lambda uid: list(existing_ids),
@@ -1303,3 +1301,99 @@ class MreviewCachedVerifyTests(unittest.IsolatedAsyncioTestCase):
             )
 
         mock_verify.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Member profile durable store (SQLite source of truth) + lazy backfill
+# ---------------------------------------------------------------------------
+
+class MemberProfileStoreTests(unittest.IsolatedAsyncioTestCase):
+    """_member_profile_from_records now reads the durable member_profile store
+    first, falling back once to parsing the legacy record message and
+    backfilling the store."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.bot = bot_module
+
+    async def test_reads_store_without_touching_channel(self):
+        b = self.bot
+        with (
+            patch.object(
+                b.analytics, "get_member_profile",
+                return_value={"in_game_name": "Viro#1", "mastery_rank": "MR 25"},
+            ),
+            patch.object(
+                b, "_read_member_profile_from_records",
+                new=AsyncMock(return_value=None),
+            ) as legacy,
+        ):
+            out = await b._member_profile_from_records(7, 11)
+        self.assertEqual(out["in_game_name"], "Viro#1")
+        # The legacy channel parse must not run when the store has the row.
+        legacy.assert_not_awaited()
+
+    async def test_lazy_backfill_on_store_miss(self):
+        b = self.bot
+        legacy_profile = {
+            "in_game_name": "Old#9", "mastery_rank": "LR 2",
+            "platform": "PC", "clan": "Golden", "last_verified_ts": 123,
+        }
+        with (
+            patch.object(b.analytics, "get_member_profile", return_value=None),
+            patch.object(
+                b, "_read_member_profile_from_records",
+                new=AsyncMock(return_value=legacy_profile),
+            ),
+            patch.object(b.analytics, "upsert_member_profile") as upsert,
+        ):
+            out = await b._member_profile_from_records(7, 11)
+        self.assertEqual(out["in_game_name"], "Old#9")
+        # The parsed legacy profile is persisted to the store.
+        upsert.assert_called_once()
+        kwargs = upsert.call_args.kwargs
+        self.assertEqual(kwargs["in_game_name"], "Old#9")
+        self.assertEqual(kwargs["mastery_rank"], "LR 2")
+        self.assertEqual(kwargs["platform"], "PC")
+        self.assertEqual(kwargs["clan"], "Golden")
+
+    async def test_store_snapshot_preserves_ocr_fields_on_role_refresh(self):
+        # A role-derived refresh (no in_game_name / mastery_rank) must omit
+        # those fields from the upsert so the store preserves them, while still
+        # refreshing the role-derived platform/clan from the rendered lines.
+        b = self.bot
+        member = MagicMock()
+        member.id = 42
+        member.guild = MagicMock()
+        member.guild.id = 7
+        with patch.object(b.analytics, "upsert_member_profile") as upsert:
+            await b._store_member_profile_snapshot(
+                member,
+                in_game_name=None,
+                mastery_rank=None,
+                summary_lines=["Platform: **Xbox**", "Clan: **Golden**"],
+            )
+        kwargs = upsert.call_args.kwargs
+        self.assertNotIn("in_game_name", kwargs)
+        self.assertNotIn("mastery_rank", kwargs)
+        self.assertEqual(kwargs["platform"], "Xbox")
+        self.assertEqual(kwargs["clan"], "Golden")
+
+    async def test_store_snapshot_rejects_bogus_mastery(self):
+        b = self.bot
+        member = MagicMock()
+        member.id = 42
+        member.guild = MagicMock()
+        member.guild.id = 7
+        with patch.object(b.analytics, "upsert_member_profile") as upsert:
+            await b._store_member_profile_snapshot(
+                member,
+                in_game_name="Viro#1",
+                mastery_rank="MR 0",
+                summary_lines=["In-game name: **Viro#1**"],
+            )
+        kwargs = upsert.call_args.kwargs
+        self.assertEqual(kwargs["in_game_name"], "Viro#1")
+        # 'MR 0' is not an exact rank -> not written (would clobber the real
+        # rank role otherwise).
+        self.assertNotIn("mastery_rank", kwargs)
