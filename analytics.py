@@ -731,14 +731,9 @@ def _percentile(values: list[int], pct: float) -> int:
     return s[k]
 
 
-def _compute_summary() -> dict:
-    """Run the actual SQL queries and return a fresh summary dict.
-
-    Must be called with ``_lock`` held (or from a context where no concurrent
-    writes are possible).  Uses ``_connect_read`` to avoid blocking the write
-    lock while running the ~7 aggregation queries.
-    """
-    out: dict = {
+def _empty_summary() -> dict:
+    """Return a fresh, zeroed summary dict (the shape /status expects)."""
+    return {
         "available": False,
         "total": 0,
         "by_outcome": {},
@@ -750,6 +745,16 @@ def _compute_summary() -> dict:
         "db_path": str(_db_path) if _db_path else DEFAULT_DB_PATH,
         "db_size_bytes": 0,
     }
+
+
+def _compute_summary() -> dict:
+    """Run the actual SQL queries and return a fresh summary dict.
+
+    Must be called with ``_lock`` held (or from a context where no concurrent
+    writes are possible).  Uses ``_connect_read`` to avoid blocking the write
+    lock while running the ~7 aggregation queries.
+    """
+    out: dict = _empty_summary()
     try:
         with _connect_read() as conn:
             row = conn.execute(
@@ -834,35 +839,13 @@ def summary() -> dict:
         return snap[0]
 
     if _disabled:
-        return {
-            "available": False,
-            "total": 0,
-            "by_outcome": {},
-            "by_clan": [],
-            "windows": {},
-            "ocr": {"engines": [], "avg_ms": 0, "p50_ms": 0, "p95_ms": 0, "samples": 0},
-            "first_ts": None,
-            "last_ts": None,
-            "db_path": str(_db_path) if _db_path else DEFAULT_DB_PATH,
-            "db_size_bytes": 0,
-        }
+        return _empty_summary()
 
     # Slow path: recompute under the write lock, then update the cache.
     with _lock:
         _init()
         if _disabled:
-            return {
-                "available": False,
-                "total": 0,
-                "by_outcome": {},
-                "by_clan": [],
-                "windows": {},
-                "ocr": {"engines": [], "avg_ms": 0, "p50_ms": 0, "p95_ms": 0, "samples": 0},
-                "first_ts": None,
-                "last_ts": None,
-                "db_path": str(_db_path) if _db_path else DEFAULT_DB_PATH,
-                "db_size_bytes": 0,
-            }
+            return _empty_summary()
         # Double-check under the lock in case another thread already refreshed.
         snap = _summary_snapshot
         if snap is not None and (time.time() - snap[1]) < ANALYTICS_SUMMARY_TTL:
