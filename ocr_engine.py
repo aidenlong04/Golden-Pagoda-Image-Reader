@@ -329,6 +329,13 @@ def _ocr(
         return cached
 
     result = _ocr_uncached(image_bytes, filename, content_type)
+    # Fold the title-bar supplement into the cached result: OCR.space routinely
+    # drops the small PlayerName#NNN line, and recovering it via a Tesseract
+    # top-strip crop is pure CPU. Caching the augmented result means re-uploads
+    # / catch-up retries skip that strip pass too (not just the backend call).
+    text, words, engine = result
+    text, words = _supplement_title_bar_ocr(image_bytes, text, words)
+    result = (text, words, engine)
     _cache_put(key, result)
     return result
 

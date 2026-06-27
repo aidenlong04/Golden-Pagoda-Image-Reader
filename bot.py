@@ -54,7 +54,7 @@ from logic import (
 import analytics
 import records_index
 from config import _csv, _csv_ids, _float_env, _int_env
-from ocr_engine import OCR_API_KEY, OLLAMA_OCR_MODEL, _ocr, _supplement_title_bar_ocr
+from ocr_engine import OCR_API_KEY, OLLAMA_OCR_MODEL, _ocr
 from envstore import (  # noqa: F401  (some re-exported for tests via bot.*)
     ENV_FILE_PATH,
     PLATFORM_ROLE_ID_ENV_KEYS,
@@ -819,8 +819,10 @@ async def _ocr_profile_fields(
     )
     started = time.monotonic()
     try:
-        # OCR involves blocking HTTP (up to 60s) and subprocess work.
-        ocr_text_raw, ocr_words, engine = await _run_heavy(
+        # OCR involves blocking HTTP (up to 60s) and subprocess work. The
+        # title-bar Tesseract supplement is folded into _ocr (and its result
+        # cache), so a single worker hop covers both passes.
+        ocr_text_raw, _ocr_words, engine = await _run_heavy(
             _ocr, image_bytes, filename, content_type,
         )
         ocr_text = (ocr_text_raw or "").strip()
@@ -833,15 +835,6 @@ async def _ocr_profile_fields(
     latency_ms = int((time.monotonic() - started) * 1000)
     # Record to in-process metrics for the /status Latency page.
     ocr_latency.record(latency_ms)
-
-    # OCR.space often drops the small title-bar text; rerun Tesseract on the
-    # top strip to recover the PlayerName#NNN token when it's missing.
-    try:
-        ocr_text, ocr_words = await _run_heavy(
-            _supplement_title_bar_ocr, image_bytes, ocr_text, ocr_words,
-        )
-    except Exception:
-        logger.exception("Title-bar OCR supplement raised")
 
     return _OcrProfileFields(
         True,
