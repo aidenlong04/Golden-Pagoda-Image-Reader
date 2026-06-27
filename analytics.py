@@ -471,6 +471,9 @@ def upsert_member_profile(
                     value = supplied[name]
                     if value is _PRESERVE_EXISTING:
                         continue
+                    # Defence-in-depth: identifiers only ever come from the
+                    # fixed allowlist, never from caller input.
+                    assert name in _MEMBER_PROFILE_COLUMNS
                     cols.append(name)
                     vals.append(value)
                     set_clauses.append(f"{name}=excluded.{name}")
