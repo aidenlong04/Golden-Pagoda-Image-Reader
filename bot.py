@@ -1875,9 +1875,6 @@ async def _reset_onboarding_select(guild_id: int, user_id: int) -> None:
 _PASS_WELCOME_ACCENT = 13938486
 _PASS_WELCOME_GIF = "https://i.imgur.com/a3aDbfQ.gif"
 _PASS_WELCOME_STAFF_ROLE_ID = 1361846841934610565
-_PASS_WELCOME_SELF_ROLES_URL = (
-    "https://discord.com/channels/1361846841905381629/1392582268769271950"
-)
 _PASS_WELCOME_SELF_ROLES_EMOJI = {
     "id": "1416857239599317022", "name": "ExcalNod", "animated": True,
 }
@@ -1912,25 +1909,51 @@ def _onboarding_pass_welcome_components(
             "\n> *Each clan within the alliance walks a different path — but "
             "all serve the Origin System.*\n"
         )
-    # Action row: the Self Roles link button, plus (manual-review only) a
-    # staff-only "Verify" button that grants the verified roles right from
-    # this card.
-    action_buttons: list[dict] = [
+    # Alias select: replaces the old Self Roles link button. "IGN" sets the
+    # member's server nickname to the in-game name read from their record;
+    # "Server name" opens a modal to pick a custom nickname. The custom_id
+    # encodes the target member id + the card variant so the select can be
+    # re-rendered in place after a pick.
+    variant = "mr" if manual_review else "std"
+    alias_rows: list[dict] = [
         {
-            "type": 2,
-            "style": 5,
-            "label": "Self Roles",
-            "emoji": _PASS_WELCOME_SELF_ROLES_EMOJI,
-            "url": _PASS_WELCOME_SELF_ROLES_URL,
+            "type": 1,
+            "components": [
+                {
+                    "type": 3,
+                    "custom_id": f"alias:{member_id}:{variant}",
+                    "placeholder": "Choose your server alias",
+                    "min_values": 1,
+                    "max_values": 1,
+                    "options": [
+                        {
+                            "label": "IGN",
+                            "value": "ign",
+                            "description": "Continue as your Tenno Alias",
+                            "emoji": _PASS_WELCOME_SELF_ROLES_EMOJI,
+                        },
+                        {
+                            "label": "Server name",
+                            "value": "nick",
+                            "description": "Pick a new Alias",
+                        },
+                    ],
+                }
+            ],
         }
     ]
     if manual_review:
-        action_buttons.append({
-            "type": 2,
-            "style": 3,
-            "label": "Verify",
-            "emoji": _MREVIEW_VERIFY_EMOJI,
-            "custom_id": f"mreview:{member_id}:approve",
+        # Staff-only "Verify" button that grants the verified roles right
+        # from this card (a select occupies a full row, so it gets its own).
+        alias_rows.append({
+            "type": 1,
+            "components": [{
+                "type": 2,
+                "style": 3,
+                "label": "Verify",
+                "emoji": _MREVIEW_VERIFY_EMOJI,
+                "custom_id": f"mreview:{member_id}:approve",
+            }],
         })
     return [
         {
@@ -1965,10 +1988,7 @@ def _onboarding_pass_welcome_components(
                         " — The Lotus"
                     ),
                 },
-                {
-                    "type": 1,
-                    "components": action_buttons,
-                },
+                *alias_rows,
             ],
         }
     ]
@@ -2296,6 +2316,179 @@ class _GPModal(discord.ui.Modal):
                 await interaction.followup.send(msg, ephemeral=True)
             else:
                 await interaction.response.send_message(msg, ephemeral=True)
+
+
+# Discord caps server nicknames at 32 characters.
+_NICKNAME_MAX_LEN = 32
+
+
+async def _set_member_nickname(
+    member: discord.Member, nickname: str, *, reason: str
+) -> tuple[bool, str]:
+    """Set a member's server nickname. Fail-soft.
+
+    The nickname is display-only — it never touches the member's record, so
+    the recorded in-game name (the logging source of truth) is unchanged.
+    Returns ``(ok, message)`` for the ephemeral reply.
+    """
+    nickname = nickname.strip()[:_NICKNAME_MAX_LEN]
+    if not nickname:
+        return False, "\u274C No name to set, Operator."
+    try:
+        await _discord_call_with_retry(
+            lambda: member.edit(nick=nickname, reason=reason),
+            label="alias nickname edit",
+        )
+    except discord.Forbidden:
+        return False, (
+            "\u274C I can't change your nickname, Operator — "
+            "please set it yourself or ask a staff member."
+        )
+    except discord.HTTPException:
+        logger.exception("alias: failed to set nickname for %s", member.id)
+        return False, "\u274C Something went wrong \u2014 please try again."
+    return True, f"\u2705 Your server alias is now **{nickname}**."
+
+
+class _AliasNicknameModal(_GPModal):
+    """Modal opened from the verified-welcome alias select's "Server name"
+    option. Lets the member pick a custom server nickname — nothing else: no
+    OCR, no roles, and no record write (the recorded IGN stays untouched).
+    """
+
+    def __init__(self, *, member: discord.Member) -> None:
+        super().__init__(title="Pick a new Alias", timeout=600)
+        self._gp_member = member
+        self.nickname = discord.ui.TextInput(
+            label="Server nickname",
+            placeholder="Your new alias",
+            default=member.nick or None,
+            required=True,
+            max_length=_NICKNAME_MAX_LEN,
+        )
+        self.add_item(self.nickname)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        member = self._gp_member
+        _ok, msg = await _set_member_nickname(
+            member, self.nickname.value or "",
+            reason="Alias select: member picked a server name",
+        )
+        with contextlib.suppress(Exception):
+            await interaction.response.send_message(
+                msg, ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+
+async def _reset_alias_select(
+    interaction: discord.Interaction, member_id: int, *, manual_review: bool
+) -> None:
+    """Re-render the verified-welcome's alias select to a fresh, unselected
+    state so the member can pick again (Discord suppresses a string-select
+    re-fire on an unchanged value). Fail-soft.
+    """
+    msg = interaction.message
+    if msg is None:
+        return
+    components = _onboarding_pass_welcome_components(
+        member_id, manual_review=manual_review
+    )
+    await _patch_message_v2_components(
+        msg.channel.id, msg.id, components,
+        debug_msg="alias: failed to reset alias select",
+    )
+
+
+async def _handle_alias_interaction(
+    interaction: discord.Interaction, custom_id: str
+) -> None:
+    """Dispatch the alias select on the verified-welcome card.
+
+    ``custom_id`` format: ``alias:<user_id>:<variant>`` where ``variant`` is
+    ``std`` (normal pass welcome) or ``mr`` (manual-review card). The picked
+    option is in the interaction's ``values``:
+    - ``ign``: set the member's server nickname to the in-game name read from
+      their record (the profile card/log headline).
+    - ``nick``: open a modal to pick a custom server nickname.
+
+    Nickname changes are display-only — the recorded IGN used in logging is
+    never replaced. Ownership check: only the target member may interact.
+    """
+    parts = custom_id.split(":")
+    try:
+        target_id = int(parts[1])
+    except (IndexError, ValueError):
+        return
+    manual_review = len(parts) > 2 and parts[2] == "mr"
+    values = (interaction.data or {}).get("values") or []
+    value = str(values[0]) if values else ""
+    user = interaction.user
+    guild = interaction.guild
+
+    # Ownership gate — reject any other user with an ephemeral.
+    if user.id != target_id:
+        with contextlib.suppress(Exception):
+            await _interaction_callback(
+                interaction, 4,
+                [{"type": 17, "accent_color": ACCENT_FAIL,
+                  "components": [{"type": 10, "content": (
+                      "-# This prompt isn't for you, Operator."
+                  )}]}],
+            )
+        return
+
+    if guild is None:
+        return
+
+    member = guild.get_member(target_id)
+    if member is None:
+        with contextlib.suppress(Exception):
+            await _interaction_callback(
+                interaction, 4,
+                [{"type": 17, "accent_color": ACCENT_INCOMPLETE,
+                  "components": [{"type": 10, "content": (
+                      "-# Your session has expired. Please re-join the server."
+                  )}]}],
+            )
+        return
+
+    if value == "nick":
+        try:
+            await interaction.response.send_modal(
+                _AliasNicknameModal(member=member)
+            )
+        except Exception:
+            logger.exception("alias: failed to send nickname modal")
+        else:
+            _spawn_bg_task(_reset_alias_select(
+                interaction, target_id, manual_review=manual_review,
+            ))
+        return
+
+    if value == "ign":
+        ign = await _member_in_game_name(member)
+        if not ign:
+            msg = (
+                "\u274C I couldn't find your in-game name, Operator — "
+                "verify your profile first."
+            )
+        else:
+            _ok, msg = await _set_member_nickname(
+                member, ign,
+                reason="Alias select: member chose their IGN",
+            )
+        with contextlib.suppress(Exception):
+            await _interaction_callback(
+                interaction, 4,
+                [{"type": 17,
+                  "accent_color": ACCENT_PASS if msg.startswith("\u2705")
+                  else ACCENT_FAIL,
+                  "components": [{"type": 10, "content": msg}]}],
+            )
+        _spawn_bg_task(_reset_alias_select(
+            interaction, target_id, manual_review=manual_review,
+        ))
 
 
 class _OnboardingVerifyModal(_GPModal):
@@ -6033,6 +6226,7 @@ def _register_custom_id_routes() -> None:
     _CUSTOM_ID_ROUTER.register_prefix("manage:", _handle_manage_interaction)
     _CUSTOM_ID_ROUTER.register_prefix("onboard:", _handle_onboarding_interaction)
     _CUSTOM_ID_ROUTER.register_prefix("mreview:", _handle_mreview_interaction)
+    _CUSTOM_ID_ROUTER.register_prefix("alias:", _handle_alias_interaction)
     _CUSTOM_ID_ROUTER.register_prefix("status:", _handle_status_interaction)
     _CUSTOM_ID_ROUTES_REGISTERED = True
 
