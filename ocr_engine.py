@@ -48,6 +48,12 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Module-level HTTP session shared by every OCR call: connection pooling +
+# TLS reuse across retries and successive verifications. requests.Session is
+# thread-safe for this simple posting pattern, and _run_heavy caps callers at
+# two concurrent workers anyway.
+_HTTP_SESSION = requests.Session()
+
 # OCR.space API — engine 3 per requirements. Falls back to local Tesseract
 # (with --oem 3) if OCR_API_KEY is not set and pytesseract is available.
 OCR_API_KEY = os.getenv("OCR_API_KEY", "").strip()
@@ -70,6 +76,12 @@ _OLLAMA_OCR_PROMPT = (
     "number, and the CLAN name. Output only the raw transcribed text — no "
     "commentary, no markdown, no explanations."
 )
+# Short connect timeout (seconds) shared by every OCR HTTP call: a
+# down/refusing backend (Ollama not running, OCR.space unreachable) fails
+# over in seconds instead of consuming the full read timeout before the
+# next engine runs.
+OCR_CONNECT_TIMEOUT = _int_env("OCR_CONNECT_TIMEOUT", 5)
+
 # OCR.space free tier rejects uploads >1 MB. We re-encode oversize images as
 # JPEG before sending so large PNG screenshots still get verified.
 OCR_MAX_UPLOAD_BYTES = _int_env("OCR_MAX_UPLOAD_BYTES", 900_000)
@@ -161,7 +173,7 @@ def _ocr_via_api(
 
     for attempt in range(1, OCR_RETRY_MAX_ATTEMPTS + 1):
         try:
-            response = requests.post(
+            response = _HTTP_SESSION.post(
                 OCR_API_URL,
                 headers={"apikey": OCR_API_KEY},
                 data={
@@ -173,7 +185,7 @@ def _ocr_via_api(
                     "isOverlayRequired": "true",
                 },
                 files={"file": (filename, image_bytes, content_type or "image/png")},
-                timeout=60,
+                timeout=(OCR_CONNECT_TIMEOUT, 60),
             )
             if 500 <= response.status_code < 600:
                 exc = requests.HTTPError(
@@ -263,7 +275,7 @@ def _ocr_via_ollama(
     if not OLLAMA_OCR_MODEL:
         raise RuntimeError("OLLAMA_OCR_MODEL not configured")
     b64 = base64.b64encode(image_bytes).decode("ascii")
-    response = requests.post(
+    response = _HTTP_SESSION.post(
         f"{OLLAMA_URL}/api/generate",
         json={
             "model": OLLAMA_OCR_MODEL,
@@ -272,7 +284,7 @@ def _ocr_via_ollama(
             "stream": False,
             "options": {"temperature": 0},
         },
-        timeout=OLLAMA_TIMEOUT,
+        timeout=(OCR_CONNECT_TIMEOUT, OLLAMA_TIMEOUT),
     )
     response.raise_for_status()
     data = response.json()
@@ -329,6 +341,13 @@ def _ocr(
         return cached
 
     result = _ocr_uncached(image_bytes, filename, content_type)
+    # Fold the title-bar supplement into the cached result: OCR.space routinely
+    # drops the small PlayerName#NNN line, and recovering it via a Tesseract
+    # top-strip crop is pure CPU. Caching the augmented result means re-uploads
+    # / catch-up retries skip that strip pass too (not just the backend call).
+    text, words, engine = result
+    text, words = _supplement_title_bar_ocr(image_bytes, text, words)
+    result = (text, words, engine)
     _cache_put(key, result)
     return result
 

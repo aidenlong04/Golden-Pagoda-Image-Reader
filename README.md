@@ -58,6 +58,18 @@ When a new member joins the server:
 - Runs locally from a terminal (`python bot.py` / `./run.ps1` on Windows);
   OCR served by a local Ollama instance
 
+## Code layout
+
+- `bot.py` remains the runtime entrypoint (`python bot.py`) and command surface.
+- `gpbot/bootstrap.py` owns client + `CommandTree` bootstrap.
+- `gpbot/routing.py` owns centralized custom-id routing.
+- `gpbot/components_v2.py` owns raw Components-V2 HTTP helpers.
+- `gpbot/discord_http.py` owns shared Discord REST retry behavior.
+- `gpbot/concurrency.py` owns bounded heavy-job execution + per-user lock helpers.
+- `gpbot/records.py` owns pure member-record body parsing (V2 text + embed parse-back).
+- `gpbot/verify.py` owns the verification pipeline states (`VerifyState` / `VerifyResult`) and pure helpers.
+- `gpbot/onboarding.py` owns onboarding custom-id parsing + reprompt sweep decisions.
+
 ## Setup (local)
 
 ### Prerequisites
@@ -147,9 +159,9 @@ full env reference.
   emojis come from the live clan slots, like `/status`, plus a **Not
   Affiliated** button that opens a modal to type a free-text clan name —
   removes any configured clan role and stores the typed name), and syndicates
-  (multi-select that syncs the syndicate roles). A Titles button opens the
-  `/titles` form pre-bound to the member (no member select). Requires
-  **Manage Server**.
+  (multi-select that syncs the syndicate roles). A Titles button opens an
+  inline titles editor (add via a modal, remove via a select — the same
+  add/remove as `/titles`). Requires **Manage Server**.
 - `/profile [user] [ephemeral] [edit_mastery]` — render a member's profile card.
   Open to everyone, and anyone may target any member (defaults to the caller).
   The reply is ephemeral by default; only managers (or `PROFILE_OPTIONS_ROLE_IDS`)
@@ -159,7 +171,7 @@ full env reference.
 
 ## Data retention / on-leave clear
 
-The bot keeps a small durable per-member store (`member_profiles` +
+The bot keeps a small durable per-member store (`member_profile` +
 `member_titles` in the analytics SQLite DB) so profile cards survive restarts.
 When a member **leaves, is kicked, or is banned**, `on_member_remove` fires an
 automatic "on-leave data clear": their stored profile and awarded titles are
@@ -246,6 +258,13 @@ The following improvements were added to address latency, reliability, and obser
 |---|---|
 | `utils/retry.py` | Exponential back-off with jitter (`exponential_backoff`, `retry_sync`) and a three-state circuit breaker (`CircuitBreaker`) |
 | `utils/metrics.py` | In-process semaphore utilisation tracker (`SemaphoreMetrics`), rolling latency percentile recorder (`LatencyRecorder`), and `metrics_snapshot()` |
+| `gpbot/routing.py` | Prefix-based custom-id router registry for interaction dispatch |
+| `gpbot/components_v2.py` | Unified Components-V2 interaction callback/edit + multipart upload API |
+| `gpbot/discord_http.py` | Shared retry wrapper for Discord HTTP calls |
+| `gpbot/concurrency.py` | Shared heavy-job/thread offload + keyed lock helpers |
+| `gpbot/records.py` | Pure member-record body parsing (V2 text + embed parse-back) |
+| `gpbot/verify.py` | Explicit verification pipeline states + pure image/mastery helpers |
+| `gpbot/onboarding.py` | Onboarding custom-id parsing + reprompt sweep decisions |
 
 ### What changed
 

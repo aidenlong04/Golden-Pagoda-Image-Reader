@@ -199,6 +199,17 @@ def _init() -> None:
                 CREATE INDEX IF NOT EXISTS idx_onboarding_pending
                     ON onboarding_prompts(completed, posted_ts)
                     WHERE completed = 0;
+
+                CREATE TABLE IF NOT EXISTS member_profile (
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    in_game_name TEXT,
+                    mastery_rank TEXT,
+                    platform TEXT,
+                    clan TEXT,
+                    updated_ts INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, user_id)
+                );
                 """
             )
             conn.commit()
@@ -363,22 +374,138 @@ def revoke_title(*, guild_id: int, user_id: int, title: str) -> bool:
             return False
 
 
+def get_member_profile(guild_id: int, user_id: int) -> dict | None:
+    """Return a member's durable profile snapshot, or ``None`` when absent.
+
+    The ``member_profile`` table is the source of truth for the two profile
+    fields that are not recoverable from Discord roles — the in-game handle
+    and the exact Mastery Rank — plus a role-derived ``platform`` / ``clan``
+    snapshot kept for the /manage console. The returned dict mirrors the old
+    records-channel read shape (``in_game_name`` / ``mastery_rank`` /
+    ``platform`` / ``clan`` / ``last_verified_ts``), with empty fields omitted.
+    Fail-soft: returns ``None`` when disabled or on error.
+    """
+    if _disabled:
+        return None
+    with _lock:
+        _init()
+        if _disabled:
+            return None
+        try:
+            with _connect() as conn:
+                row = conn.execute(
+                    "SELECT in_game_name, mastery_rank, platform, clan,"
+                    " updated_ts FROM member_profile"
+                    " WHERE guild_id=? AND user_id=?",
+                    (guild_id, user_id),
+                ).fetchone()
+        except Exception:
+            logger.exception("analytics: get_member_profile failed")
+            return None
+    if row is None:
+        return None
+    out: dict = {}
+    if row["in_game_name"]:
+        out["in_game_name"] = row["in_game_name"]
+    if row["mastery_rank"]:
+        out["mastery_rank"] = row["mastery_rank"]
+    if row["platform"]:
+        out["platform"] = row["platform"]
+    if row["clan"]:
+        out["clan"] = row["clan"]
+    if row["updated_ts"]:
+        out["last_verified_ts"] = int(row["updated_ts"])
+    return out or None
+
+
+# Sentinel marking "caller did not supply this field" so an upsert can tell
+# "leave the stored value untouched" (preserve) from "clear this value".
+_PRESERVE_EXISTING = object()
+
+# The only columns an upsert may write — a fixed allowlist so the dynamic
+# column interpolation below can never reach an unexpected identifier.
+_MEMBER_PROFILE_COLUMNS = ("in_game_name", "mastery_rank", "platform", "clan")
+
+
+def upsert_member_profile(
+    *,
+    guild_id: int,
+    user_id: int,
+    in_game_name: object = _PRESERVE_EXISTING,
+    mastery_rank: object = _PRESERVE_EXISTING,
+    platform: object = _PRESERVE_EXISTING,
+    clan: object = _PRESERVE_EXISTING,
+    updated_ts: int | None = None,
+) -> None:
+    """Insert or update a member's durable profile snapshot.
+
+    Each field is only written when supplied: passing a value sets it (``None``
+    clears it), while omitting an argument preserves whatever is stored. This
+    lets a role-derived refresh update ``platform`` / ``clan`` without
+    clobbering the OCR-only ``in_game_name`` / ``mastery_rank`` that a role
+    change can't recover. Fail-soft like the rest of the module.
+    """
+    if _disabled:
+        return
+    ts = int(updated_ts if updated_ts is not None else time.time())
+    supplied = {
+        "in_game_name": in_game_name,
+        "mastery_rank": mastery_rank,
+        "platform": platform,
+        "clan": clan,
+    }
+    with _lock:
+        _init()
+        if _disabled:
+            return
+        try:
+            with _connect() as conn:
+                # Build the INSERT with the supplied columns; omitted columns
+                # keep their stored value on conflict. Column names come only
+                # from the fixed ``_MEMBER_PROFILE_COLUMNS`` allowlist, never
+                # from caller input, so the interpolation below is safe.
+                set_clauses = ["updated_ts=excluded.updated_ts"]
+                cols = ["guild_id", "user_id", "updated_ts"]
+                vals: list[object] = [guild_id, user_id, ts]
+                for name in _MEMBER_PROFILE_COLUMNS:
+                    value = supplied[name]
+                    if value is _PRESERVE_EXISTING:
+                        continue
+                    # Defence-in-depth: identifiers only ever come from the
+                    # fixed allowlist, never from caller input.
+                    assert name in _MEMBER_PROFILE_COLUMNS
+                    cols.append(name)
+                    vals.append(value)
+                    set_clauses.append(f"{name}=excluded.{name}")
+                placeholders = ", ".join("?" for _ in cols)
+                conn.execute(
+                    f"INSERT INTO member_profile ({', '.join(cols)})"
+                    f" VALUES ({placeholders})"
+                    " ON CONFLICT(guild_id, user_id) DO UPDATE SET "
+                    + ", ".join(set_clauses),
+                    vals,
+                )
+                conn.commit()
+        except Exception:
+            logger.exception("analytics: upsert_member_profile failed")
+
+
 def delete_member_data(*, guild_id: int, user_id: int) -> dict:
     """Erase a member's durable data when they leave the server.
 
-    Scoped strictly to ``(guild_id, user_id)``. Drops every awarded title,
-    then anonymises their verification telemetry by NULLing ``user_id`` on
-    the ``events`` rows (the aggregate /status stats only ever group by
-    outcome/clan, so the counts stay exact while the personal reference is
-    gone). Also deletes any pending onboarding prompt. The member's profile
-    fields live in the records channel, not here. Fail-soft like the rest of
-    the module.
+    Scoped strictly to ``(guild_id, user_id)``. Drops every awarded title and
+    the durable profile snapshot, then anonymises their verification telemetry
+    by NULLing ``user_id`` on the ``events`` rows (the aggregate /status stats
+    only ever group by outcome/clan, so the counts stay exact while the
+    personal reference is gone). Also deletes any pending onboarding prompt.
+    The member's screenshot still lives in the records channel, not here.
+    Fail-soft like the rest of the module.
 
     Returns a small audit dict ``{"titles", "events_anonymized",
-    "onboarding"}`` with the number of rows touched in each table (all zero
-    when disabled).
+    "onboarding", "profile"}`` with the number of rows touched in each table
+    (all zero when disabled).
     """
-    out = {"titles": 0, "events_anonymized": 0, "onboarding": 0}
+    out = {"titles": 0, "events_anonymized": 0, "onboarding": 0, "profile": 0}
     if _disabled:
         return out
     with _lock:
@@ -411,6 +538,12 @@ def delete_member_data(*, guild_id: int, user_id: int) -> dict:
                         (guild_id, user_id),
                     )
                     onboarding = cur.rowcount or 0
+                    cur = conn.execute(
+                        "DELETE FROM member_profile"
+                        " WHERE guild_id=? AND user_id=?",
+                        (guild_id, user_id),
+                    )
+                    profile = cur.rowcount or 0
                     conn.execute("COMMIT")
                 except Exception:
                     conn.execute("ROLLBACK")
@@ -419,6 +552,7 @@ def delete_member_data(*, guild_id: int, user_id: int) -> dict:
                 out["titles"] = titles
                 out["events_anonymized"] = events
                 out["onboarding"] = onboarding
+                out["profile"] = profile
             if out["events_anonymized"] or out["titles"]:
                 invalidate_summary_cache()
         except Exception:
@@ -597,14 +731,9 @@ def _percentile(values: list[int], pct: float) -> int:
     return s[k]
 
 
-def _compute_summary() -> dict:
-    """Run the actual SQL queries and return a fresh summary dict.
-
-    Must be called with ``_lock`` held (or from a context where no concurrent
-    writes are possible).  Uses ``_connect_read`` to avoid blocking the write
-    lock while running the ~7 aggregation queries.
-    """
-    out: dict = {
+def _empty_summary() -> dict:
+    """Return a fresh, zeroed summary dict (the shape /status expects)."""
+    return {
         "available": False,
         "total": 0,
         "by_outcome": {},
@@ -616,6 +745,16 @@ def _compute_summary() -> dict:
         "db_path": str(_db_path) if _db_path else DEFAULT_DB_PATH,
         "db_size_bytes": 0,
     }
+
+
+def _compute_summary() -> dict:
+    """Run the actual SQL queries and return a fresh summary dict.
+
+    Must be called with ``_lock`` held (or from a context where no concurrent
+    writes are possible).  Uses ``_connect_read`` to avoid blocking the write
+    lock while running the ~7 aggregation queries.
+    """
+    out: dict = _empty_summary()
     try:
         with _connect_read() as conn:
             row = conn.execute(
@@ -700,35 +839,13 @@ def summary() -> dict:
         return snap[0]
 
     if _disabled:
-        return {
-            "available": False,
-            "total": 0,
-            "by_outcome": {},
-            "by_clan": [],
-            "windows": {},
-            "ocr": {"engines": [], "avg_ms": 0, "p50_ms": 0, "p95_ms": 0, "samples": 0},
-            "first_ts": None,
-            "last_ts": None,
-            "db_path": str(_db_path) if _db_path else DEFAULT_DB_PATH,
-            "db_size_bytes": 0,
-        }
+        return _empty_summary()
 
     # Slow path: recompute under the write lock, then update the cache.
     with _lock:
         _init()
         if _disabled:
-            return {
-                "available": False,
-                "total": 0,
-                "by_outcome": {},
-                "by_clan": [],
-                "windows": {},
-                "ocr": {"engines": [], "avg_ms": 0, "p50_ms": 0, "p95_ms": 0, "samples": 0},
-                "first_ts": None,
-                "last_ts": None,
-                "db_path": str(_db_path) if _db_path else DEFAULT_DB_PATH,
-                "db_size_bytes": 0,
-            }
+            return _empty_summary()
         # Double-check under the lock in case another thread already refreshed.
         snap = _summary_snapshot
         if snap is not None and (time.time() - snap[1]) < ANALYTICS_SUMMARY_TTL:

@@ -16,20 +16,13 @@ Tunable via env var:
 """
 from __future__ import annotations
 
-import os
 import threading
 import time
 from collections import deque
 
+from config import _int_env
 
-def _int_env_local(name: str, default: int) -> int:
-    try:
-        return int((os.getenv(name) or "").strip() or default)
-    except ValueError:
-        return default
-
-
-_LATENCY_WINDOW: int = _int_env_local("METRICS_LATENCY_WINDOW", 500)
+_LATENCY_WINDOW: int = _int_env("METRICS_LATENCY_WINDOW", 500)
 
 
 # ---------------------------------------------------------------------------

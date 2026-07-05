@@ -343,6 +343,46 @@ class OnboardingPassWelcomeTests(unittest.TestCase):
         self.assertEqual(verify["emoji"]["id"], "1459403163432910972")
         self.assertTrue(verify["emoji"]["animated"])
 
+    def _selects(self, components):
+        out = []
+        for top in components:
+            for inner in top.get("components", []) or []:
+                if inner.get("type") == 1:
+                    out.extend(
+                        c for c in inner.get("components") or []
+                        if c.get("type") == 3
+                    )
+        return out
+
+    def test_pass_welcome_has_alias_select_not_self_roles_button(self):
+        member_id = 12345
+        comps = self.bot._onboarding_pass_welcome_components(member_id)
+        labels = [b.get("label") for b in self._buttons(comps)]
+        self.assertNotIn("Self Roles", labels)
+        selects = self._selects(comps)
+        self.assertEqual(len(selects), 1)
+        select = selects[0]
+        self.assertEqual(select["custom_id"], f"alias:{member_id}:std")
+        opts = {o["value"]: o for o in select["options"]}
+        self.assertEqual(set(opts), {"ign", "nick"})
+        self.assertEqual(opts["ign"]["label"], "IGN")
+        self.assertEqual(
+            opts["ign"]["description"], "Continue as your Tenno Alias"
+        )
+        self.assertEqual(opts["nick"]["label"], "Server name")
+        self.assertEqual(opts["nick"]["description"], "Pick a new Alias")
+
+    def test_manual_review_welcome_alias_select_variant(self):
+        member_id = 778899
+        comps = self.bot._onboarding_pass_welcome_components(
+            member_id, manual_review=True
+        )
+        selects = self._selects(comps)
+        self.assertEqual(len(selects), 1)
+        self.assertEqual(
+            selects[0]["custom_id"], f"alias:{member_id}:mr"
+        )
+
 
 # ---------------------------------------------------------------------------
 # /onboard admin command — triggers the onboarding pipeline on demand
@@ -775,7 +815,6 @@ class RecordWriteLockTests(unittest.IsolatedAsyncioTestCase):
                 bot, "_member_profile_from_records",
                 new=AsyncMock(return_value=None),
             ),
-            patch.object(bot, "_invalidate_record_profile_cache"),
             patch.object(
                 bot.records_index, "get_record_message_ids",
                 side_effect=fake_get_ids,
@@ -838,7 +877,6 @@ class RecordCreationPolicyTests(unittest.IsolatedAsyncioTestCase):
                 bot, "_member_profile_from_records",
                 new=AsyncMock(return_value=None),
             ),
-            patch.object(bot, "_invalidate_record_profile_cache"),
             patch.object(
                 bot.records_index, "get_record_message_ids",
                 side_effect=lambda uid: list(existing_ids),
@@ -1303,3 +1341,244 @@ class MreviewCachedVerifyTests(unittest.IsolatedAsyncioTestCase):
             )
 
         mock_verify.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Member profile durable store (SQLite source of truth) + lazy backfill
+# ---------------------------------------------------------------------------
+
+class MemberProfileStoreTests(unittest.IsolatedAsyncioTestCase):
+    """_member_profile_from_records now reads the durable member_profile store
+    first, falling back once to parsing the legacy record message and
+    backfilling the store."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.bot = bot_module
+
+    async def test_reads_store_without_touching_channel(self):
+        b = self.bot
+        with (
+            patch.object(
+                b.analytics, "get_member_profile",
+                return_value={"in_game_name": "Viro#1", "mastery_rank": "MR 25"},
+            ),
+            patch.object(
+                b, "_read_member_profile_from_records",
+                new=AsyncMock(return_value=None),
+            ) as legacy,
+        ):
+            out = await b._member_profile_from_records(7, 11)
+        self.assertEqual(out["in_game_name"], "Viro#1")
+        # The legacy channel parse must not run when the store has the row.
+        legacy.assert_not_awaited()
+
+    async def test_lazy_backfill_on_store_miss(self):
+        b = self.bot
+        legacy_profile = {
+            "in_game_name": "Old#9", "mastery_rank": "LR 2",
+            "platform": "PC", "clan": "Golden", "last_verified_ts": 123,
+        }
+        with (
+            patch.object(b.analytics, "get_member_profile", return_value=None),
+            patch.object(
+                b, "_read_member_profile_from_records",
+                new=AsyncMock(return_value=legacy_profile),
+            ),
+            patch.object(b.analytics, "upsert_member_profile") as upsert,
+        ):
+            out = await b._member_profile_from_records(7, 11)
+        self.assertEqual(out["in_game_name"], "Old#9")
+        # The parsed legacy profile is persisted to the store.
+        upsert.assert_called_once()
+        kwargs = upsert.call_args.kwargs
+        self.assertEqual(kwargs["in_game_name"], "Old#9")
+        self.assertEqual(kwargs["mastery_rank"], "LR 2")
+        self.assertEqual(kwargs["platform"], "PC")
+        self.assertEqual(kwargs["clan"], "Golden")
+
+    async def test_store_snapshot_preserves_ocr_fields_on_role_refresh(self):
+        # A role-derived refresh (no in_game_name / mastery_rank) must omit
+        # those fields from the upsert so the store preserves them, while still
+        # refreshing the role-derived platform/clan from the rendered lines.
+        b = self.bot
+        member = MagicMock()
+        member.id = 42
+        member.guild = MagicMock()
+        member.guild.id = 7
+        with patch.object(b.analytics, "upsert_member_profile") as upsert:
+            await b._store_member_profile_snapshot(
+                member,
+                in_game_name=None,
+                mastery_rank=None,
+                summary_lines=["Platform: **Xbox**", "Clan: **Golden**"],
+            )
+        kwargs = upsert.call_args.kwargs
+        self.assertNotIn("in_game_name", kwargs)
+        self.assertNotIn("mastery_rank", kwargs)
+        self.assertEqual(kwargs["platform"], "Xbox")
+        self.assertEqual(kwargs["clan"], "Golden")
+
+    async def test_store_snapshot_rejects_bogus_mastery(self):
+        b = self.bot
+        member = MagicMock()
+        member.id = 42
+        member.guild = MagicMock()
+        member.guild.id = 7
+        with patch.object(b.analytics, "upsert_member_profile") as upsert:
+            await b._store_member_profile_snapshot(
+                member,
+                in_game_name="Viro#1",
+                mastery_rank="MR 0",
+                summary_lines=["In-game name: **Viro#1**"],
+            )
+        kwargs = upsert.call_args.kwargs
+        self.assertEqual(kwargs["in_game_name"], "Viro#1")
+        # 'MR 0' is not an exact rank -> not written (would clobber the real
+        # rank role otherwise).
+        self.assertNotIn("mastery_rank", kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Alias select — nickname flow on the verified-welcome card
+# ---------------------------------------------------------------------------
+
+class AliasSelectTests(unittest.IsolatedAsyncioTestCase):
+    """The alias select handler: IGN nickname set + Server-name modal."""
+
+    async def asyncSetUp(self):
+        import bot as bot_module
+        self.bot = bot_module
+
+    def _make_interaction(self, clicker_id: int, values: list[str]) -> Mock:
+        interaction = MagicMock()
+        interaction.user = MagicMock()
+        interaction.user.id = clicker_id
+        interaction.guild = MagicMock()
+        interaction.guild.id = 7
+        interaction.guild.get_member = MagicMock(return_value=None)
+        interaction.data = {"values": values}
+        interaction.message = MagicMock()
+        interaction.message.id = 1
+        interaction.message.channel.id = 999
+        interaction.response = AsyncMock()
+        interaction.followup = AsyncMock()
+        return interaction
+
+    async def test_wrong_user_gets_ephemeral_rejection(self):
+        interaction = self._make_interaction(2222, ["ign"])
+        with patch.object(
+            self.bot, "_interaction_callback", new_callable=AsyncMock
+        ) as mock_cb:
+            await self.bot._handle_alias_interaction(
+                interaction, "alias:1111:std"
+            )
+        mock_cb.assert_awaited()
+
+    async def test_ign_option_sets_nickname_from_record(self):
+        b = self.bot
+        target_uid = 1111
+        member = MagicMock()
+        member.id = target_uid
+        member.edit = AsyncMock()
+        interaction = self._make_interaction(target_uid, ["ign"])
+        interaction.guild.get_member = MagicMock(return_value=member)
+
+        with patch.object(
+            b, "_member_in_game_name", new_callable=AsyncMock,
+            return_value="Viro#123",
+        ), patch.object(
+            b, "_interaction_callback", new_callable=AsyncMock
+        ) as mock_cb, patch.object(
+            b, "_reset_alias_select", new_callable=AsyncMock
+        ), patch.object(
+            b, "_edit_or_create_member_record", new_callable=AsyncMock
+        ) as mock_record:
+            await b._handle_alias_interaction(
+                interaction, f"alias:{target_uid}:std"
+            )
+
+        member.edit.assert_awaited_once()
+        self.assertEqual(member.edit.call_args.kwargs["nick"], "Viro#123")
+        mock_cb.assert_awaited()
+        # Nickname flow never touches the member record (IGN in logging
+        # is not replaced).
+        mock_record.assert_not_awaited()
+
+    async def test_ign_option_without_record_reports_failure(self):
+        b = self.bot
+        target_uid = 1111
+        member = MagicMock()
+        member.id = target_uid
+        member.edit = AsyncMock()
+        interaction = self._make_interaction(target_uid, ["ign"])
+        interaction.guild.get_member = MagicMock(return_value=member)
+
+        with patch.object(
+            b, "_member_in_game_name", new_callable=AsyncMock,
+            return_value=None,
+        ), patch.object(
+            b, "_interaction_callback", new_callable=AsyncMock
+        ) as mock_cb, patch.object(
+            b, "_reset_alias_select", new_callable=AsyncMock
+        ):
+            await b._handle_alias_interaction(
+                interaction, f"alias:{target_uid}:std"
+            )
+
+        member.edit.assert_not_awaited()
+        mock_cb.assert_awaited()
+
+    async def test_nick_option_opens_modal(self):
+        b = self.bot
+        target_uid = 1111
+        member = MagicMock()
+        member.id = target_uid
+        member.nick = None
+        interaction = self._make_interaction(target_uid, ["nick"])
+        interaction.guild.get_member = MagicMock(return_value=member)
+        send_modal_mock = AsyncMock()
+        interaction.response.send_modal = send_modal_mock
+
+        with patch.object(
+            b, "_reset_alias_select", new_callable=AsyncMock
+        ):
+            await b._handle_alias_interaction(
+                interaction, f"alias:{target_uid}:std"
+            )
+
+        send_modal_mock.assert_awaited_once()
+        args = send_modal_mock.call_args[0]
+        self.assertIsInstance(args[0], b._AliasNicknameModal)
+
+    async def test_nickname_modal_sets_nick_without_record_write(self):
+        b = self.bot
+        member = MagicMock()
+        member.id = 1111
+        member.nick = None
+        member.edit = AsyncMock()
+        modal = b._AliasNicknameModal(member=member)
+        modal.nickname._value = "Fresh Alias"
+        interaction = MagicMock()
+        interaction.response = AsyncMock()
+
+        with patch.object(
+            b, "_edit_or_create_member_record", new_callable=AsyncMock
+        ) as mock_record:
+            await modal.on_submit(interaction)
+
+        member.edit.assert_awaited_once()
+        self.assertEqual(member.edit.call_args.kwargs["nick"], "Fresh Alias")
+        mock_record.assert_not_awaited()
+
+    async def test_set_member_nickname_truncates_to_32(self):
+        member = MagicMock()
+        member.edit = AsyncMock()
+        long_name = "x" * 50
+        ok, _msg = await self.bot._set_member_nickname(
+            member, long_name, reason="test"
+        )
+        self.assertTrue(ok)
+        self.assertEqual(
+            member.edit.call_args.kwargs["nick"], "x" * 32
+        )
