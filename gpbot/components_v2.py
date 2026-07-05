@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
+from typing import Any
 
 import aiohttp
 import discord
@@ -11,17 +13,17 @@ V2_USER_AGENT = "GoldenPagoda (https://github.com/aidenlong04, 1.0)"
 
 
 async def v2_multipart_request(
-    session,
+    session: aiohttp.ClientSession,
     *,
     method: str,
     url: str,
     bot_token: str,
-    payload: dict,
+    payload: dict[str, Any],
     file_bytes: bytes,
     file_name: str,
     file_content_type: str = "image/png",
     extra_files: list[tuple[bytes, str]] | None = None,
-):
+) -> dict[str, Any] | None:
     form = aiohttp.FormData()
     form.add_field(
         "payload_json", json.dumps(payload),
@@ -55,13 +57,13 @@ async def v2_multipart_request(
 
 async def interaction_callback(
     *,
-    http_client,
+    http_client: Any,
     interaction: discord.Interaction,
     callback_type: int,
     components: list[dict],
     flags: int,
-    allowed_mentions: dict,
-):
+    allowed_mentions: Mapping[str, Any],
+) -> None:
     from discord.http import Route
 
     route = Route(
@@ -85,11 +87,11 @@ async def interaction_callback(
 
 async def interaction_edit_original_v2(
     *,
-    http_client,
+    http_client: Any,
     interaction: discord.Interaction,
     components: list[dict],
-    allowed_mentions: dict,
-):
+    allowed_mentions: Mapping[str, Any],
+) -> None:
     from discord.http import Route
 
     route = Route(

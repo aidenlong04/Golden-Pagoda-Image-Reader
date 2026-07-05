@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 
 
+# Keep this module discord-agnostic; caller passes framework-specific interaction objects.
 InteractionHandler = Callable[[object, str], Awaitable[object | None]]
 
 

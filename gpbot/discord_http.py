@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Awaitable, Callable
 
 import discord
 
@@ -8,15 +10,16 @@ from utils.retry import exponential_backoff
 
 
 async def discord_call_with_retry(
-    coro_factory,
+    coro_factory: Callable[[], Awaitable[object]],
     /,
     *,
     label: str = "discord call",
-    logger,
+    logger: logging.Logger,
     max_attempts: int = 3,
     base_delay: float = 1.0,
     max_delay: float = 30.0,
 ) -> None:
+    """Run a Discord HTTP call with retry/backoff on 429 responses."""
     last = None
     for attempt in range(1, max_attempts + 1):
         try:

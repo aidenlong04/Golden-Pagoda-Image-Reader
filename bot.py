@@ -294,6 +294,7 @@ HEALTH_INTERVAL = _int_env("HEALTH_INTERVAL", 20)
 # (`</name:id>`) inside ephemeral replies fired from component buttons.
 _COMMAND_IDS: dict[str, int] = {}
 _CUSTOM_ID_ROUTER = CustomIDRouter()
+_CUSTOM_ID_ROUTES_REGISTERED = False
 
 # Strong refs for fire-and-forget tasks. asyncio docs warn that
 # create_task() return values must be kept alive or the task may be
@@ -6055,13 +6056,14 @@ async def _handle_status_interaction(
 
 
 def _register_custom_id_routes() -> None:
-    if getattr(_register_custom_id_routes, "_done", False):
+    global _CUSTOM_ID_ROUTES_REGISTERED
+    if _CUSTOM_ID_ROUTES_REGISTERED:
         return
     _CUSTOM_ID_ROUTER.register_prefix("manage:", _handle_manage_interaction)
     _CUSTOM_ID_ROUTER.register_prefix("onboard:", _handle_onboarding_interaction)
     _CUSTOM_ID_ROUTER.register_prefix("mreview:", _handle_mreview_interaction)
     _CUSTOM_ID_ROUTER.register_prefix("status:", _handle_status_interaction)
-    _register_custom_id_routes._done = True
+    _CUSTOM_ID_ROUTES_REGISTERED = True
 
 
 _register_custom_id_routes()
