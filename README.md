@@ -159,9 +159,9 @@ full env reference.
   emojis come from the live clan slots, like `/status`, plus a **Not
   Affiliated** button that opens a modal to type a free-text clan name —
   removes any configured clan role and stores the typed name), and syndicates
-  (multi-select that syncs the syndicate roles). A Titles button opens an
-  inline titles editor (add via a modal, remove via a select — the same
-  add/remove as `/titles`). Requires **Manage Server**.
+  (multi-select that syncs the syndicate roles). A Titles button opens the
+  same interactive `/titles` form directly, with the member pre-bound
+  (add/remove a title in one modal). Requires **Manage Server**.
 - `/profile [user] [ephemeral] [edit_mastery]` — render a member's profile card.
   Open to everyone, and anyone may target any member (defaults to the caller).
   The reply is ephemeral by default; only managers (or `PROFILE_OPTIONS_ROLE_IDS`)

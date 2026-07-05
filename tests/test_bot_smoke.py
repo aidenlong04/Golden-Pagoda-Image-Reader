@@ -652,6 +652,12 @@ class ManagePanelTests(unittest.TestCase):
         self.assertIsInstance(modal.member_select, discord.ui.UserSelect)
         self.assertEqual(len(modal.children), 4)
 
+    def test_titles_modal_member_select_is_required(self):
+        """min_values=1 with required=False is a contradiction Discord
+        rejects with a 400 — the modal would silently never open."""
+        modal = self.b._TitlesModal()
+        self.assertTrue(modal.member_select.required)
+
     def test_titles_modal_omits_member_select_with_member(self):
         """The /manage Titles button pre-binds the member — no member
         select."""
@@ -1245,35 +1251,7 @@ class ManageEditPanelTests(unittest.TestCase):
         self.assertIn("manage:42:editfield:mastery", ids)
         self.assertIn("manage:42:editfield:clan", ids)
         self.assertIn("manage:42:editfield:syndicate", ids)
-        self.assertIn("manage:42:editfield:titles", ids)
-
-    def test_titles_editor_lists_titles_add_button_and_remove_select(self):
-        titles = [
-            {"title": "Sharpshooter", "reason": "event win"},
-            {"title": "boot licker", "reason": ""},
-        ]
-        payload = self.b._manage_editor_components(
-            42, self.member, "titles", titles=titles
-        )
-        body = payload[1]["components"][0]["content"]
-        self.assertIn("Sharpshooter", body)
-        self.assertIn("boot licker", body)
-        ids = {b.get("custom_id") for b in self._buttons(payload)}
-        self.assertIn("manage:42:titleadd", ids)
-        sel = self._selects(payload)[0]
-        self.assertEqual(sel["custom_id"], "manage:42:titlerm")
-        self.assertEqual(
-            [o["value"] for o in sel["options"]],
-            ["Sharpshooter", "boot licker"],
-        )
-
-    def test_titles_editor_without_titles_has_no_remove_select(self):
-        payload = self.b._manage_editor_components(
-            42, self.member, "titles", titles=[]
-        )
-        ids = {b.get("custom_id") for b in self._buttons(payload)}
-        self.assertIn("manage:42:titleadd", ids)
-        self.assertEqual(self._selects(payload), [])
+        self.assertIn("manage:42:titles", ids)
 
     def test_edit_page_for_departed_member_has_no_field_buttons(self):
         comps = self.b._manage_components(
