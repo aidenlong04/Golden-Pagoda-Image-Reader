@@ -132,8 +132,10 @@ full env reference.
 - `/clan-emblems role:<role> emoji:<:name:id>` — set the per-clan emoji at
   runtime. Updates in-memory state, `os.environ`, and rewrites the server's
   `.env`. Requires **Manage Server**.
-- `/titles action:<add|remove> member:<member> title:<text> [reason]` — grant
-  or remove a member's cosmetic profile title. Requires **Manage Server**.
+- `/titles [action] [member] [title] [reason]` — grant or remove a member's
+  cosmetic profile title. Run without args (or with partial args) it opens an
+  interactive form — action select, member select, title and optional reason —
+  pre-filled with anything you did pass. Requires **Manage Server**.
 - `/onboard member:<member>` — post the onboarding welcome prompt for a member
   on demand (the same pipeline as the automatic join welcome — clan buttons +
   screenshot verification). Useful for members who joined while the bot was
@@ -153,8 +155,10 @@ full env reference.
   page edits a present member's verification data — Discord roles **and** the
   durable store are updated together: in-game name (text modal), platform
   (assigns the platform role), mastery rank incl. Legendary (swaps the MR
-  bucket role + stores the exact rank), clan (dynamic buttons whose names and
-  emojis come from the live clan slots, like `/status`), and syndicates
+  bucket role + stores the exact rank), clan (a select whose names and
+  emojis come from the live clan slots, like `/status`, plus a **Not
+  Affiliated** button that opens a modal to type a free-text clan name —
+  removes any configured clan role and stores the typed name), and syndicates
   (multi-select that syncs the syndicate roles). A Titles button opens an
   inline titles editor (add via a modal, remove via a select — the same
   add/remove as `/titles`). Requires **Manage Server**.
