@@ -160,7 +160,7 @@ full env reference.
   Affiliated** button that opens a modal to type a free-text clan name —
   removes any configured clan role and stores the typed name), and syndicates
   (multi-select that syncs the syndicate roles). A Titles button opens the
-  same interactive `/titles` form directly, with the member pre-bound
+  same interactive `/titles` form directly, with the member pre-selected
   (add/remove a title in one modal). Requires **Manage Server**.
 - `/profile [user] [ephemeral] [edit_mastery]` — render a member's profile card.
   Open to everyone, and anyone may target any member (defaults to the caller).
