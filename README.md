@@ -143,8 +143,10 @@ full env reference.
   page edits a present member's verification data — Discord roles **and** the
   durable store are updated together: in-game name (text modal), platform
   (assigns the platform role), mastery rank incl. Legendary (swaps the MR
-  bucket role + stores the exact rank), clan (dynamic buttons whose names and
-  emojis come from the live clan slots, like `/status`), and syndicates
+  bucket role + stores the exact rank), clan (a select whose names and
+  emojis come from the live clan slots, like `/status`, plus a **Not
+  Affiliated** button that opens a modal to type a free-text clan name —
+  removes any configured clan role and stores the typed name), and syndicates
   (multi-select that syncs the syndicate roles). A Titles button opens the
   `/titles` form pre-bound to the member (no member select). Requires
   **Manage Server**.

@@ -1271,19 +1271,52 @@ class ManageEditPanelTests(unittest.TestCase):
         total = sum(len(s["options"]) for s in sels)
         self.assertEqual(total, 38)  # MR 1-30 + Legendary 1-8
 
-    def test_clan_editor_uses_dynamic_buttons_with_emojis(self):
+    def test_clan_editor_uses_select_with_emojis(self):
         payload = self.b._manage_editor_components(42, self.member, "clan")
-        btns = [
-            b for b in self._buttons(payload)
-            if str(b.get("custom_id", "")).startswith("manage:42:setclan:")
-        ]
-        ids = {b["custom_id"] for b in btns}
-        self.assertEqual(ids, {"manage:42:setclan:1", "manage:42:setclan:2"})
-        gp = next(b for b in btns if b["custom_id"].endswith(":1"))
+        sel = next(
+            s for s in self._selects(payload)
+            if s["custom_id"] == "manage:42:setclan"
+        )
+        values = [o["value"] for o in sel["options"]]
+        self.assertEqual(values, ["1", "2"])
+        gp = next(o for o in sel["options"] if o["value"] == "1")
         self.assertEqual(gp["emoji"], {"id": "123", "name": "gp",
                                        "animated": False})
-        # Current clan (Golden Pagoda, slot 1) is highlighted (primary style).
-        self.assertEqual(gp["style"], 1)
+        # Current clan (Golden Pagoda, slot 1) is preselected.
+        defaults = [o["value"] for o in sel["options"] if o.get("default")]
+        self.assertEqual(defaults, ["1"])
+        # A "Not Affiliated" button sits under the select.
+        ids = {b.get("custom_id") for b in self._buttons(payload)}
+        self.assertIn("manage:42:clanother", ids)
+
+    def test_clan_editor_offers_not_affiliated_without_slots(self):
+        self.b.CLAN_SLOTS[:] = []
+        payload = self.b._manage_editor_components(42, self.member, "clan")
+        self.assertEqual(self._selects(payload), [])
+        ids = {b.get("custom_id") for b in self._buttons(payload)}
+        self.assertIn("manage:42:clanother", ids)
+
+    def test_configured_clan_slot_for_name(self):
+        slot = self.b._configured_clan_slot_for_name("golden pagoda")
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot.slot, 1)
+        self.assertIsNone(self.b._configured_clan_slot_for_name("Free Clan"))
+        self.assertIsNone(self.b._configured_clan_slot_for_name(""))
+
+    def test_record_lines_clan_role_beats_override(self):
+        # No configured clan role: the free-text override is written.
+        member = self._make_member([111])
+        lines = self.b._member_record_profile_lines(
+            member, clan_override="Free Clan"
+        )
+        self.assertIn("Clan: **Free Clan**", lines)
+        # A configured clan role always wins the Clan line.
+        member = self._make_member([111, 701])
+        lines = self.b._member_record_profile_lines(
+            member, clan_override="Free Clan"
+        )
+        self.assertIn("Clan: **Golden Pagoda**", lines)
+        self.assertNotIn("Clan: **Free Clan**", lines)
 
     def test_syndicate_editor_multiselect_preselects_held(self):
         payload = self.b._manage_editor_components(42, self.member, "syndicate")

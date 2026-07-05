@@ -2479,6 +2479,7 @@ def _member_record_profile_lines(
     *,
     in_game_name: str | None = None,
     mastery_rank: str | None = None,
+    clan_override: str | None = None,
 ) -> list[str]:
     """Derive the full member-profile body for the records ("profile-log")
     channel.
@@ -2487,8 +2488,10 @@ def _member_record_profile_lines(
     each record carries the complete profile as stable, parseable
     ``Key: **Value**`` lines. In-game name + exact Mastery Rank are OCR-only
     (passed in); Clan, Platform, the Mastery bucket and Syndicate are read
-    live from the member's current roles. Categories with no value are
-    omitted.
+    live from the member's current roles. A configured clan role always wins
+    the Clan line; ``clan_override`` (a free-text "not affiliated" clan name)
+    is used only when the member holds no configured clan role. Categories
+    with no value are omitted.
     """
     role_ids = {r.id for r in member.roles}
     lines: list[str] = []
@@ -2504,6 +2507,8 @@ def _member_record_profile_lines(
         clan = _strip_clan_tag(slot.clan_name)
         if clan:
             lines.append(f"Clan: **{clan}**")
+    elif clan_override and clan_override.strip():
+        lines.append(f"Clan: **{clan_override.strip()}**")
 
     member_platform = next(
         (
@@ -2740,11 +2745,28 @@ def _record_write_lock(user_id: int) -> asyncio.Lock:
     return lock
 
 
+def _configured_clan_slot_for_name(name: str) -> "ClanSlot | None":
+    """Return the configured clan slot whose (tag-stripped) name matches
+    ``name`` case-insensitively, or None for a free-text clan."""
+    wanted = _strip_clan_tag(name or "").casefold()
+    if not wanted:
+        return None
+    return next(
+        (
+            s for s in CLAN_SLOTS
+            if s.clan_name
+            and _strip_clan_tag(s.clan_name).casefold() == wanted
+        ),
+        None,
+    )
+
+
 async def _edit_or_create_member_record(
     member: discord.Member,
     *,
     in_game_name: str | None = None,
     mastery_rank: str | None = None,
+    clan_override: str | None = None,
     extra_lines: list[str] | None = None,
     image_bytes: bytes | None = None,
 ) -> None:
@@ -2777,8 +2799,11 @@ async def _edit_or_create_member_record(
             # Preserve the OCR-only fields (in-game handle + exact Mastery
             # Rank) from the existing record when the caller didn't supply
             # them — a role-change refresh must not clobber data that isn't
-            # role-derivable.
-            if in_game_name is None or mastery_rank is None:
+            # role-derivable. A stored free-text ("not affiliated") clan is
+            # preserved the same way, but only when it doesn't name a
+            # configured clan — a configured clan is role-derived, so
+            # dropping the role must drop the Clan line too.
+            if in_game_name is None or mastery_rank is None or clan_override is None:
                 existing = await _member_profile_from_records(
                     member.guild.id, member.id
                 )
@@ -2787,8 +2812,15 @@ async def _edit_or_create_member_record(
                         in_game_name = existing.get("in_game_name")
                     if mastery_rank is None:
                         mastery_rank = existing.get("mastery_rank")
+                    if clan_override is None:
+                        stored_clan = existing.get("clan")
+                        if stored_clan and _configured_clan_slot_for_name(
+                            stored_clan
+                        ) is None:
+                            clan_override = stored_clan
             summary_lines = _member_record_profile_lines(
                 member, in_game_name=in_game_name, mastery_rank=mastery_rank,
+                clan_override=clan_override,
             )
             if extra_lines:
                 summary_lines = summary_lines + list(extra_lines)
@@ -4084,6 +4116,24 @@ async def _apply_clan_slot(member: discord.Member, slot: "ClanSlot") -> str:
     return "assigned"
 
 
+async def _remove_configured_clan_roles(member: discord.Member) -> str:
+    """Remove every configured clan role from ``member`` ("Not Affiliated").
+
+    Returns ``"assigned"`` (incl. no-op) or ``"error"`` (role edit failed).
+    """
+    clan_ids = {s.role_id for s in CLAN_SLOTS if s.role_id}
+    to_remove = [r for r in member.roles if r.id in clan_ids]
+    try:
+        if to_remove:
+            await member.remove_roles(
+                *to_remove, reason="Manage: clan edit (not affiliated)"
+            )
+    except discord.HTTPException:
+        logger.exception("manage: clan role removal failed")
+        return "error"
+    return "assigned"
+
+
 async def _sync_syndicate_roles(
     member: discord.Member, wanted_ids: set[int]
 ) -> str:
@@ -4147,6 +4197,10 @@ def _manage_edit_page_components(
     clan_name = (
         _strip_clan_tag(clan_slot.clan_name or "") if clan_slot else None
     )
+    if not clan_name:
+        # No configured clan role — fall back to the stored free-text
+        # ("not affiliated") clan, when one is on record.
+        clan_name = (profile or {}).get("clan")
     mr_role = _member_current_mr_role(member)
     mastery_override = (profile or {}).get("mastery_rank")
     if mastery_override:
@@ -4221,10 +4275,11 @@ def _manage_editor_components(
     """Build the full Components V2 payload for a single-field sub-editor.
 
     ``field`` is one of ``"platform"``, ``"mastery"``, ``"clan"``,
-    ``"syndicate"``. Each renders the appropriate control (select(s) for
-    platform / mastery / syndicate, dynamic buttons for clan) pre-reflecting
-    the member's current roles, plus a Back button to the Edit page. The
-    in-game name and titles fields don't route here (modal / hint instead).
+    ``"syndicate"``. Each renders the appropriate control (a select per
+    field, plus the clan editor's "Not Affiliated" free-text button)
+    pre-reflecting the member's current roles, plus a Back button to the
+    Edit page. The in-game name and titles fields don't route here (each
+    opens its modal directly instead).
     """
     back_row = {"type": 1, "components": [
         {"type": 2, "style": 2, "label": "\u25C0 Back",
@@ -4297,24 +4352,33 @@ def _manage_editor_components(
                 "**Clan**\n-# Pick the member's clan. This assigns the clan "
                 "role (replacing any other clan role) and stores it."
             )})
-            # Dynamic buttons: names + emojis come straight from the live clan
+            # Select options: names + emojis come straight from the live clan
             # slots (the same data /status shows), so they update on their own
             # whenever an emblem or clan is reconfigured.
-            buttons: list[dict] = []
+            options = []
             for slot in configured:
-                is_current = bool(current and current.slot == slot.slot)
-                btn = {
-                    "type": 2,
-                    "style": 1 if is_current else 2,
-                    "label": (_strip_clan_tag(slot.clan_name or "") or "?")[:80],
-                    "custom_id": f"manage:{member_id}:setclan:{slot.slot}",
+                opt = {
+                    "label": (_strip_clan_tag(slot.clan_name or "") or "?")[:100],
+                    "value": str(slot.slot),
+                    "default": bool(current and current.slot == slot.slot),
                 }
                 emoji = _button_emoji_from_literal(slot.emoji)
                 if emoji:
-                    btn["emoji"] = emoji
-                buttons.append(btn)
-            for i in range(0, len(buttons), 5):
-                container.append({"type": 1, "components": buttons[i:i + 5]})
+                    opt["emoji"] = emoji
+                options.append(opt)
+            container.append({"type": 1, "components": [{
+                "type": 3, "custom_id": f"manage:{member_id}:setclan",
+                "placeholder": "Select clan",
+                "min_values": 1, "max_values": 1, "options": options,
+            }]})
+        # "Not Affiliated": free-text clan for members outside the configured
+        # slots — opens a modal to type the clan name, removes any configured
+        # clan role, and stores the typed name.
+        container.append({"type": 1, "components": [
+            {"type": 2, "style": 2, "label": "Not Affiliated",
+             "emoji": {"name": "\U0001F4DD"},
+             "custom_id": f"manage:{member_id}:clanother"},
+        ]})
 
     elif field == "syndicate":
         title = "Syndicates"
@@ -4695,7 +4759,7 @@ async def _handle_manage_interaction(
     # member just refresh the panel, which renders the "left the server" note.
     _EDIT_ACTIONS = {
         "editfield", "ign", "titleshint",
-        "setplatform", "setmr", "setclan", "setsyn",
+        "setplatform", "setmr", "setclan", "setsyn", "clanother",
     }
     if action in _EDIT_ACTIONS and member is None:
         snap = await _manage_snapshot(guild.id, member_id)
@@ -4782,8 +4846,9 @@ async def _handle_manage_interaction(
 
     if action == "setclan":
         note = "No clan selected."
+        values = (interaction.data or {}).get("values") or []
         try:
-            slot_no = int(parts[3])
+            slot_no = int(values[0]) if values else int(parts[3])
         except (IndexError, ValueError):
             slot_no = 0
         slot = next((s for s in CLAN_SLOTS if s.slot == slot_no), None)
@@ -4801,6 +4866,25 @@ async def _handle_manage_interaction(
         )
         with contextlib.suppress(Exception):
             await _interaction_callback(interaction, 7, components)
+        return
+
+    if action == "clanother":
+        # "Not Affiliated": open the free-text clan modal, prefilled with the
+        # stored clan when it's already a free-text (non-configured) one.
+        try:
+            stored = await _member_profile_from_records(guild.id, member_id)
+            stored_clan = (stored or {}).get("clan")
+            current = (
+                stored_clan
+                if stored_clan
+                and _configured_clan_slot_for_name(stored_clan) is None
+                else None
+            )
+            await interaction.response.send_modal(_ManageClanNameModal(
+                member=member, current=current,
+            ))
+        except Exception:
+            logger.exception("manage: send clan name modal failed")
         return
 
     if action == "setsyn":
@@ -5421,6 +5505,85 @@ class _ManageIGNModal(discord.ui.Modal):
                 member.id, member, _MANAGE_EDIT_PAGE, snap,
                 note=f"\u2705 In-game name set to **{_strip_clan_tag(value)}**."
                 if value else "No name entered.",
+            )
+            await _interaction_edit_original_v2(interaction, components)
+
+
+class _ManageClanNameModal(discord.ui.Modal):
+    """Admin modal opened from the /manage clan editor's "Not Affiliated"
+    button. Collects a free-text clan name for a member outside the
+    configured clan slots, removes any configured clan role, and stores the
+    typed name in the member's record. If the typed name actually matches a
+    configured clan, that clan's role is assigned instead (same as picking it
+    from the select).
+    """
+
+    def __init__(
+        self, *, member: discord.Member, current: str | None = None
+    ) -> None:
+        super().__init__(title="Set Clan (Not Affiliated)", timeout=600)
+        self._gp_member = member
+        self.clan = discord.ui.TextInput(
+            label="Clan name",
+            placeholder="The member's clan (outside this server's clans).",
+            default=current or None,
+            required=True,
+            max_length=64,
+        )
+        self.add_item(self.clan)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Defence in depth: re-check Manage Server before mutating roles.
+        user = interaction.user
+        if not (
+            isinstance(user, discord.Member)
+            and user.guild_permissions.manage_guild
+        ):
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "Operator, you can't use this.", ephemeral=True
+                )
+            return
+        member = self._gp_member
+        member = member.guild.get_member(member.id) or member
+        value = _strip_clan_tag((self.clan.value or "").strip())
+        note = "No clan name entered."
+        if value:
+            slot = _configured_clan_slot_for_name(value)
+            if slot is not None:
+                # The typed name is one of this server's clans — assign the
+                # role instead of storing a free-text duplicate.
+                status = await _apply_clan_slot(member, slot)
+                label = _strip_clan_tag(slot.clan_name or "") or "?"
+                note = {
+                    "assigned": (
+                        f"\u2705 **{label}** is a configured clan \u2014 "
+                        "assigned its role instead."
+                    ),
+                    "no_match": "That clan slot has no resolvable role.",
+                    "error": "Couldn't change the role \u2014 check my "
+                             "Manage Roles permission and role position.",
+                }.get(status, "Updated.")
+            else:
+                status = await _remove_configured_clan_roles(member)
+                await _edit_or_create_member_record(
+                    member, clan_override=value
+                )
+                note = (
+                    f"\u2705 Clan set to **{value}** (not affiliated \u2014 "
+                    "configured clan roles removed)."
+                    if status == "assigned"
+                    else f"Stored clan **{value}**, but I couldn't remove "
+                         "the clan role \u2014 check my Manage Roles "
+                         "permission."
+                )
+        # Refresh the clan editor in place (the modal submit is a fresh
+        # interaction, so ack as a deferred update then PATCH @original).
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.defer()
+        with contextlib.suppress(Exception):
+            components = _manage_editor_components(
+                member.id, member, "clan", note=note,
             )
             await _interaction_edit_original_v2(interaction, components)
 
