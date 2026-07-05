@@ -4441,14 +4441,12 @@ def _manage_edit_page_components(
         lines.append(f"-# {note}")
     body.append({"type": 10, "content": "\n".join(lines)})
 
-    # One button per editable field. ``ign`` opens a modal; ``titles`` posts a
-    # /titles hint; the rest open inline sub-editors. Split across rows of 5.
+    # One button per editable field. ``ign`` opens a modal; the rest open
+    # inline sub-editors. Split across rows of 5.
     field_buttons: list[dict] = []
     for field, label, emoji in _MANAGE_EDIT_FIELDS:
         if field == "ign":
             cid = f"manage:{member_id}:ign"
-        elif field == "titles":
-            cid = f"manage:{member_id}:titleshint"
         else:
             cid = f"manage:{member_id}:editfield:{field}"
         field_buttons.append({
@@ -4466,14 +4464,17 @@ def _manage_editor_components(
     field: str,
     *,
     note: str | None = None,
+    titles: list[dict] | None = None,
 ) -> list[dict]:
     """Build the full Components V2 payload for a single-field sub-editor.
 
     ``field`` is one of ``"platform"``, ``"mastery"``, ``"clan"``,
-    ``"syndicate"``. Each renders the appropriate control (select(s) for
-    platform / mastery / syndicate, dynamic buttons for clan) pre-reflecting
-    the member's current roles, plus a Back button to the Edit page. The
-    in-game name and titles fields don't route here (modal / hint instead).
+    ``"syndicate"``, ``"titles"``. Each renders the appropriate control
+    (select(s) for platform / mastery / syndicate, dynamic buttons for clan,
+    an add button + remove select for titles) pre-reflecting the member's
+    current state, plus a Back button to the Edit page. The in-game name
+    field doesn't route here (modal instead). ``titles`` supplies the
+    member's current titles for the titles editor.
     """
     back_row = {"type": 1, "components": [
         {"type": 2, "style": 2, "label": "\u25C0 Back",
@@ -4597,6 +4598,39 @@ def _manage_editor_components(
                 "placeholder": "Select syndicates",
                 "min_values": 0, "max_values": len(options),
                 "options": options,
+            }]})
+
+    elif field == "titles":
+        title = "Titles"
+        titles = titles or []
+        lines = [
+            f"**Titles** ({len(titles)})",
+            "-# Add a cosmetic profile title, or pick one below to remove "
+            "it \u2014 same as /titles.",
+        ]
+        for t in titles:
+            t_name = t.get("title") or "?"
+            reason = (t.get("reason") or "").strip()
+            row = f"-# \u2022 `{t_name}`"
+            if reason:
+                row += f" \u2014 {reason}"
+            lines.append(row)
+        container.append({"type": 10, "content": "\n".join(lines)})
+        container.append({"type": 1, "components": [
+            {"type": 2, "style": 1, "label": "Add title",
+             "emoji": {"name": "\U0001F451"},
+             "custom_id": f"manage:{member_id}:titleadd"},
+        ]})
+        if titles:
+            options = [
+                {"label": (t.get("title") or "?")[:100],
+                 "value": (t.get("title") or "?")[:100]}
+                for t in titles[:25]
+            ]
+            container.append({"type": 1, "components": [{
+                "type": 3, "custom_id": f"manage:{member_id}:titlerm",
+                "placeholder": "Remove a title\u2026",
+                "min_values": 1, "max_values": 1, "options": options,
             }]})
 
     if note:
@@ -4943,7 +4977,7 @@ async def _handle_manage_interaction(
     # These all need the member present (they mutate roles). For a departed
     # member just refresh the panel, which renders the "left the server" note.
     _EDIT_ACTIONS = {
-        "editfield", "ign", "titleshint",
+        "editfield", "ign", "titleadd", "titlerm",
         "setplatform", "setmr", "setclan", "setsyn",
     }
     if action in _EDIT_ACTIONS and member is None:
@@ -4965,24 +4999,49 @@ async def _handle_manage_interaction(
             logger.exception("manage: send IGN modal failed")
         return
 
-    if action == "titleshint":
-        cmd_id = _COMMAND_IDS.get("titles")
-        mention = f"</titles:{cmd_id}>" if cmd_id else "`/titles`"
-        with contextlib.suppress(Exception):
-            await _interaction_callback(
-                interaction, 4,
-                [{"type": 10, "content": "### \U0001F451  Titles"},
-                 {"type": 17, "accent_color": ACCENT_PASS, "components": [
-                     {"type": 10, "content": (
-                         f"Use {mention} to add or remove a member's cosmetic "
-                         "profile titles."
-                     )}]}],
+    if action == "titleadd":
+        try:
+            await interaction.response.send_modal(
+                _ManageTitleModal(member=member)
             )
+        except Exception:
+            logger.exception("manage: send title modal failed")
+        return
+
+    if action == "titlerm":
+        values = (interaction.data or {}).get("values") or []
+        note = "No title selected."
+        if values:
+            title = str(values[0])
+            removed = await asyncio.to_thread(
+                analytics.revoke_title,
+                guild_id=guild.id, user_id=member_id, title=title,
+            )
+            note = (
+                f"\u2705 Removed the title **{title}**."
+                if removed
+                else f"\u2139\uFE0F No title matching **{title}**."
+            )
+        titles = await asyncio.to_thread(
+            analytics.list_member_titles, guild.id, member_id
+        )
+        components = _manage_editor_components(
+            member_id, member, "titles", titles=titles, note=note
+        )
+        with contextlib.suppress(Exception):
+            await _interaction_callback(interaction, 7, components)
         return
 
     if action == "editfield":
         field = parts[3] if len(parts) > 3 else ""
-        components = _manage_editor_components(member_id, member, field)
+        titles = None
+        if field == "titles":
+            titles = await asyncio.to_thread(
+                analytics.list_member_titles, guild.id, member_id
+            )
+        components = _manage_editor_components(
+            member_id, member, field, titles=titles
+        )
         with contextlib.suppress(Exception):
             await _interaction_callback(interaction, 7, components)
         return
@@ -5714,6 +5773,68 @@ class _ManageIGNModal(_GPModal):
                 member.id, member, _MANAGE_EDIT_PAGE, snap,
                 note=f"\u2705 In-game name set to **{_strip_clan_tag(value)}**."
                 if value else "No name entered.",
+            )
+            await _interaction_edit_original_v2(interaction, components)
+
+
+class _ManageTitleModal(_GPModal):
+    """Admin modal opened from the /manage Titles editor to grant a member a
+    cosmetic profile title — the same path as ``/titles action:add``. Awards
+    the title and refreshes the Titles editor in place.
+    """
+
+    def __init__(self, *, member: discord.Member) -> None:
+        super().__init__(title="Add Title", timeout=600)
+        self._gp_member = member
+        self.title_input = discord.ui.TextInput(
+            label="Title",
+            placeholder="e.g. Sharpshooter",
+            required=True,
+            max_length=100,
+        )
+        self.reason = discord.ui.TextInput(
+            label="Reason (optional)",
+            placeholder="Why the title was awarded",
+            required=False,
+            max_length=200,
+        )
+        self.add_item(self.title_input)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        user = interaction.user
+        if not (
+            isinstance(user, discord.Member)
+            and user.guild_permissions.manage_guild
+        ):
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "Operator, you can't use this.", ephemeral=True
+                )
+            return
+        member = self._gp_member
+        value = (self.title_input.value or "").strip()
+        reason = (self.reason.value or "").strip() or None
+        # Ack BEFORE the writes so the submit is acknowledged instantly, then
+        # refresh the Titles editor in place (PATCH @original).
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.defer()
+        if value:
+            await asyncio.to_thread(
+                analytics.award_title,
+                guild_id=member.guild.id,
+                user_id=member.id,
+                title=value,
+                reason=reason,
+            )
+        with contextlib.suppress(Exception):
+            titles = await asyncio.to_thread(
+                analytics.list_member_titles, member.guild.id, member.id
+            )
+            components = _manage_editor_components(
+                member.id, member, "titles", titles=titles,
+                note=f"\u2705 Gave **{member.display_name}** the title "
+                     f"**{value}**." if value else "No title entered.",
             )
             await _interaction_edit_original_v2(interaction, components)
 
