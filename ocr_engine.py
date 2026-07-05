@@ -70,6 +70,12 @@ _OLLAMA_OCR_PROMPT = (
     "number, and the CLAN name. Output only the raw transcribed text — no "
     "commentary, no markdown, no explanations."
 )
+# Short connect timeout (seconds) shared by every OCR HTTP call: a
+# down/refusing backend (Ollama not running, OCR.space unreachable) fails
+# over in seconds instead of consuming the full read timeout before the
+# next engine runs.
+OCR_CONNECT_TIMEOUT = _int_env("OCR_CONNECT_TIMEOUT", 5)
+
 # OCR.space free tier rejects uploads >1 MB. We re-encode oversize images as
 # JPEG before sending so large PNG screenshots still get verified.
 OCR_MAX_UPLOAD_BYTES = _int_env("OCR_MAX_UPLOAD_BYTES", 900_000)
@@ -173,7 +179,7 @@ def _ocr_via_api(
                     "isOverlayRequired": "true",
                 },
                 files={"file": (filename, image_bytes, content_type or "image/png")},
-                timeout=60,
+                timeout=(OCR_CONNECT_TIMEOUT, 60),
             )
             if 500 <= response.status_code < 600:
                 exc = requests.HTTPError(
@@ -272,7 +278,7 @@ def _ocr_via_ollama(
             "stream": False,
             "options": {"temperature": 0},
         },
-        timeout=OLLAMA_TIMEOUT,
+        timeout=(OCR_CONNECT_TIMEOUT, OLLAMA_TIMEOUT),
     )
     response.raise_for_status()
     data = response.json()

@@ -106,6 +106,21 @@ def _load_font_cached(size: int, bold: bool) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()  # type: ignore[return-value]
 
 
+def warm_font_cache() -> None:
+    """Pre-open the truetype fonts at the sizes the cards use.
+
+    The truetype open is the hottest call inside a cold card render (each
+    size probes a list of filesystem paths); warming the memoized loader at
+    startup moves that cost off the first member's /profile or verify reply.
+    Sizes are the logical values used by the card layouts multiplied by the
+    supersample factor. Safe to call from a worker thread.
+    """
+    logical_sizes = (10, 14, 15, 16, 17, 18, 44)
+    for size in logical_sizes:
+        for bold in (False, True):
+            _load_font(size * _PROGRESS_SS, bold=bold)
+
+
 def _ellipsize(draw, text: str, font, max_w: float) -> str:
     """Trim ``text`` (appending an ellipsis) until it fits within ``max_w``
     pixels for ``font``. Shared by every card-text field that has to budget

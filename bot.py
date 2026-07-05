@@ -54,6 +54,41 @@ from logic import (
 import analytics
 import records_index
 from config import _csv, _csv_ids, _float_env, _int_env
+from gpbot.bootstrap import build_client_tree
+from gpbot.components_v2 import (
+    DISCORD_API_BASE as _DISCORD_API_BASE,
+    interaction_callback as _v2_interaction_callback,
+    interaction_edit_original_v2 as _v2_interaction_edit_original,
+    v2_multipart_request as _v2_multipart_http,
+)
+from gpbot.concurrency import (
+    get_or_create_lock,
+    run_heavy_job,
+    spawn_bg_task as _spawn_bg_task_impl,
+)
+from gpbot.discord_http import discord_call_with_retry
+from gpbot.onboarding import (
+    RepromptDecision,
+    parse_onboard_custom_id,
+    reprompt_decision,
+)
+from gpbot.records import (
+    DISCORD_EPOCH_MS as _DISCORD_EPOCH_MS,
+    RECORD_LINE_RE as _RECORD_LINE_RE,
+    RECORD_PROFILE_LABELS as _RECORD_PROFILE_LABELS,
+    collect_v2_text as _collect_v2_text,
+    is_exact_mastery_rank as _is_exact_mastery_rank,
+    parse_record_embed as _parse_record_embed,
+    parse_record_profile_text as _parse_record_profile_text,
+    snowflake_ts as _snowflake_ts,
+)
+from gpbot.routing import CustomIDRouter
+from gpbot.verify import (
+    VerifyResult as _VerifyResult,
+    VerifyState,
+    parse_mastery_token,
+    validate_image_bytes,
+)
 from ocr_engine import OCR_API_KEY, OLLAMA_OCR_MODEL, _ocr
 from envstore import (  # noqa: F401  (some re-exported for tests via bot.*)
     ENV_FILE_PATH,
@@ -75,6 +110,7 @@ from cards import (  # noqa: F401  (test-facing re-exports resolved as bot.*)
     _radial_gradient,
     _render_profile_card_png,
     _vignette,
+    warm_font_cache,
 )
 from utils.metrics import heavy_semaphore_metrics, metrics_snapshot, ocr_latency
 
@@ -270,12 +306,7 @@ CLAN_SLOTS: list[ClanSlot] = _load_clan_slots()
 
 # ---------- Discord client --------------------------------------------------
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
+client, tree = build_client_tree()
 
 BOT_START_TIME = time.time()
 HEALTH_PATH = os.getenv("HEALTH_PATH", "./data/gp_health")
@@ -284,6 +315,8 @@ HEALTH_INTERVAL = _int_env("HEALTH_INTERVAL", 20)
 # Populated after tree.sync(); used to render clickable slash-command mentions
 # (`</name:id>`) inside ephemeral replies fired from component buttons.
 _COMMAND_IDS: dict[str, int] = {}
+_CUSTOM_ID_ROUTER = CustomIDRouter()
+_CUSTOM_ID_ROUTES_REGISTERED = False
 
 # Strong refs for fire-and-forget tasks. asyncio docs warn that
 # create_task() return values must be kept alive or the task may be
@@ -309,13 +342,13 @@ async def _run_heavy(func, /, *args, **kwargs):
     Instruments ``heavy_semaphore_metrics`` (from utils.metrics) so the
     /status page can surface current/peak/queued counts and average wait.
     """
-    enqueue_ts = heavy_semaphore_metrics.record_enqueue()
-    async with _HEAVY_JOB_SEMAPHORE:
-        heavy_semaphore_metrics.record_acquire(enqueue_ts)
-        try:
-            return await asyncio.to_thread(func, *args, **kwargs)
-        finally:
-            heavy_semaphore_metrics.record_release()
+    return await run_heavy_job(
+        _HEAVY_JOB_SEMAPHORE,
+        heavy_semaphore_metrics,
+        func,
+        *args,
+        **kwargs,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -342,36 +375,14 @@ async def _discord_call_with_retry(coro_factory, /, *, label: str = "discord cal
     label:
         Human-readable description for logging.
     """
-    from utils.retry import exponential_backoff
-    last: Exception | None = None
-    for attempt in range(1, _DISCORD_RETRY_MAX + 1):
-        try:
-            await coro_factory()
-            return
-        except discord.HTTPException as exc:
-            last = exc
-            if exc.status == 429:
-                # Respect the Retry-After header when Discord provides it.
-                retry_after = getattr(exc, "retry_after", None)
-                if retry_after and isinstance(retry_after, (int, float)) and retry_after > 0:
-                    delay = min(float(retry_after), _DISCORD_RETRY_MAX_DELAY)
-                else:
-                    delay = exponential_backoff(
-                        attempt,
-                        base=_DISCORD_RETRY_BASE,
-                        cap=_DISCORD_RETRY_MAX_DELAY,
-                    )
-                if attempt < _DISCORD_RETRY_MAX:
-                    logger.warning(
-                        "%s: rate-limited (attempt %d/%d); sleeping %.1fs",
-                        label, attempt, _DISCORD_RETRY_MAX, delay,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-            # Non-429 or final attempt — propagate.
-            raise
-    if last is not None:
-        raise last
+    await discord_call_with_retry(
+        coro_factory,
+        label=label,
+        logger=logger,
+        max_attempts=_DISCORD_RETRY_MAX,
+        base_delay=_DISCORD_RETRY_BASE,
+        max_delay=_DISCORD_RETRY_MAX_DELAY,
+    )
 
 async def _health_task() -> None:
     # Liveness signal: touch HEALTH_PATH every HEALTH_INTERVAL seconds. The
@@ -407,10 +418,7 @@ def _spawn_bg_task(coro) -> asyncio.Task:
     """Schedule a coroutine on the running loop and keep a strong reference
     so the GC can't reap it mid-await. Self-cleans on completion and logs
     any unhandled exception via ``_bg_task_done``."""
-    task = asyncio.create_task(coro)
-    _BG_TASKS.add(task)
-    task.add_done_callback(_bg_task_done)
-    return task
+    return _spawn_bg_task_impl(coro, task_set=_BG_TASKS, on_done=_bg_task_done)
 
 
 # Persistent aiohttp session for Discord REST + CDN fetches. Reusing a
@@ -464,6 +472,40 @@ async def on_ready() -> None:
         # Run an immediate reconciliation sweep before entering the loop
         # so offline-elapsed prompts are handled within seconds of boot.
         _spawn_bg_task(_onboarding_reprompt_task_startup())
+
+    # Pre-warm the render caches (truetype fonts + configured emoji icons)
+    # so the first verify/profile reply doesn't pay the cold-start cost.
+    if not getattr(client, "_caches_warmed", False):
+        client._caches_warmed = True  # type: ignore[attr-defined]
+        _spawn_bg_task(_prewarm_caches())
+
+
+async def _prewarm_caches() -> None:
+    """Warm the font cache and prefetch every configured emoji icon.
+
+    Runs once in the background after connect: fonts load in a worker thread
+    (filesystem probes), emoji icons fetch concurrently from the CDN into
+    ``_EMOJI_BYTES_CACHE``. Fail-soft — a cold cache only costs latency.
+    """
+    try:
+        await asyncio.to_thread(warm_font_cache)
+    except Exception:
+        logger.debug("cache pre-warm: font warm failed", exc_info=True)
+    literals: set[str] = {s.emoji for s in CLAN_SLOTS if s.emoji}
+    literals.update(v for v in PLATFORM_EMOJIS.values() if v)
+    literals.update(v for v in SYNDICATE_FACTION_EMOJIS.values() if v)
+    for raw in (
+        MASTERY_RANK_EMOJI_RAW, OPERATOR_EMOJI_RAW,
+        SYNDICATE_EMOJI_RAW, WARNING_EMOJI_RAW,
+    ):
+        if raw:
+            literals.add(raw)
+    try:
+        await asyncio.gather(
+            *(_fetch_emoji_bytes(lit) for lit in literals)
+        )
+    except Exception:
+        logger.debug("cache pre-warm: emoji prefetch failed", exc_info=True)
 
 
 async def _onboarding_reprompt_task_startup() -> None:
@@ -1010,6 +1052,35 @@ async def _member_profile_info_lines(
     role_ids = {r.id for r in member.roles}
     rows: list[tuple] = []
 
+    # Prefetch every emoji icon a row might need in one concurrent burst —
+    # each literal is an independent CDN fetch (cached per emoji ID), so
+    # paying their latency back-to-back on a cold cache is pure waste.
+    slot = next(
+        (s for s in CLAN_SLOTS if s.role_id and s.role_id in role_ids),
+        None,
+    )
+    platforms = {p: rid for p, rid in PLATFORM_ROLE_IDS.items() if rid}
+    member_platform = next(
+        (p for p, rid in platforms.items() if rid in role_ids), None
+    )
+    syn_ids = set(SYNDICATE_ROLE_IDS)
+    syndicate_roles = [r for r in member.roles if r.id in syn_ids]
+    emoji_literals: set[str | None] = {
+        slot.emoji if slot is not None else None,
+        PLATFORM_EMOJIS.get(member_platform) if member_platform else None,
+        MASTERY_RANK_EMOJI_RAW,
+        *(_syndicate_style(r.name)[1] for r in syndicate_roles),
+    }
+    emoji_literals.discard(None)
+    literal_list = sorted(emoji_literals)
+    emoji_bytes_list = await asyncio.gather(
+        *(_fetch_emoji_bytes(lit) for lit in literal_list)
+    )
+    emoji_bytes: dict[str | None, bytes | None] = dict(
+        zip(literal_list, emoji_bytes_list)
+    )
+    emoji_bytes[None] = None
+
     # The records channel is the source of truth for the exact picked/OCR'd
     # Mastery Rank (Discord roles only carry coarse buckets), so prefer it for
     # the Mastery Rank row when present. The record read (HTTP/cache) and the
@@ -1025,10 +1096,6 @@ async def _member_profile_info_lines(
 
     # Clan — match the member's clan role to its slot for name + emoji.
     if any(s.role_id for s in CLAN_SLOTS):
-        slot = next(
-            (s for s in CLAN_SLOTS if s.role_id and s.role_id in role_ids),
-            None,
-        )
         if slot is not None:
             clan_role = member.guild.get_role(slot.role_id)
             clan_color = (
@@ -1039,23 +1106,19 @@ async def _member_profile_info_lines(
             rows.append((
                 "Clan",
                 _strip_clan_tag(slot.clan_name or "") or "\u2014",
-                await _fetch_emoji_bytes(slot.emoji),
+                emoji_bytes.get(slot.emoji),
                 clan_color,
             ))
         else:
             rows.append(("Clan", "\u2014", None))
 
     # Platform — first configured platform role the member holds.
-    platforms = {p: rid for p, rid in PLATFORM_ROLE_IDS.items() if rid}
     if platforms:
-        member_platform = next(
-            (p for p, rid in platforms.items() if rid in role_ids), None
-        )
         if member_platform is not None:
             rows.append((
                 "Platform",
                 member_platform,
-                await _fetch_emoji_bytes(PLATFORM_EMOJIS.get(member_platform)),
+                emoji_bytes.get(PLATFORM_EMOJIS.get(member_platform)),
             ))
         else:
             rows.append(("Platform", "\u2014", None))
@@ -1087,7 +1150,7 @@ async def _member_profile_info_lines(
         rows.append((
             "Mastery Rank",
             mr_value,
-            await _fetch_emoji_bytes(MASTERY_RANK_EMOJI_RAW),
+            emoji_bytes.get(MASTERY_RANK_EMOJI_RAW),
         ))
 
     # Syndicate — members may pledge to several. Emit a per-faction list of
@@ -1095,16 +1158,13 @@ async def _member_profile_info_lines(
     # per-faction SYNDICATE_EMOJI_<KEY>, falling back to the role's own
     # colour + the shared SYNDICATE_EMOJI for an unrecognised name.
     if SYNDICATE_ROLE_IDS:
-        syn_ids = set(SYNDICATE_ROLE_IDS)
         factions: list[tuple] = []
-        for r in member.roles:
-            if r.id not in syn_ids:
-                continue
+        for r in syndicate_roles:
             color, emoji_literal = _syndicate_style(r.name)
             if color is None and r.color.value:
                 color = r.color.to_rgb()
             factions.append((
-                r.name, color, await _fetch_emoji_bytes(emoji_literal),
+                r.name, color, emoji_bytes.get(emoji_literal),
             ))
         rows.append(("Syndicate", factions))
 
@@ -1182,10 +1242,8 @@ def _assign_role_buttons(
 
 # Components V2 multipart bodies bypass discord.py's HTTPClient (it can't
 # cleanly post arbitrary V2 multipart) and go straight out via aiohttp with
-# the bot token. One base URL + User-Agent + sender keeps the POST (new
-# reply) and PATCH (attachment swap) paths in lock-step.
-_DISCORD_API_BASE = "https://discord.com/api/v10"
-_V2_USER_AGENT = "GoldenPagoda (https://github.com/aidenlong04, 1.0)"
+# the bot token. One base URL + sender keeps the POST (new reply) and PATCH
+# (attachment swap) paths in lock-step.
 
 
 async def _v2_multipart_request(
@@ -1209,36 +1267,24 @@ async def _v2_multipart_request(
     Raises ``discord.HTTPException`` on any 4xx/5xx so callers can fall back
     or log it (e.g. ``_post_channel_embed`` / ``_edit_channel_embed``).
     """
-    form = aiohttp.FormData()
-    form.add_field(
-        "payload_json", json.dumps(payload),
-        content_type="application/json",
-    )
-    form.add_field(
-        "files[0]", file_bytes,
-        filename=file_name, content_type=file_content_type,
-    )
-    for idx, (extra_bytes, extra_name) in enumerate(extra_files or [], start=1):
-        form.add_field(
-            f"files[{idx}]", extra_bytes,
-            filename=extra_name, content_type="image/png",
-        )
-    headers = {
-        "Authorization": f"Bot {DISCORD_TOKEN}",
-        "User-Agent": _V2_USER_AGENT,
-    }
-    timeout = aiohttp.ClientTimeout(total=15)
     session = await _get_http_session()
-    async with session.request(
-        method, url, data=form, headers=headers, timeout=timeout
-    ) as resp:
-        if resp.status >= 400:
-            text = await resp.text()
-            raise discord.HTTPException(resp, text)  # type: ignore[arg-type]
-        try:
-            return await resp.json()
-        except (aiohttp.ContentTypeError, ValueError):
-            return None
+    holder: dict[str, object] = {}
+
+    async def _request():
+        holder["data"] = await _v2_multipart_http(
+            session,
+            method=method,
+            url=url,
+            bot_token=DISCORD_TOKEN,
+            payload=payload,
+            file_bytes=file_bytes,
+            file_name=file_name,
+            file_content_type=file_content_type,
+            extra_files=extra_files,
+        )
+
+    await _discord_call_with_retry(_request, label=f"v2 multipart {method}")
+    return holder.get("data")
 
 
 async def _delete_message(channel_id: int, message_id: int) -> None:
@@ -1246,13 +1292,17 @@ async def _delete_message(channel_id: int, message_id: int) -> None:
     swallowed (already gone); other HTTP errors are logged."""
     from discord.http import Route
 
+    route = Route(
+        "DELETE",
+        "/channels/{channel_id}/messages/{message_id}",
+        channel_id=channel_id,
+        message_id=message_id,
+    )
     try:
-        await client.http.request(Route(
-            "DELETE",
-            "/channels/{channel_id}/messages/{message_id}",
-            channel_id=channel_id,
-            message_id=message_id,
-        ))
+        await _discord_call_with_retry(
+            lambda: client.http.request(route),
+            label=f"delete message {message_id}",
+        )
     except discord.NotFound:
         pass
     except discord.HTTPException:
@@ -1309,7 +1359,16 @@ async def _post_channel_v2(
         channel_id=channel_id,
     )
     try:
-        data = await client.http.request(route, json=payload)
+        holder: dict[str, object] = {}
+
+        async def _request():
+            holder["data"] = await client.http.request(route, json=payload)
+
+        await _discord_call_with_retry(
+            _request,
+            label=f"post channel v2 {channel_id}",
+        )
+        data = holder.get("data")
         return _extract_message_id(data)
     except discord.HTTPException:
         logger.exception("_post_channel_v2: failed to post to channel %s", channel_id)
@@ -2215,7 +2274,31 @@ async def _handle_mreview_interaction(
         )
 
 
-class _OnboardingVerifyModal(discord.ui.Modal):
+class _GPModal(discord.ui.Modal):
+    """Shared modal base: report unexpected ``on_submit`` failures to the
+    user instead of dying silently.
+
+    discord.py's default ``Modal.on_error`` only logs — the member sees the
+    modal close and nothing else. Every deferred interaction must surface its
+    failure, so route it through the followup webhook (the submit handlers
+    defer immediately) with a plain-response fallback.
+    """
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception, /
+    ) -> None:
+        logger.exception(
+            "modal %s failed", type(self).__name__, exc_info=error
+        )
+        msg = "\u274C Something went wrong \u2014 please try again."
+        with contextlib.suppress(Exception):
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+
+
+class _OnboardingVerifyModal(_GPModal):
     """Modal opened from the onboarding welcome prompt when a member clicks a
     clan button. Accepts a Warframe profile screenshot, OCRs it, and validates
     that the OCR-detected clan matches the one the member claimed via the button.
@@ -2404,7 +2487,7 @@ class _OnboardingVerifyModal(discord.ui.Modal):
         ))
 
 
-class _OnboardingNoClanModal(discord.ui.Modal):
+class _OnboardingNoClanModal(_GPModal):
     """Modal opened from the onboarding welcome prompt when a member clicks
     "Not listed / No". Collects a Warframe profile screenshot so the member's
     manual-review record still carries their screenshot (matching the clan
@@ -2726,11 +2809,7 @@ def _record_write_lock(user_id: int) -> asyncio.Lock:
     freshly-indexed record and edit it in place instead. Created lazily on the
     running loop; keyed by the globally-unique user id (matches the index key).
     """
-    lock = _RECORD_WRITE_LOCKS.get(user_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _RECORD_WRITE_LOCKS[user_id] = lock
-    return lock
+    return get_or_create_lock(_RECORD_WRITE_LOCKS, user_id)
 
 
 async def _edit_or_create_member_record(
@@ -2898,30 +2977,9 @@ def _evict_cached_screenshot(user_id: int) -> None:
     """Drop the member's cached screenshot (on leave)."""
     _screenshot_cache.pop(user_id, None)
 
-# Maps a record body label to the profile dict key it populates. Mirrors the
-# lines emitted by :func:`_member_record_profile_lines`.
-_RECORD_PROFILE_LABELS = {
-    "in-game name": "in_game_name",
-    "mastery rank": "mastery_rank",
-    "clan": "clan",
-    "platform": "platform",
-    "syndicate": "syndicate",
-}
-
-# A record body line: "Key: **Value**", optionally prefixed by the "-# "
-# small-text marker the container uses.
-_RECORD_LINE_RE = re.compile(
-    r"^\s*(?:-#\s*)?([A-Za-z][\w \-]*?):\s*\*\*(.+?)\*\*\s*$",
-    re.MULTILINE,
-)
-
-# Discord epoch (2015-01-01) in ms, for deriving a timestamp from a snowflake.
-_DISCORD_EPOCH_MS = 1420070400000
-
-
-def _snowflake_ts(snowflake: int) -> int:
-    """Return the unix-seconds creation time encoded in a Discord snowflake."""
-    return int((((int(snowflake) >> 22) + _DISCORD_EPOCH_MS) / 1000))
+# Record body parsing (labels, line regex, snowflake timestamps, V2 text
+# walk, embed parse-back) lives in gpbot.records; re-exported above as the
+# private bot.* names tests and callers already use.
 
 
 def _records_channel_id() -> int:
@@ -2931,98 +2989,6 @@ def _records_channel_id() -> int:
     except Exception:
         cid = None
     return int(cid or MEMBER_RECORDS_CHANNEL_ID or 0)
-
-
-def _collect_v2_text(components: object) -> str:
-    """Walk a Components V2 tree and join every type-10 ``content`` string."""
-    parts: list[str] = []
-
-    def _walk(node: object) -> None:
-        if isinstance(node, dict):
-            if node.get("type") == 10 and isinstance(node.get("content"), str):
-                parts.append(node["content"])
-            _walk(node.get("components"))
-            _walk(node.get("items"))
-        elif isinstance(node, list):
-            for child in node:
-                _walk(child)
-
-    _walk(components)
-    return "\n".join(parts)
-
-
-_EXACT_MASTERY_RE = re.compile(r"^(MR|LR)\s*(\d+)$", re.IGNORECASE)
-
-
-def _is_exact_mastery_rank(value: str) -> bool:
-    """True when ``value`` is an exact ``MR n`` / ``LR n`` rank with a real
-    (>= 1) number.
-
-    The records channel stores the exact OCR rank and prefers it over the
-    coarse role bucket on every refresh, so a bogus ``MR 0`` (a stray UI/credit
-    digit the OCR misread) would otherwise stick forever and never update to
-    the member's real rank. Rejecting rank 0 here drops that bad value on read
-    so the role bucket wins instead. Rank roles run MR 1-30 / Legendary 1-8 and
-    the mastery editor already requires ``> 0``, so 0 is never a real rank.
-    """
-    m = _EXACT_MASTERY_RE.match(value or "")
-    return bool(m) and int(m.group(2)) >= 1
-
-
-def _parse_record_profile_text(text: str) -> dict:
-    """Parse a record body's ``Key: **Value**`` lines into a profile dict.
-
-    Recognises the labels emitted by :func:`_member_record_profile_lines`.
-    The Mastery Rank value is kept only when it's an exact ``MR n`` / ``LR n``
-    rank (the OCR-exact override); a coarse role-bucket name is dropped so the
-    returned shape matches the old durable-store semantics (where
-    ``mastery_rank`` was always the exact rank or absent).
-    """
-    out: dict = {}
-    for m in _RECORD_LINE_RE.finditer(text or ""):
-        key = _RECORD_PROFILE_LABELS.get(m.group(1).strip().lower())
-        if not key or key in out:
-            continue
-        value = m.group(2).strip()
-        if key == "mastery_rank" and not _is_exact_mastery_rank(value):
-            continue
-        out[key] = value
-    return out
-
-
-def _parse_record_embed(embeds: object) -> dict:
-    """Parse a member record's profile fields out of its rich ``embeds``.
-
-    Mirrors :func:`_parse_record_profile_text` but reads the structured
-    ``embeds[].fields`` (``{name, value}``) written by
-    :func:`_build_member_record_embed`. Field names map through
-    ``_RECORD_PROFILE_LABELS``; values may be wrapped in ``**bold**``. Mastery
-    Rank is kept only when it's an exact ``MR n`` / ``LR n`` rank.
-    """
-    out: dict = {}
-    if not isinstance(embeds, list):
-        return out
-    for embed in embeds:
-        if not isinstance(embed, dict):
-            continue
-        for field in embed.get("fields") or []:
-            if not isinstance(field, dict):
-                continue
-            name = str(field.get("name", "")).strip().rstrip(":").strip().lower()
-            key = _RECORD_PROFILE_LABELS.get(name)
-            if not key or key in out:
-                continue
-            value = str(field.get("value", "")).strip()
-            if value.startswith("`") and value.endswith("`") and len(value) > 2:
-                value = value[1:-1].strip()
-            elif value.startswith("**") and value.endswith("**") and len(value) > 4:
-                value = value[2:-2].strip()
-            if not value:
-                continue
-            if key == "mastery_rank" and not _is_exact_mastery_rank(value):
-                continue
-            out[key] = value
-    return out
 
 
 async def _fetch_record_message(channel_id: int, message_id: int) -> dict | None:
@@ -3171,28 +3137,15 @@ async def _handle_onboarding_interaction(
 
     Ownership check: only the target member may interact.
     """
-    parts = custom_id.split(":")
-    # parts[0] = "onboard", parts[1] = user_id, parts[2] = action
-    try:
-        target_id = int(parts[1])
-    except (IndexError, ValueError):
+    parsed = parse_onboard_custom_id(
+        custom_id,
+        select_values=(interaction.data or {}).get("values"),
+    )
+    if parsed is None:
         return
-
-    action = parts[2] if len(parts) > 2 else ""
+    target_id, _action, slot_token = parsed
     user = interaction.user
     guild = interaction.guild
-
-    # The clan dropdown carries the chosen slot in the select's values, while
-    # legacy clan buttons encoded it in the custom_id. Normalise both to a
-    # single ``slot_token`` (a slot number string or "none").
-    slot_token: str | None = None
-    if action == "clanselect":
-        values = (interaction.data or {}).get("values") or []
-        slot_token = str(values[0]) if values else None
-    elif action == "clan":
-        slot_token = parts[3] if len(parts) > 3 else None
-    elif action == "none":
-        slot_token = "none"
 
     # Ownership gate — reject any other user with an ephemeral.
     if user.id != target_id:
@@ -3303,22 +3256,28 @@ async def _onboarding_reprompt_sweep() -> None:
         posted_ts = row["posted_ts"]
         reprompt_count = row["reprompt_count"]
 
-        elapsed = now - posted_ts
-        if elapsed < window_secs:
-            continue
-
         guild = client.get_guild(guild_id)
         if guild is None:
             continue
         member = guild.get_member(user_id)
-        if member is None:
+
+        decision = reprompt_decision(
+            posted_ts=posted_ts,
+            reprompt_count=reprompt_count,
+            now=now,
+            window_secs=window_secs,
+            max_reprompts=ONBOARDING_MAX_REPROMPTS,
+            member_present=member is not None,
+        )
+        if decision is RepromptDecision.WAIT:
+            continue
+        if decision is RepromptDecision.CLEANUP:
             # Member left; clean up.
             await asyncio.to_thread(
                 analytics.delete_onboarding_prompt, guild_id, user_id
             )
             continue
-
-        if reprompt_count >= ONBOARDING_MAX_REPROMPTS:
+        if decision is RepromptDecision.STOP:
             logger.info(
                 "onboarding: %s in guild %s hit max reprompts (%d); stopping",
                 user_id, guild_id, ONBOARDING_MAX_REPROMPTS,
@@ -3868,27 +3827,19 @@ async def _interaction_callback(
     *,
     ephemeral: bool = True,
 ) -> None:
-    from discord.http import Route
-
     flags = COMPONENTS_V2_FLAG
     if ephemeral:
         flags |= EPHEMERAL_FLAG
-    route = Route(
-        "POST",
-        "/interactions/{interaction_id}/{interaction_token}/callback",
-        interaction_id=interaction.id,
-        interaction_token=interaction.token,
-    )
-    await client.http.request(
-        route,
-        json={
-            "type": callback_type,
-            "data": {
-                "flags": flags,
-                "components": components,
-                "allowed_mentions": _ALLOWED_MENTIONS_NONE,
-            },
-        },
+    await _discord_call_with_retry(
+        lambda: _v2_interaction_callback(
+            http_client=client.http,
+            interaction=interaction,
+            callback_type=callback_type,
+            components=components,
+            flags=flags,
+            allowed_mentions=_ALLOWED_MENTIONS_NONE,
+        ),
+        label="interaction callback",
     )
     with contextlib.suppress(AttributeError):
         interaction.response._responded = True  # type: ignore[attr-defined]
@@ -3905,20 +3856,14 @@ async def _interaction_edit_original_v2(
     ``@original`` route directly. The message keeps its IS_COMPONENTS_V2
     flag, so the edit only needs to carry the new component tree.
     """
-    from discord.http import Route
-
-    route = Route(
-        "PATCH",
-        "/webhooks/{application_id}/{interaction_token}/messages/@original",
-        application_id=interaction.application_id,
-        interaction_token=interaction.token,
-    )
-    await client.http.request(
-        route,
-        json={
-            "components": components,
-            "allowed_mentions": _ALLOWED_MENTIONS_NONE,
-        },
+    await _discord_call_with_retry(
+        lambda: _v2_interaction_edit_original(
+            http_client=client.http,
+            interaction=interaction,
+            components=components,
+            allowed_mentions=_ALLOWED_MENTIONS_NONE,
+        ),
+        label="interaction edit original",
     )
 
 
@@ -5280,7 +5225,7 @@ class _MasteryEditorView(discord.ui.View):
                 )
 
 
-class _ScreenshotVerifyModal(discord.ui.Modal):
+class _ScreenshotVerifyModal(_GPModal):
     """Modal that lets a member upload a Warframe profile screenshot. On
     submit we OCR it and assign/store every field we can (in-game name,
     clan role, mastery rank), then re-render the /profile card in place.
@@ -5439,7 +5384,7 @@ class _ScreenshotVerifyButton(discord.ui.Button):
         await interaction.response.send_modal(modal)
 
 
-class _ManageIGNModal(discord.ui.Modal):
+class _ManageIGNModal(_GPModal):
     """Admin modal opened from the /manage Edit page to set a member's stored
     in-game name by hand (no OCR). Writes ``in_game_name`` to the durable
     store and refreshes the Edit page in place.
@@ -5488,7 +5433,7 @@ class _ManageIGNModal(discord.ui.Modal):
             await _interaction_edit_original_v2(interaction, components)
 
 
-class _ManageScreenshotModal(discord.ui.Modal):
+class _ManageScreenshotModal(_GPModal):
     """Admin screenshot modal opened from the /manage panel. OCRs a member's
     Warframe profile screenshot and writes their in-game name / clan /
     mastery straight into the durable store + roles (same pipeline as the
@@ -5587,18 +5532,8 @@ class _ManageScreenshotModal(discord.ui.Modal):
                 )
 
 
-class _VerifyResult(NamedTuple):
-    """Outcome of :func:`_verify_member_from_screenshot`.
-
-    ``summary`` holds the human-readable per-field lines (empty when the
-    screenshot couldn't be read). ``in_game_name`` and ``mastery_rank`` carry
-    the OCR-only fields — the handle + exact rank that aren't recoverable from
-    Discord roles — so callers can thread them into the member-records log.
-    """
-
-    summary: list[str]
-    in_game_name: str | None
-    mastery_rank: str | None
+# _VerifyResult / VerifyState live in gpbot.verify (imported at top) so the
+# pipeline states are unit-testable without a gateway connection.
 
 
 async def _verify_member_from_screenshot(
@@ -5613,21 +5548,15 @@ async def _verify_member_from_screenshot(
     onboarding + /manage flows, but scoped to a single member's self-service:
     no reactions, no public reply, no verify/incomplete role gating. Returns
     a ``_VerifyResult`` whose ``summary`` describes what was updated; an empty
-    summary means the screenshot couldn't be read.
+    summary means the screenshot couldn't be read (``result.state`` says why:
+    ``INVALID_IMAGE`` vs ``OCR_FAILED``).
     """
-    try:
-        probe = Image.open(io.BytesIO(image_bytes))
-        try:
-            probe.verify()
-        finally:
-            probe.close()
-    except Exception:
-        logger.warning("profile screenshot: invalid image", exc_info=True)
-        return _VerifyResult([], None, None)
+    if not await asyncio.to_thread(validate_image_bytes, image_bytes):
+        return _VerifyResult.failed(VerifyState.INVALID_IMAGE)
 
     fields = await _ocr_profile_fields(image_bytes, filename, content_type)
     if not fields.ok:
-        return _VerifyResult([], None, None)
+        return _VerifyResult.failed(VerifyState.OCR_FAILED)
     profile_name = fields.profile_name
     clan_name = fields.clan_name
     mastery_rank = fields.mastery_rank
@@ -5651,10 +5580,9 @@ async def _verify_member_from_screenshot(
             )
 
     if mastery_rank:
-        m = re.match(r"\s*(MR|LR)\s*(\d+)", mastery_rank, re.IGNORECASE)
-        if m:
-            kind = m.group(1).upper()
-            value = int(m.group(2))
+        token = parse_mastery_token(mastery_rank)
+        if token is not None:
+            kind, value = token
             status = await _apply_mastery_bucket(member, kind, value)
             disp = _format_mastery_display(f"{kind} {value}")
             if status == "assigned":
@@ -6016,7 +5944,17 @@ async def onboard_cmd(
         )
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
-    posted = await _post_onboarding_welcome(member)
+    try:
+        posted = await _post_onboarding_welcome(member)
+    except Exception:
+        logger.exception("/onboard failed")
+        with contextlib.suppress(Exception):
+            await interaction.followup.send(
+                "\u274C Couldn't post the onboarding welcome \u2014 "
+                "something went wrong; check the logs.",
+                ephemeral=True,
+            )
+        return
     logger.info(
         "onboard: admin %s triggered onboarding for %s in guild %s (posted=%s)",
         interaction.user.id, member.id, guild.id, posted,
@@ -6037,25 +5975,9 @@ async def onboard_cmd(
     )
 
 
-@client.event
-async def on_interaction(interaction: discord.Interaction) -> None:
-    if interaction.type != discord.InteractionType.component:
-        return
-    data = interaction.data or {}
-    custom_id = str(data.get("custom_id", ""))
-
-    if custom_id.startswith("manage:"):
-        await _handle_manage_interaction(interaction, custom_id)
-        return
-    if custom_id.startswith("onboard:"):
-        await _handle_onboarding_interaction(interaction, custom_id)
-        return
-    if custom_id.startswith("mreview:"):
-        await _handle_mreview_interaction(interaction, custom_id)
-        return
-    if not custom_id.startswith("status:"):
-        return
-
+async def _handle_status_interaction(
+    interaction: discord.Interaction, custom_id: str
+) -> None:
     parts = custom_id.split(":", 1)
     if len(parts) != 2 or parts[1] == "noop":
         try:
@@ -6102,6 +6024,29 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         await _interaction_callback(interaction, 7, components)  # UPDATE_MESSAGE
     except Exception:
         logger.exception("pagination failed")
+
+
+def _register_custom_id_routes() -> None:
+    global _CUSTOM_ID_ROUTES_REGISTERED
+    if _CUSTOM_ID_ROUTES_REGISTERED:
+        return
+    _CUSTOM_ID_ROUTER.register_prefix("manage:", _handle_manage_interaction)
+    _CUSTOM_ID_ROUTER.register_prefix("onboard:", _handle_onboarding_interaction)
+    _CUSTOM_ID_ROUTER.register_prefix("mreview:", _handle_mreview_interaction)
+    _CUSTOM_ID_ROUTER.register_prefix("status:", _handle_status_interaction)
+    _CUSTOM_ID_ROUTES_REGISTERED = True
+
+
+_register_custom_id_routes()
+
+
+@client.event
+async def on_interaction(interaction: discord.Interaction) -> None:
+    if interaction.type != discord.InteractionType.component:
+        return
+    data = interaction.data or {}
+    custom_id = str(data.get("custom_id", ""))
+    await _CUSTOM_ID_ROUTER.dispatch(interaction, custom_id)
 
 
 

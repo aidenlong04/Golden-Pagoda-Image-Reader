@@ -17,24 +17,35 @@ envstore.py      .env rewriters (_rewrite_env_file skeleton) — imports logic.C
 ocr_engine.py    Ollama -> OCR.space -> Tesseract chain — imports config, utils.retry
 analytics.py     SQLite (events, member_titles, onboarding_prompts, member_profile), fail-soft — stdlib sqlite3
 cards.py         Pillow/numpy card rendering — imports logic._mastery_label_value
-bot.py           Discord client, slash commands, V2 helpers, verify/role/onboarding/records flow
-                 imports: logic, analytics, config, ocr_engine, envstore, cards, utils.metrics
+gpbot/bootstrap.py    Discord client + CommandTree bootstrap
+gpbot/routing.py      centralized custom-id router/registry
+gpbot/components_v2.py Components-V2 raw HTTP helpers
+gpbot/discord_http.py shared Discord REST retry wrapper
+gpbot/concurrency.py  heavy-job runner + background-task + per-key lock helpers
+gpbot/records.py      pure member-record body parsing (V2 text + embed parse-back)
+gpbot/verify.py       verification pipeline states (VerifyState/VerifyResult) + pure helpers
+gpbot/onboarding.py   onboarding custom-id parsing + reprompt sweep decisions
+bot.py                entrypoint/orchestrator wiring commands + flows using gpbot modules
 ```
 
-`bot.py` re-exports selected `cards.py`, `envstore.py`, and `logic.py` symbols
-so tests can resolve them as `bot.*`.
+`bot.py` re-exports selected `cards.py`, `envstore.py`, `logic.py`, and
+`gpbot.*` symbols so tests can resolve them as `bot.*` (e.g. `_VerifyResult`,
+`_parse_record_embed`, `_collect_v2_text`).
 
 ## Entry points
 
 - **Gateway events** (`@client.event` in `bot.py`):
-  - `on_ready` — resolves roles/clan slots from live guilds, syncs the 5 slash
-    commands, starts `_health_task` and the onboarding reprompt loop.
+  - `on_ready` — resolves roles/clan slots from live guilds, syncs the slash
+    commands, starts `_health_task`, the onboarding reprompt loop, and the
+    one-shot cache pre-warm (`_prewarm_caches`: fonts + configured emoji
+    icons).
   - `on_member_join` — posts the onboarding welcome (dynamic clan buttons).
   - `on_member_remove` — schedules the on-leave privacy data clear.
   - `on_member_update` — refreshes a member's record when tracked roles change
     (only if a record already exists).
-  - `on_interaction` — dispatches button/modal/select interactions
-    (`onboard:` / `manage:` / `status` / mreview custom-id branches).
+  - `on_interaction` — dispatches button/modal/select interactions via
+    `gpbot.routing.CustomIDRouter` registry (`onboard:` / `manage:` / `status:` /
+    `mreview:`).
 - **Slash commands** (`@tree.command`): `/clan-emblems`, `/status`, `/profile`,
   `/titles`, `/manage`. Synced in `on_ready`; none are groups.
 - **Process entry**: `python bot.py` (macOS/Linux) / `./run.ps1` (Windows).
@@ -56,13 +67,15 @@ so tests can resolve them as `bot.*`.
 ## External I/O sites
 
 - **Discord REST**: discord.py `client.http` + raw aiohttp via
-  `_DISCORD_API_BASE` (`https://discord.com/api/v10`) for Components V2
-  (`_send_v2`, `_post_channel_v2`, `_v2_multipart_request`,
-  `_edit_channel_message_v2`, `_interaction_callback`). All funnel rate-limit
-  retries through `_discord_call_with_retry`.
+  `gpbot.components_v2` (`https://discord.com/api/v10`) for Components V2
+  callbacks/edits/multipart uploads. Calls funnel rate-limit retries through
+  `gpbot.discord_http.discord_call_with_retry`.
 - **OCR** (`ocr_engine.py`): Ollama (`OLLAMA_URL`, default
   `http://localhost:11434`) -> OCR.space (`https://api.ocr.space`, engine 3)
-  -> local Tesseract. Invoked from `bot.py` only via `_run_heavy`.
+  -> local Tesseract. Invoked from `bot.py` only via `_run_heavy`. Every HTTP
+  call uses a short connect timeout (`OCR_CONNECT_TIMEOUT`, 5s) so a
+  down/refusing backend fails over in seconds instead of consuming the full
+  read timeout.
 - **SQLite** (`analytics.py`): `ANALYTICS_DB_PATH`. Always called from `bot.py`
   through `asyncio.to_thread` — never on the event loop. The `member_profile`
   table is the source of truth for the OCR-only profile fields (in-game name +
@@ -85,3 +98,10 @@ so tests can resolve them as `bot.*`.
   logs any unhandled exception).
 - SQLite/records I/O is fail-soft: gateway events never crash the bot.
 - A role-only refresh never mints a screenshot-less record.
+- The verification pipeline resolves to explicit `gpbot.verify.VerifyState`
+  outcomes (`INVALID_IMAGE` / `OCR_FAILED` / `VERIFIED`); every deferred
+  interaction reports failures via the followup webhook (modals inherit
+  `_GPModal.on_error`).
+- Latency: independent awaits batch through `asyncio.gather` (emoji CDN
+  fetches, record + titles reads, avatar + info gathering); font + emoji
+  caches pre-warm at startup.
