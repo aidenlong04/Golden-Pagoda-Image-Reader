@@ -1839,7 +1839,7 @@ async def _finalize_onboarding_with_record(member: discord.Member) -> None:
     user_id = member.id
     # Mark onboarding complete + strip dropdown + look up the record index —
     # three independent I/O steps, run concurrently.
-    results = await _gather_fail_soft(
+    _complete_res, _dropdown_res, ids_res = await _gather_fail_soft(
         "onboarding finalize with record",
         asyncio.to_thread(
             analytics.complete_onboarding_prompt, guild_id, user_id
@@ -1849,7 +1849,7 @@ async def _finalize_onboarding_with_record(member: discord.Member) -> None:
             records_index.get_record_message_ids, user_id
         ),
     )
-    ids = results[2] if not isinstance(results[2], BaseException) else []
+    ids = ids_res if not isinstance(ids_res, BaseException) else []
     if ids:
         await _edit_or_create_member_record(member)
 
@@ -5855,13 +5855,13 @@ async def _verify_member_from_screenshot(
     if clan_name:
         role = _find_clan_role(member.guild, clan_name)
         if role is not None:
-            clan_task = asyncio.ensure_future(_add_role(
+            clan_task = asyncio.create_task(_add_role(
                 member, role, "Profile screenshot self-verification"
             ))
     token = parse_mastery_token(mastery_rank) if mastery_rank else None
     mastery_task = None
     if token is not None:
-        mastery_task = asyncio.ensure_future(
+        mastery_task = asyncio.create_task(
             _apply_mastery_bucket(member, *token)
         )
 
