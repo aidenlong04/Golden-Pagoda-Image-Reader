@@ -644,6 +644,31 @@ class ManagePanelTests(unittest.TestCase):
         self.assertEqual(modal.screenshot.max_values, 1)
         self.assertEqual(modal._gp_admin_id, 123)
 
+    def test_titles_modal_includes_member_select_without_member(self):
+        """/titles run bare opens the full form: action, member, title,
+        reason."""
+        import discord
+        modal = self.b._TitlesModal()
+        self.assertIsInstance(modal.member_select, discord.ui.UserSelect)
+        self.assertEqual(len(modal.children), 4)
+
+    def test_titles_modal_omits_member_select_with_member(self):
+        """The /manage Titles button pre-binds the member — no member
+        select."""
+        modal = self.b._TitlesModal(member=Mock(id=7))
+        self.assertIsNone(modal.member_select)
+        self.assertEqual(len(modal.children), 3)
+
+    def test_titles_modal_prefills_partial_args(self):
+        modal = self.b._TitlesModal(
+            action="remove", title_text="Champ", reason="won the event"
+        )
+        self.assertEqual(modal.title_input.default, "Champ")
+        self.assertEqual(modal.reason_input.default, "won the event")
+        defaults = {o.value: o.default for o in modal.action_select.options}
+        self.assertTrue(defaults["remove"])
+        self.assertFalse(defaults["add"])
+
 
 class OnLeaveClearTests(unittest.TestCase):
     """Tests for the autonomous on-leave data clear."""

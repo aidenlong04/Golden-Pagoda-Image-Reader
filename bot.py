@@ -4191,8 +4191,9 @@ def _manage_edit_page_components(
         lines.append(f"-# {note}")
     body.append({"type": 10, "content": "\n".join(lines)})
 
-    # One button per editable field. ``ign`` opens a modal; ``titles`` posts a
-    # /titles hint; the rest open inline sub-editors. Split across rows of 5.
+    # One button per editable field. ``ign`` opens a modal; ``titles`` opens
+    # the /titles form (member pre-bound, so no member select); the rest open
+    # inline sub-editors. Split across rows of 5.
     field_buttons: list[dict] = []
     for field, label, emoji in _MANAGE_EDIT_FIELDS:
         if field == "ign":
@@ -4716,18 +4717,12 @@ async def _handle_manage_interaction(
         return
 
     if action == "titleshint":
-        cmd_id = _COMMAND_IDS.get("titles")
-        mention = f"</titles:{cmd_id}>" if cmd_id else "`/titles`"
-        with contextlib.suppress(Exception):
-            await _interaction_callback(
-                interaction, 4,
-                [{"type": 10, "content": "### \U0001F451  Titles"},
-                 {"type": 17, "accent_color": ACCENT_PASS, "components": [
-                     {"type": 10, "content": (
-                         f"Use {mention} to add or remove a member's cosmetic "
-                         "profile titles."
-                     )}]}],
-            )
+        # Open the /titles form pre-bound to this member — no member select
+        # needed since the /manage panel already knows the target.
+        try:
+            await interaction.response.send_modal(_TitlesModal(member=member))
+        except Exception:
+            logger.exception("manage: send titles modal failed")
         return
 
     if action == "editfield":
@@ -5853,6 +5848,150 @@ async def profile_cmd(
 
 # /titles — admin command to grant or remove a member's cosmetic profile
 # title via a single add/remove action choice. Requires Manage Server.
+async def _apply_title_change(
+    guild: discord.Guild,
+    member: discord.Member | discord.User,
+    action: str,
+    title: str,
+    reason: str | None,
+) -> str:
+    """Grant or revoke ``title`` for ``member`` and return the confirm text.
+
+    Shared by the /titles slash command (direct args) and ``_TitlesModal``
+    (the interactive form). SQLite runs off the event loop.
+    """
+    if action == "add":
+        reason = (reason or "").strip() or None
+        await asyncio.to_thread(
+            analytics.award_title,
+            guild_id=guild.id,
+            user_id=member.id,
+            title=title,
+            reason=reason,
+        )
+        msg = f"\u2705 Gave **{member.display_name}** the title **{title}**."
+        if reason:
+            msg += f"\n-# {reason}"
+        return msg
+    removed = await asyncio.to_thread(
+        analytics.revoke_title,
+        guild_id=guild.id,
+        user_id=member.id,
+        title=title,
+    )
+    if removed:
+        return (
+            f"\u2705 Removed the title **{title}** from "
+            f"**{member.display_name}**."
+        )
+    return (
+        f"\u2139\uFE0F **{member.display_name}** has no title matching "
+        f"**{title}**."
+    )
+
+
+class _TitlesModal(discord.ui.Modal):
+    """Interactive form mirroring the /titles args (action, member, title,
+    reason). Opened when /titles is run without args, pre-filled with any
+    partial args. The /manage Edit page's Titles button opens the same modal
+    with ``member`` fixed — the member select is omitted since the target is
+    already known from the panel.
+    """
+
+    def __init__(
+        self,
+        *,
+        member: discord.Member | None = None,
+        action: str = "add",
+        title_text: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        super().__init__(title="Titles", timeout=600)
+        self._gp_member = member
+        self.action_select = discord.ui.Select(
+            min_values=1, max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="add", value="add", default=action != "remove",
+                ),
+                discord.SelectOption(
+                    label="remove", value="remove",
+                    default=action == "remove",
+                ),
+            ],
+        )
+        self.add_item(discord.ui.Label(
+            text="Action",
+            description="Whether to add or remove the title.",
+            component=self.action_select,
+        ))
+        self.member_select: discord.ui.UserSelect | None = None
+        if member is None:
+            self.member_select = discord.ui.UserSelect(
+                min_values=1, max_values=1,
+            )
+            self.add_item(discord.ui.Label(
+                text="Member",
+                description="The member whose title to change.",
+                component=self.member_select,
+            ))
+        self.title_input = discord.ui.TextInput(
+            label="Title",
+            placeholder="The title text (case-insensitive when removing).",
+            default=title_text or None,
+            required=True,
+            max_length=100,
+        )
+        self.add_item(self.title_input)
+        self.reason_input = discord.ui.TextInput(
+            label="Reason",
+            placeholder="Optional citation shown when adding.",
+            default=reason or None,
+            required=False,
+            max_length=200,
+        )
+        self.add_item(self.reason_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Defence in depth: re-check Manage Server before mutating the store.
+        user = interaction.user
+        guild = interaction.guild
+        if guild is None or not (
+            isinstance(user, discord.Member)
+            and user.guild_permissions.manage_guild
+        ):
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "Operator, you can't use this.", ephemeral=True
+                )
+            return
+        member: discord.Member | discord.User | None = self._gp_member
+        if member is None and self.member_select is not None:
+            picked = list(self.member_select.values or [])
+            if picked:
+                member = guild.get_member(picked[0].id) or picked[0]
+        if member is None:
+            await interaction.response.send_message(
+                "\u274C Pick a member.", ephemeral=True
+            )
+            return
+        title = (self.title_input.value or "").strip()
+        if not title:
+            await interaction.response.send_message(
+                "\u274C A title is required.", ephemeral=True
+            )
+            return
+        values = list(self.action_select.values or [])
+        action = values[0] if values else "add"
+        msg = await _apply_title_change(
+            guild, member, action, title, self.reason_input.value
+        )
+        await interaction.response.send_message(
+            msg, ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
 @tree.command(
     name="titles",
     description="Add or remove a member's cosmetic profile title.",
@@ -5870,9 +6009,9 @@ async def profile_cmd(
 ])
 async def titles_cmd(
     interaction: discord.Interaction,
-    action: app_commands.Choice[str],
-    member: discord.Member,
-    title: str,
+    action: app_commands.Choice[str] | None = None,
+    member: discord.Member | None = None,
+    title: str | None = None,
     reason: str | None = None,
 ) -> None:
     guild = interaction.guild
@@ -5882,41 +6021,18 @@ async def titles_cmd(
         )
         return
     title = (title or "").strip()
-    if not title:
-        await interaction.response.send_message(
-            "\u274C A title is required.", ephemeral=True
-        )
+    if action is None or member is None or not title:
+        # Run without (or with partial) args: open the interactive form,
+        # pre-filled with whatever was provided.
+        await interaction.response.send_modal(_TitlesModal(
+            member=member,
+            action=action.value if action else "add",
+            title_text=title or None,
+            reason=reason,
+        ))
         return
 
-    if action.value == "add":
-        reason = (reason or "").strip() or None
-        await asyncio.to_thread(
-            analytics.award_title,
-            guild_id=guild.id,
-            user_id=member.id,
-            title=title,
-            reason=reason,
-        )
-        msg = f"\u2705 Gave **{member.display_name}** the title **{title}**."
-        if reason:
-            msg += f"\n-# {reason}"
-    else:
-        removed = await asyncio.to_thread(
-            analytics.revoke_title,
-            guild_id=guild.id,
-            user_id=member.id,
-            title=title,
-        )
-        if removed:
-            msg = (
-                f"\u2705 Removed the title **{title}** from "
-                f"**{member.display_name}**."
-            )
-        else:
-            msg = (
-                f"\u2139\uFE0F **{member.display_name}** has no title matching "
-                f"**{title}**."
-            )
+    msg = await _apply_title_change(guild, member, action.value, title, reason)
     await interaction.response.send_message(
         msg, ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
