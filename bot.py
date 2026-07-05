@@ -5030,7 +5030,7 @@ async def _handle_manage_interaction(
         return
 
     if action == "titles":
-        # Open the same interactive form as /titles, member pre-bound.
+        # Open the same interactive form as /titles, member pre-selected.
         try:
             await interaction.response.send_modal(
                 _TitlesModal(member=member)
@@ -6340,8 +6340,7 @@ class _TitlesModal(discord.ui.Modal):
     """Interactive form mirroring the /titles args (action, member, title,
     reason). Opened when /titles is run without args, pre-filled with any
     partial args. The /manage Edit page's Titles button opens the same modal
-    with ``member`` fixed — the member select is omitted since the target is
-    already known from the panel.
+    with the panel's member pre-selected in the member select.
 
     Styled to recreate Discord's native slash-command argument sheet for
     /titles exactly: the command description as a leading text display,
@@ -6379,19 +6378,21 @@ class _TitlesModal(discord.ui.Modal):
             description="Whether to add or remove the title.",
             component=self.action_select,
         ))
-        self.member_select: discord.ui.UserSelect | None = None
-        if member is None:
-            # required=True must accompany min_values=1 — Discord rejects a
-            # modal select with min_values > 0 that isn't required (400), so
-            # the modal would silently never open.
-            self.member_select = discord.ui.UserSelect(
-                min_values=1, max_values=1, required=True,
-            )
-            self.add_item(discord.ui.Label(
-                text="member",
-                description="The member whose title to change.",
-                component=self.member_select,
-            ))
+        # required=True must accompany min_values=1 — Discord rejects a
+        # modal select with min_values > 0 that isn't required (400), so
+        # the modal would silently never open. A known member (the /manage
+        # Titles button) pre-selects the target instead of hiding the field.
+        self.member_select = discord.ui.UserSelect(
+            min_values=1, max_values=1, required=True,
+            default_values=(
+                [discord.Object(id=member.id)] if member is not None else []
+            ),
+        )
+        self.add_item(discord.ui.Label(
+            text="member",
+            description="The member whose title to change.",
+            component=self.member_select,
+        ))
         self.title_input = discord.ui.TextInput(
             default=title_text or None,
             required=True,
@@ -6428,11 +6429,12 @@ class _TitlesModal(discord.ui.Modal):
                     "Operator, you can't use this.", ephemeral=True
                 )
             return
-        member: discord.Member | discord.User | None = self._gp_member
-        if member is None and self.member_select is not None:
-            picked = list(self.member_select.values or [])
-            if picked:
-                member = guild.get_member(picked[0].id) or picked[0]
+        member: discord.Member | discord.User | None = None
+        picked = list(self.member_select.values or [])
+        if picked:
+            member = guild.get_member(picked[0].id) or picked[0]
+        if member is None:
+            member = self._gp_member
         if member is None:
             await interaction.response.send_message(
                 "\u274C Pick a member.", ephemeral=True
