@@ -155,8 +155,9 @@ full env reference.
   (assigns the platform role), mastery rank incl. Legendary (swaps the MR
   bucket role + stores the exact rank), clan (dynamic buttons whose names and
   emojis come from the live clan slots, like `/status`), and syndicates
-  (multi-select that syncs the syndicate roles). A Titles button points you at
-  `/titles`. Requires **Manage Server**.
+  (multi-select that syncs the syndicate roles). A Titles button opens an
+  inline titles editor (add via a modal, remove via a select — the same
+  add/remove as `/titles`). Requires **Manage Server**.
 - `/profile [user] [ephemeral] [edit_mastery]` — render a member's profile card.
   Open to everyone, and anyone may target any member (defaults to the caller).
   The reply is ephemeral by default; only managers (or `PROFILE_OPTIONS_ROLE_IDS`)

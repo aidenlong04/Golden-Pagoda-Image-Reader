@@ -421,6 +421,29 @@ def _spawn_bg_task(coro) -> asyncio.Task:
     return _spawn_bg_task_impl(coro, task_set=_BG_TASKS, on_done=_bg_task_done)
 
 
+async def _gather_fail_soft(label: str, *coros) -> list:
+    """Run independent I/O steps concurrently, logging (not raising) any
+    failure so one step can't kill its siblings. Returns the raw results
+    (exceptions included) positionally."""
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    for res in results:
+        if isinstance(res, BaseException):
+            logger.error(
+                "%s: concurrent step failed: %r", label, res, exc_info=res,
+            )
+    return results
+
+
+async def _gather_role_ops(*ops) -> None:
+    """Run independent per-role add/remove calls concurrently; re-raise the
+    first failure after every op has settled (so a sibling op is never left
+    running un-awaited)."""
+    results = await asyncio.gather(*ops, return_exceptions=True)
+    for res in results:
+        if isinstance(res, BaseException):
+            raise res
+
+
 # Persistent aiohttp session for Discord REST + CDN fetches. Reusing a
 # single session avoids paying the TLS handshake (~100-200ms on a CX22
 # AMD Rome core) on every reply, progress edit, and avatar fetch.
@@ -1814,16 +1837,19 @@ async def _finalize_onboarding_with_record(member: discord.Member) -> None:
     """
     guild_id = member.guild.id
     user_id = member.id
-    # Mark onboarding complete + strip dropdown.
-    await asyncio.to_thread(
-        analytics.complete_onboarding_prompt, guild_id, user_id
+    # Mark onboarding complete + strip dropdown + look up the record index —
+    # three independent I/O steps, run concurrently.
+    _complete_res, _dropdown_res, ids_res = await _gather_fail_soft(
+        "onboarding finalize with record",
+        asyncio.to_thread(
+            analytics.complete_onboarding_prompt, guild_id, user_id
+        ),
+        _remove_onboarding_dropdown(guild_id, user_id),
+        asyncio.to_thread(
+            records_index.get_record_message_ids, user_id
+        ),
     )
-    await _remove_onboarding_dropdown(guild_id, user_id)
-    # Refresh an EXISTING record's role-derived fields; never create a new,
-    # screenshot-less one from a bare role grant.
-    ids = await asyncio.to_thread(
-        records_index.get_record_message_ids, user_id
-    )
+    ids = ids_res if not isinstance(ids_res, BaseException) else []
     if ids:
         await _edit_or_create_member_record(member)
 
@@ -2088,26 +2114,34 @@ async def _onboarding_route_manual_review(
     mastery_rank: str | None = None,
 ) -> None:
     """Assign the incomplete review role, notify the help channel, and ack."""
-    await _add_incomplete_role(member)
+    # Ack the triggering interaction up front so it can't time out during the
+    # role/analytics/HTTP work below (the modal path already deferred; the
+    # dropdown path needs a fresh DEFERRED_UPDATE ack).
+    with contextlib.suppress(Exception):
+        if not interaction.response.is_done():
+            await _interaction_callback(interaction, 6, [])  # DEFERRED_UPDATE
     logger.info(
         "onboarding: routing %s (%s) to manual review: %s",
         member, member.id, reason,
     )
-    await asyncio.to_thread(
-        analytics.record_verification,
-        outcome="incomplete",
-        guild_id=member.guild.id,
-        user_id=member.id,
+    # These four steps are independent I/O (role add, two SQLite writes, the
+    # welcome-prompt dropdown strip) — run them concurrently.
+    await _gather_fail_soft(
+        "onboarding manual-review route",
+        _add_incomplete_role(member),
+        asyncio.to_thread(
+            analytics.record_verification,
+            outcome="incomplete",
+            guild_id=member.guild.id,
+            user_id=member.id,
+        ),
+        asyncio.to_thread(
+            analytics.complete_onboarding_prompt,
+            guild_id=member.guild.id,
+            user_id=member.id,
+        ),
+        _remove_onboarding_dropdown(member.guild.id, member.id),
     )
-    # Mark the onboarding prompt complete so the reprompt loop stops.
-    await asyncio.to_thread(
-        analytics.complete_onboarding_prompt,
-        guild_id=member.guild.id,
-        user_id=member.id,
-    )
-    # Drop the clan-select dropdown from the original welcome prompt so it
-    # can't be re-submitted (banner + welcome line are preserved).
-    await _remove_onboarding_dropdown(member.guild.id, member.id)
     # Maintain the member's canonical record (the uploaded screenshot, if any)
     # in the records channel so staff have a record of the pending case.
     _spawn_bg_task(
@@ -2123,11 +2157,6 @@ async def _onboarding_route_manual_review(
     # onboarding-complete card, with the manual-review text variant) — it now
     # carries the staff-only "Verify" button inline.
     await _post_onboarding_pass_welcome(member, manual_review=True)
-    # Ack the triggering interaction so it doesn't error (the modal path already
-    # deferred; the dropdown path needs a fresh DEFERRED_UPDATE ack).
-    with contextlib.suppress(Exception):
-        if not interaction.response.is_done():
-            await _interaction_callback(interaction, 6, [])  # DEFERRED_UPDATE
 
 
 # When a staff member approves a manual-review case via the "Verify" button on
@@ -2240,23 +2269,33 @@ async def _handle_mreview_interaction(
             )
 
     reason = f"Manual review approved by {user}"
-    removed: list[str] = []
-    for rid in _MREVIEW_REMOVE_ROLE_IDS:
-        role = guild.get_role(rid)
-        if role is None or role not in member.roles:
-            continue
+
+    async def _mreview_remove_one(role: discord.Role) -> "str | None":
         try:
             await _discord_call_with_retry(
-                lambda r=role: member.remove_roles(r, reason=reason),
+                lambda: member.remove_roles(role, reason=reason),
                 label=f"mreview_remove:{role.name}",
             )
-            removed.append(role.name)
+            return role.name
         except discord.Forbidden:
             logger.warning(
                 "mreview: missing permission to remove %s", role.name
             )
         except discord.HTTPException:
             logger.exception("mreview: failed to remove %s", role.name)
+        return None
+
+    # Each removal is an independent per-role DELETE; run them concurrently.
+    to_remove = [
+        role for rid in _MREVIEW_REMOVE_ROLE_IDS
+        if (role := guild.get_role(rid)) is not None and role in member.roles
+    ]
+    removed = [
+        name for name in await asyncio.gather(
+            *(_mreview_remove_one(role) for role in to_remove)
+        )
+        if name
+    ]
 
     granted: list[str] = []
     for rid in _MREVIEW_APPROVE_ROLE_IDS:
@@ -2647,26 +2686,30 @@ class _OnboardingVerifyModal(_GPModal):
                     await interaction.followup.send(retry_text, ephemeral=True)
                 return
 
-        # Success — mark onboarding complete and confirm to the member.
-        await asyncio.to_thread(
-            analytics.complete_onboarding_prompt,
-            guild.id, member.id,
-        )
-        await _remove_unverified_role(member)
-        await asyncio.to_thread(
-            analytics.record_verification,
-            outcome="pass",
-            clan=claimed_name,
-            guild_id=guild.id,
-            user_id=member.id,
+        # Success — mark onboarding complete and confirm to the member. The
+        # four finalize steps are independent I/O (two SQLite writes, the
+        # unverified-role removal, the welcome-prompt dropdown strip), so run
+        # them concurrently.
+        await _gather_fail_soft(
+            "onboarding pass finalize",
+            asyncio.to_thread(
+                analytics.complete_onboarding_prompt,
+                guild.id, member.id,
+            ),
+            _remove_unverified_role(member),
+            asyncio.to_thread(
+                analytics.record_verification,
+                outcome="pass",
+                clan=claimed_name,
+                guild_id=guild.id,
+                user_id=member.id,
+            ),
+            _remove_onboarding_dropdown(guild.id, member.id),
         )
         logger.info(
             "onboarding: %s verified via welcome prompt (clan=%s)",
             member.id, claimed_name,
         )
-        # Drop the clan-select dropdown from the original welcome prompt so it
-        # can't be re-submitted (banner + welcome line are preserved).
-        await _remove_onboarding_dropdown(guild.id, member.id)
         # Welcome-only response: post the public "Welcome to the Golden Pagoda"
         # message to the server-entry channel (no ephemeral confirmation).
         await _post_onboarding_pass_welcome(member)
@@ -4163,12 +4206,14 @@ async def _manage_snapshot(guild_id: int, user_id: int) -> dict:
     truth) and the awarded titles off the event loop (SQLite), fail-soft.
     Returns ``{"profile", "titles", "records"}``.
     """
-    profile = await _member_profile_from_records(guild_id, user_id)
-    titles = await asyncio.to_thread(
-        analytics.list_member_titles, guild_id, user_id
-    )
-    records = await asyncio.to_thread(
-        _member_record_jump_urls, guild_id, user_id
+    profile, titles, records = await asyncio.gather(
+        _member_profile_from_records(guild_id, user_id),
+        asyncio.to_thread(
+            analytics.list_member_titles, guild_id, user_id
+        ),
+        asyncio.to_thread(
+            _member_record_jump_urls, guild_id, user_id
+        ),
     )
     return {"profile": profile, "titles": titles, "records": records}
 
@@ -4242,11 +4287,14 @@ async def _apply_platform_role(
     to_remove = [
         r for r in member.roles if r.id in plat_ids and r.id != target.id
     ]
+    ops = []
+    if to_remove:
+        ops.append(member.remove_roles(*to_remove, reason="Manage: platform edit"))
+    if target.id not in have_ids:
+        ops.append(member.add_roles(target, reason="Manage: platform edit"))
     try:
-        if to_remove:
-            await member.remove_roles(*to_remove, reason="Manage: platform edit")
-        if target.id not in have_ids:
-            await member.add_roles(target, reason="Manage: platform edit")
+        if ops:
+            await _gather_role_ops(*ops)
     except discord.HTTPException:
         logger.exception("manage: platform role swap failed")
         return "error"
@@ -4269,11 +4317,14 @@ async def _apply_clan_slot(member: discord.Member, slot: "ClanSlot") -> str:
     to_remove = [
         r for r in member.roles if r.id in clan_ids and r.id != target.id
     ]
+    ops = []
+    if to_remove:
+        ops.append(member.remove_roles(*to_remove, reason="Manage: clan edit"))
+    if target.id not in have_ids:
+        ops.append(member.add_roles(target, reason="Manage: clan edit"))
     try:
-        if to_remove:
-            await member.remove_roles(*to_remove, reason="Manage: clan edit")
-        if target.id not in have_ids:
-            await member.add_roles(target, reason="Manage: clan edit")
+        if ops:
+            await _gather_role_ops(*ops)
     except discord.HTTPException:
         logger.exception("manage: clan role swap failed")
         return "error"
@@ -4299,13 +4350,16 @@ async def _sync_syndicate_roles(
         role for rid in (have - wanted)
         if (role := member.guild.get_role(rid)) is not None
     ]
+    ops = []
+    if to_add:
+        ops.append(member.add_roles(*to_add, reason="Manage: syndicate edit"))
+    if to_remove:
+        ops.append(member.remove_roles(
+            *to_remove, reason="Manage: syndicate edit"
+        ))
     try:
-        if to_add:
-            await member.add_roles(*to_add, reason="Manage: syndicate edit")
-        if to_remove:
-            await member.remove_roles(
-                *to_remove, reason="Manage: syndicate edit"
-            )
+        if ops:
+            await _gather_role_ops(*ops)
     except discord.HTTPException:
         logger.exception("manage: syndicate role sync failed")
         return "error"
@@ -4387,14 +4441,12 @@ def _manage_edit_page_components(
         lines.append(f"-# {note}")
     body.append({"type": 10, "content": "\n".join(lines)})
 
-    # One button per editable field. ``ign`` opens a modal; ``titles`` posts a
-    # /titles hint; the rest open inline sub-editors. Split across rows of 5.
+    # One button per editable field. ``ign`` opens a modal; the rest open
+    # inline sub-editors. Split across rows of 5.
     field_buttons: list[dict] = []
     for field, label, emoji in _MANAGE_EDIT_FIELDS:
         if field == "ign":
             cid = f"manage:{member_id}:ign"
-        elif field == "titles":
-            cid = f"manage:{member_id}:titleshint"
         else:
             cid = f"manage:{member_id}:editfield:{field}"
         field_buttons.append({
@@ -4412,14 +4464,17 @@ def _manage_editor_components(
     field: str,
     *,
     note: str | None = None,
+    titles: list[dict] | None = None,
 ) -> list[dict]:
     """Build the full Components V2 payload for a single-field sub-editor.
 
     ``field`` is one of ``"platform"``, ``"mastery"``, ``"clan"``,
-    ``"syndicate"``. Each renders the appropriate control (select(s) for
-    platform / mastery / syndicate, dynamic buttons for clan) pre-reflecting
-    the member's current roles, plus a Back button to the Edit page. The
-    in-game name and titles fields don't route here (modal / hint instead).
+    ``"syndicate"``, ``"titles"``. Each renders the appropriate control
+    (select(s) for platform / mastery / syndicate, dynamic buttons for clan,
+    an add button + remove select for titles) pre-reflecting the member's
+    current state, plus a Back button to the Edit page. The in-game name
+    field doesn't route here (modal instead). ``titles`` supplies the
+    member's current titles for the titles editor.
     """
     back_row = {"type": 1, "components": [
         {"type": 2, "style": 2, "label": "\u25C0 Back",
@@ -4543,6 +4598,39 @@ def _manage_editor_components(
                 "placeholder": "Select syndicates",
                 "min_values": 0, "max_values": len(options),
                 "options": options,
+            }]})
+
+    elif field == "titles":
+        title = "Titles"
+        titles = titles or []
+        lines = [
+            f"**Titles** ({len(titles)})",
+            "-# Add a cosmetic profile title, or pick one below to remove "
+            "it \u2014 same as /titles.",
+        ]
+        for t in titles:
+            t_name = t.get("title") or "?"
+            reason = (t.get("reason") or "").strip()
+            row = f"-# \u2022 `{t_name}`"
+            if reason:
+                row += f" \u2014 {reason}"
+            lines.append(row)
+        container.append({"type": 10, "content": "\n".join(lines)})
+        container.append({"type": 1, "components": [
+            {"type": 2, "style": 1, "label": "Add title",
+             "emoji": {"name": "\U0001F451"},
+             "custom_id": f"manage:{member_id}:titleadd"},
+        ]})
+        if titles:
+            options = [
+                {"label": (t.get("title") or "?")[:100],
+                 "value": (t.get("title") or "?")[:100]}
+                for t in titles[:25]
+            ]
+            container.append({"type": 1, "components": [{
+                "type": 3, "custom_id": f"manage:{member_id}:titlerm",
+                "placeholder": "Remove a title\u2026",
+                "min_values": 1, "max_values": 1, "options": options,
             }]})
 
     if note:
@@ -4889,7 +4977,7 @@ async def _handle_manage_interaction(
     # These all need the member present (they mutate roles). For a departed
     # member just refresh the panel, which renders the "left the server" note.
     _EDIT_ACTIONS = {
-        "editfield", "ign", "titleshint",
+        "editfield", "ign", "titleadd", "titlerm",
         "setplatform", "setmr", "setclan", "setsyn",
     }
     if action in _EDIT_ACTIONS and member is None:
@@ -4911,24 +4999,49 @@ async def _handle_manage_interaction(
             logger.exception("manage: send IGN modal failed")
         return
 
-    if action == "titleshint":
-        cmd_id = _COMMAND_IDS.get("titles")
-        mention = f"</titles:{cmd_id}>" if cmd_id else "`/titles`"
-        with contextlib.suppress(Exception):
-            await _interaction_callback(
-                interaction, 4,
-                [{"type": 10, "content": "### \U0001F451  Titles"},
-                 {"type": 17, "accent_color": ACCENT_PASS, "components": [
-                     {"type": 10, "content": (
-                         f"Use {mention} to add or remove a member's cosmetic "
-                         "profile titles."
-                     )}]}],
+    if action == "titleadd":
+        try:
+            await interaction.response.send_modal(
+                _ManageTitleModal(member=member)
             )
+        except Exception:
+            logger.exception("manage: send title modal failed")
+        return
+
+    if action == "titlerm":
+        values = (interaction.data or {}).get("values") or []
+        note = "No title selected."
+        if values:
+            title = str(values[0])
+            removed = await asyncio.to_thread(
+                analytics.revoke_title,
+                guild_id=guild.id, user_id=member_id, title=title,
+            )
+            note = (
+                f"\u2705 Removed the title **{title}**."
+                if removed
+                else f"\u2139\uFE0F No title matching **{title}**."
+            )
+        titles = await asyncio.to_thread(
+            analytics.list_member_titles, guild.id, member_id
+        )
+        components = _manage_editor_components(
+            member_id, member, "titles", titles=titles, note=note
+        )
+        with contextlib.suppress(Exception):
+            await _interaction_callback(interaction, 7, components)
         return
 
     if action == "editfield":
         field = parts[3] if len(parts) > 3 else ""
-        components = _manage_editor_components(member_id, member, field)
+        titles = None
+        if field == "titles":
+            titles = await asyncio.to_thread(
+                analytics.list_member_titles, guild.id, member_id
+            )
+        components = _manage_editor_components(
+            member_id, member, field, titles=titles
+        )
         with contextlib.suppress(Exception):
             await _interaction_callback(interaction, 7, components)
         return
@@ -4957,11 +5070,21 @@ async def _handle_manage_interaction(
         kind, _, num = (values[0].partition(":") if values else ("", "", ""))
         if kind in ("MR", "LR") and num.isdigit() and int(num) > 0:
             value = int(num)
-            status = await _apply_mastery_bucket(member, kind, value)
-            # Persist the exact rank to the record (not role-derivable).
-            await _edit_or_create_member_record(
-                member, mastery_rank=f"{kind} {value}",
+            # Persist the exact rank (not role-derivable) to the durable
+            # store concurrently with the role swap; the channel-mirror
+            # record edit happens off the critical path.
+            status, _ = await asyncio.gather(
+                _apply_mastery_bucket(member, kind, value),
+                asyncio.to_thread(
+                    analytics.upsert_member_profile,
+                    guild_id=guild.id,
+                    user_id=member_id,
+                    mastery_rank=f"{kind} {value}",
+                ),
             )
+            _spawn_bg_task(_edit_or_create_member_record(
+                member, mastery_rank=f"{kind} {value}",
+            ))
             disp = _format_mastery_display(f"{kind} {value}")
             note = {
                 "assigned": f"\u2705 Mastery Rank set to **{disp}**.",
@@ -5261,15 +5384,18 @@ async def _apply_mastery_bucket(
     to_remove = [
         r for r in member.roles if r.id in mr_ids and r.id != target.id
     ]
+    ops = []
+    if to_remove:
+        ops.append(member.remove_roles(
+            *to_remove, reason="Mastery rank self-service edit"
+        ))
+    if target.id not in have_ids:
+        ops.append(member.add_roles(
+            target, reason="Mastery rank self-service edit"
+        ))
     try:
-        if to_remove:
-            await member.remove_roles(
-                *to_remove, reason="Mastery rank self-service edit"
-            )
-        if target.id not in have_ids:
-            await member.add_roles(
-                target, reason="Mastery rank self-service edit"
-            )
+        if ops:
+            await _gather_role_ops(*ops)
         return "assigned"
     except discord.HTTPException:
         logger.exception("mastery bucket role swap failed")
@@ -5368,12 +5494,22 @@ class _MasteryEditorView(discord.ui.View):
                 await interaction.response.defer()
             return
 
-        status = await _apply_mastery_bucket(self.member, kind, value)
-        # Persist the exact rank to the record (source of truth) and await it
-        # so the re-render below reads the fresh value instead of racing.
-        await _edit_or_create_member_record(
-            self.member, mastery_rank=f"{kind} {value}",
+        # The role swap and the durable-store upsert are independent, and the
+        # re-render below reads the *store* (not the channel mirror), so run
+        # them concurrently and await both before rendering — the mirror edit
+        # in the records channel moves off the critical path as a bg task.
+        status, _ = await asyncio.gather(
+            _apply_mastery_bucket(self.member, kind, value),
+            asyncio.to_thread(
+                analytics.upsert_member_profile,
+                guild_id=self.member.guild.id,
+                user_id=self.member.id,
+                mastery_rank=f"{kind} {value}",
+            ),
         )
+        _spawn_bg_task(_edit_or_create_member_record(
+            self.member, mastery_rank=f"{kind} {value}",
+        ))
         info = await _member_profile_info_lines(self.member)
         png = await _run_heavy(
             _render_profile_card_png,
@@ -5484,9 +5620,12 @@ class _ScreenshotVerifyModal(_GPModal):
         )
         summary = result.summary
 
-        # Refresh card from the (now-current) member roles and record.
-        info = await _member_profile_info_lines(member)
-        in_game_name = await _member_in_game_name(member)
+        # Refresh card from the (now-current) member roles and record. The
+        # two store reads are independent, so run them concurrently.
+        info, in_game_name = await asyncio.gather(
+            _member_profile_info_lines(member),
+            _member_in_game_name(member),
+        )
         png = await _run_heavy(
             _render_profile_card_png,
             avatar_bytes=self._gp_avatar_bytes,
@@ -5610,18 +5749,92 @@ class _ManageIGNModal(_GPModal):
             return
         member = self._gp_member
         value = (self.ign.value or "").strip()
-        if value:
-            await _edit_or_create_member_record(member, in_game_name=value)
         # Refresh the Edit page in place (the modal submit is a fresh
         # interaction, so ack as a deferred update then PATCH @original).
+        # Ack BEFORE the writes so the click is acknowledged instantly.
         with contextlib.suppress(discord.HTTPException):
             await interaction.response.defer()
+        if value:
+            # The snapshot read below hits the durable store, so only the
+            # store upsert must land before the refresh; the channel-mirror
+            # record edit moves off the critical path.
+            await asyncio.to_thread(
+                analytics.upsert_member_profile,
+                guild_id=member.guild.id,
+                user_id=member.id,
+                in_game_name=value,
+            )
+            _spawn_bg_task(
+                _edit_or_create_member_record(member, in_game_name=value)
+            )
         with contextlib.suppress(Exception):
             snap = await _manage_snapshot(member.guild.id, member.id)
             components = _manage_components(
                 member.id, member, _MANAGE_EDIT_PAGE, snap,
                 note=f"\u2705 In-game name set to **{_strip_clan_tag(value)}**."
                 if value else "No name entered.",
+            )
+            await _interaction_edit_original_v2(interaction, components)
+
+
+class _ManageTitleModal(_GPModal):
+    """Admin modal opened from the /manage Titles editor to grant a member a
+    cosmetic profile title — the same path as ``/titles action:add``. Awards
+    the title and refreshes the Titles editor in place.
+    """
+
+    def __init__(self, *, member: discord.Member) -> None:
+        super().__init__(title="Add Title", timeout=600)
+        self._gp_member = member
+        self.title_input = discord.ui.TextInput(
+            label="Title",
+            placeholder="e.g. Sharpshooter",
+            required=True,
+            max_length=100,
+        )
+        self.reason = discord.ui.TextInput(
+            label="Reason (optional)",
+            placeholder="Why the title was awarded",
+            required=False,
+            max_length=200,
+        )
+        self.add_item(self.title_input)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        user = interaction.user
+        if not (
+            isinstance(user, discord.Member)
+            and user.guild_permissions.manage_guild
+        ):
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "Operator, you can't use this.", ephemeral=True
+                )
+            return
+        member = self._gp_member
+        value = (self.title_input.value or "").strip()
+        reason = (self.reason.value or "").strip() or None
+        # Ack BEFORE the writes so the submit is acknowledged instantly, then
+        # refresh the Titles editor in place (PATCH @original).
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.defer()
+        if value:
+            await asyncio.to_thread(
+                analytics.award_title,
+                guild_id=member.guild.id,
+                user_id=member.id,
+                title=value,
+                reason=reason,
+            )
+        with contextlib.suppress(Exception):
+            titles = await asyncio.to_thread(
+                analytics.list_member_titles, member.guild.id, member.id
+            )
+            components = _manage_editor_components(
+                member.id, member, "titles", titles=titles,
+                note=f"\u2705 Gave **{member.display_name}** the title "
+                     f"**{value}**." if value else "No title entered.",
             )
             await _interaction_edit_original_v2(interaction, components)
 
@@ -5756,16 +5969,30 @@ async def _verify_member_from_screenshot(
 
     summary: list[str] = []
 
+    # Kick the clan role add and the mastery bucket swap off concurrently —
+    # they touch disjoint role IDs via independent per-role REST calls — then
+    # collect their results in the original summary order.
+    clan_task = None
+    if clan_name:
+        role = _find_clan_role(member.guild, clan_name)
+        if role is not None:
+            clan_task = asyncio.create_task(_add_role(
+                member, role, "Profile screenshot self-verification"
+            ))
+    token = parse_mastery_token(mastery_rank) if mastery_rank else None
+    mastery_task = None
+    if token is not None:
+        mastery_task = asyncio.create_task(
+            _apply_mastery_bucket(member, *token)
+        )
+
     if profile_name:
         summary.append(f"In-game name: **{_strip_clan_tag(profile_name)}**")
 
     if clan_name:
-        role = _find_clan_role(member.guild, clan_name)
         clan_label = _strip_clan_tag(clan_name)
-        if role is not None:
-            _changed, status = await _add_role(
-                member, role, "Profile screenshot self-verification"
-            )
+        if clan_task is not None:
+            _changed, status = await clan_task
             summary.append(f"Clan: {status}")
         else:
             summary.append(
@@ -5773,10 +6000,9 @@ async def _verify_member_from_screenshot(
             )
 
     if mastery_rank:
-        token = parse_mastery_token(mastery_rank)
-        if token is not None:
+        if mastery_task is not None:
             kind, value = token
-            status = await _apply_mastery_bucket(member, kind, value)
+            status = await mastery_task
             disp = _format_mastery_display(f"{kind} {value}")
             if status == "assigned":
                 summary.append(f"Mastery Rank: **{disp}**")
@@ -5942,16 +6168,15 @@ async def profile_cmd(
     # Platform / Mastery / Syndicate) without the progress bar.
     try:
         await interaction.response.defer(ephemeral=ephemeral)
-        # The role-derived info read (record + titles) and the avatar CDN fetch
-        # are independent I/O, so run them concurrently rather than paying both
-        # round-trips back-to-back. The in-game-name read reuses the record that
-        # _member_profile_info_lines just warmed in the 60s TTL cache, so it
-        # stays sequential (a cache hit, no extra HTTP) and never double-fetches.
-        info, avatar_bytes = await asyncio.gather(
+        # The role-derived info read (record + titles), the avatar CDN fetch
+        # and the stored in-game-name read are independent I/O, so run all
+        # three concurrently rather than paying their round-trips
+        # back-to-back.
+        info, avatar_bytes, in_game_name = await asyncio.gather(
             _member_profile_info_lines(target),
             _fetch_avatar_bytes(avatar_url),
+            _member_in_game_name(target),
         )
-        in_game_name = await _member_in_game_name(target)
         png = await _run_heavy(
             _render_profile_card_png,
             avatar_bytes=avatar_bytes,

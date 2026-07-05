@@ -1220,7 +1220,35 @@ class ManageEditPanelTests(unittest.TestCase):
         self.assertIn("manage:42:editfield:mastery", ids)
         self.assertIn("manage:42:editfield:clan", ids)
         self.assertIn("manage:42:editfield:syndicate", ids)
-        self.assertIn("manage:42:titleshint", ids)
+        self.assertIn("manage:42:editfield:titles", ids)
+
+    def test_titles_editor_lists_titles_add_button_and_remove_select(self):
+        titles = [
+            {"title": "Sharpshooter", "reason": "event win"},
+            {"title": "boot licker", "reason": ""},
+        ]
+        payload = self.b._manage_editor_components(
+            42, self.member, "titles", titles=titles
+        )
+        body = payload[1]["components"][0]["content"]
+        self.assertIn("Sharpshooter", body)
+        self.assertIn("boot licker", body)
+        ids = {b.get("custom_id") for b in self._buttons(payload)}
+        self.assertIn("manage:42:titleadd", ids)
+        sel = self._selects(payload)[0]
+        self.assertEqual(sel["custom_id"], "manage:42:titlerm")
+        self.assertEqual(
+            [o["value"] for o in sel["options"]],
+            ["Sharpshooter", "boot licker"],
+        )
+
+    def test_titles_editor_without_titles_has_no_remove_select(self):
+        payload = self.b._manage_editor_components(
+            42, self.member, "titles", titles=[]
+        )
+        ids = {b.get("custom_id") for b in self._buttons(payload)}
+        self.assertIn("manage:42:titleadd", ids)
+        self.assertEqual(self._selects(payload), [])
 
     def test_edit_page_for_departed_member_has_no_field_buttons(self):
         comps = self.b._manage_components(
