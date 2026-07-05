@@ -48,6 +48,12 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Module-level HTTP session shared by every OCR call: connection pooling +
+# TLS reuse across retries and successive verifications. requests.Session is
+# thread-safe for this simple posting pattern, and _run_heavy caps callers at
+# two concurrent workers anyway.
+_HTTP_SESSION = requests.Session()
+
 # OCR.space API — engine 3 per requirements. Falls back to local Tesseract
 # (with --oem 3) if OCR_API_KEY is not set and pytesseract is available.
 OCR_API_KEY = os.getenv("OCR_API_KEY", "").strip()
@@ -167,7 +173,7 @@ def _ocr_via_api(
 
     for attempt in range(1, OCR_RETRY_MAX_ATTEMPTS + 1):
         try:
-            response = requests.post(
+            response = _HTTP_SESSION.post(
                 OCR_API_URL,
                 headers={"apikey": OCR_API_KEY},
                 data={
@@ -269,7 +275,7 @@ def _ocr_via_ollama(
     if not OLLAMA_OCR_MODEL:
         raise RuntimeError("OLLAMA_OCR_MODEL not configured")
     b64 = base64.b64encode(image_bytes).decode("ascii")
-    response = requests.post(
+    response = _HTTP_SESSION.post(
         f"{OLLAMA_URL}/api/generate",
         json={
             "model": OLLAMA_OCR_MODEL,
