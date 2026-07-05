@@ -2274,7 +2274,31 @@ async def _handle_mreview_interaction(
         )
 
 
-class _OnboardingVerifyModal(discord.ui.Modal):
+class _GPModal(discord.ui.Modal):
+    """Shared modal base: report unexpected ``on_submit`` failures to the
+    user instead of dying silently.
+
+    discord.py's default ``Modal.on_error`` only logs — the member sees the
+    modal close and nothing else. Every deferred interaction must surface its
+    failure, so route it through the followup webhook (the submit handlers
+    defer immediately) with a plain-response fallback.
+    """
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception, /
+    ) -> None:
+        logger.exception(
+            "modal %s failed", type(self).__name__, exc_info=error
+        )
+        msg = "\u274C Something went wrong \u2014 please try again."
+        with contextlib.suppress(Exception):
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+
+
+class _OnboardingVerifyModal(_GPModal):
     """Modal opened from the onboarding welcome prompt when a member clicks a
     clan button. Accepts a Warframe profile screenshot, OCRs it, and validates
     that the OCR-detected clan matches the one the member claimed via the button.
@@ -2463,7 +2487,7 @@ class _OnboardingVerifyModal(discord.ui.Modal):
         ))
 
 
-class _OnboardingNoClanModal(discord.ui.Modal):
+class _OnboardingNoClanModal(_GPModal):
     """Modal opened from the onboarding welcome prompt when a member clicks
     "Not listed / No". Collects a Warframe profile screenshot so the member's
     manual-review record still carries their screenshot (matching the clan
@@ -5201,7 +5225,7 @@ class _MasteryEditorView(discord.ui.View):
                 )
 
 
-class _ScreenshotVerifyModal(discord.ui.Modal):
+class _ScreenshotVerifyModal(_GPModal):
     """Modal that lets a member upload a Warframe profile screenshot. On
     submit we OCR it and assign/store every field we can (in-game name,
     clan role, mastery rank), then re-render the /profile card in place.
@@ -5360,7 +5384,7 @@ class _ScreenshotVerifyButton(discord.ui.Button):
         await interaction.response.send_modal(modal)
 
 
-class _ManageIGNModal(discord.ui.Modal):
+class _ManageIGNModal(_GPModal):
     """Admin modal opened from the /manage Edit page to set a member's stored
     in-game name by hand (no OCR). Writes ``in_game_name`` to the durable
     store and refreshes the Edit page in place.
@@ -5409,7 +5433,7 @@ class _ManageIGNModal(discord.ui.Modal):
             await _interaction_edit_original_v2(interaction, components)
 
 
-class _ManageScreenshotModal(discord.ui.Modal):
+class _ManageScreenshotModal(_GPModal):
     """Admin screenshot modal opened from the /manage panel. OCRs a member's
     Warframe profile screenshot and writes their in-game name / clan /
     mastery straight into the durable store + roles (same pipeline as the
@@ -5920,7 +5944,17 @@ async def onboard_cmd(
         )
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
-    posted = await _post_onboarding_welcome(member)
+    try:
+        posted = await _post_onboarding_welcome(member)
+    except Exception:
+        logger.exception("/onboard failed")
+        with contextlib.suppress(Exception):
+            await interaction.followup.send(
+                "\u274C Couldn't post the onboarding welcome \u2014 "
+                "something went wrong; check the logs.",
+                ephemeral=True,
+            )
+        return
     logger.info(
         "onboard: admin %s triggered onboarding for %s in guild %s (posted=%s)",
         interaction.user.id, member.id, guild.id, posted,

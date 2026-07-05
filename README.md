@@ -66,6 +66,9 @@ When a new member joins the server:
 - `gpbot/components_v2.py` owns raw Components-V2 HTTP helpers.
 - `gpbot/discord_http.py` owns shared Discord REST retry behavior.
 - `gpbot/concurrency.py` owns bounded heavy-job execution + per-user lock helpers.
+- `gpbot/records.py` owns pure member-record body parsing (V2 text + embed parse-back).
+- `gpbot/verify.py` owns the verification pipeline states (`VerifyState` / `VerifyResult`) and pure helpers.
+- `gpbot/onboarding.py` owns onboarding custom-id parsing + reprompt sweep decisions.
 
 ## Setup (local)
 
@@ -254,6 +257,9 @@ The following improvements were added to address latency, reliability, and obser
 | `gpbot/components_v2.py` | Unified Components-V2 interaction callback/edit + multipart upload API |
 | `gpbot/discord_http.py` | Shared retry wrapper for Discord HTTP calls |
 | `gpbot/concurrency.py` | Shared heavy-job/thread offload + keyed lock helpers |
+| `gpbot/records.py` | Pure member-record body parsing (V2 text + embed parse-back) |
+| `gpbot/verify.py` | Explicit verification pipeline states + pure image/mastery helpers |
+| `gpbot/onboarding.py` | Onboarding custom-id parsing + reprompt sweep decisions |
 
 ### What changed
 
