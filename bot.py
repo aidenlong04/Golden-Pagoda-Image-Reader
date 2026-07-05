@@ -67,7 +67,28 @@ from gpbot.concurrency import (
     spawn_bg_task as _spawn_bg_task_impl,
 )
 from gpbot.discord_http import discord_call_with_retry
+from gpbot.onboarding import (
+    RepromptDecision,
+    parse_onboard_custom_id,
+    reprompt_decision,
+)
+from gpbot.records import (
+    DISCORD_EPOCH_MS as _DISCORD_EPOCH_MS,
+    RECORD_LINE_RE as _RECORD_LINE_RE,
+    RECORD_PROFILE_LABELS as _RECORD_PROFILE_LABELS,
+    collect_v2_text as _collect_v2_text,
+    is_exact_mastery_rank as _is_exact_mastery_rank,
+    parse_record_embed as _parse_record_embed,
+    parse_record_profile_text as _parse_record_profile_text,
+    snowflake_ts as _snowflake_ts,
+)
 from gpbot.routing import CustomIDRouter
+from gpbot.verify import (
+    VerifyResult as _VerifyResult,
+    VerifyState,
+    parse_mastery_token,
+    validate_image_bytes,
+)
 from ocr_engine import OCR_API_KEY, OLLAMA_OCR_MODEL, _ocr
 from envstore import (  # noqa: F401  (some re-exported for tests via bot.*)
     ENV_FILE_PATH,
@@ -89,6 +110,7 @@ from cards import (  # noqa: F401  (test-facing re-exports resolved as bot.*)
     _radial_gradient,
     _render_profile_card_png,
     _vignette,
+    warm_font_cache,
 )
 from utils.metrics import heavy_semaphore_metrics, metrics_snapshot, ocr_latency
 
@@ -450,6 +472,40 @@ async def on_ready() -> None:
         # Run an immediate reconciliation sweep before entering the loop
         # so offline-elapsed prompts are handled within seconds of boot.
         _spawn_bg_task(_onboarding_reprompt_task_startup())
+
+    # Pre-warm the render caches (truetype fonts + configured emoji icons)
+    # so the first verify/profile reply doesn't pay the cold-start cost.
+    if not getattr(client, "_caches_warmed", False):
+        client._caches_warmed = True  # type: ignore[attr-defined]
+        _spawn_bg_task(_prewarm_caches())
+
+
+async def _prewarm_caches() -> None:
+    """Warm the font cache and prefetch every configured emoji icon.
+
+    Runs once in the background after connect: fonts load in a worker thread
+    (filesystem probes), emoji icons fetch concurrently from the CDN into
+    ``_EMOJI_BYTES_CACHE``. Fail-soft — a cold cache only costs latency.
+    """
+    try:
+        await asyncio.to_thread(warm_font_cache)
+    except Exception:
+        logger.debug("cache pre-warm: font warm failed", exc_info=True)
+    literals: set[str] = {s.emoji for s in CLAN_SLOTS if s.emoji}
+    literals.update(v for v in PLATFORM_EMOJIS.values() if v)
+    literals.update(v for v in SYNDICATE_FACTION_EMOJIS.values() if v)
+    for raw in (
+        MASTERY_RANK_EMOJI_RAW, OPERATOR_EMOJI_RAW,
+        SYNDICATE_EMOJI_RAW, WARNING_EMOJI_RAW,
+    ):
+        if raw:
+            literals.add(raw)
+    try:
+        await asyncio.gather(
+            *(_fetch_emoji_bytes(lit) for lit in literals)
+        )
+    except Exception:
+        logger.debug("cache pre-warm: emoji prefetch failed", exc_info=True)
 
 
 async def _onboarding_reprompt_task_startup() -> None:
@@ -996,6 +1052,35 @@ async def _member_profile_info_lines(
     role_ids = {r.id for r in member.roles}
     rows: list[tuple] = []
 
+    # Prefetch every emoji icon a row might need in one concurrent burst —
+    # each literal is an independent CDN fetch (cached per emoji ID), so
+    # paying their latency back-to-back on a cold cache is pure waste.
+    slot = next(
+        (s for s in CLAN_SLOTS if s.role_id and s.role_id in role_ids),
+        None,
+    )
+    platforms = {p: rid for p, rid in PLATFORM_ROLE_IDS.items() if rid}
+    member_platform = next(
+        (p for p, rid in platforms.items() if rid in role_ids), None
+    )
+    syn_ids = set(SYNDICATE_ROLE_IDS)
+    syndicate_roles = [r for r in member.roles if r.id in syn_ids]
+    emoji_literals: set[str | None] = {
+        slot.emoji if slot is not None else None,
+        PLATFORM_EMOJIS.get(member_platform) if member_platform else None,
+        MASTERY_RANK_EMOJI_RAW,
+        *(_syndicate_style(r.name)[1] for r in syndicate_roles),
+    }
+    emoji_literals.discard(None)
+    literal_list = sorted(emoji_literals)
+    emoji_bytes_list = await asyncio.gather(
+        *(_fetch_emoji_bytes(lit) for lit in literal_list)
+    )
+    emoji_bytes: dict[str | None, bytes | None] = dict(
+        zip(literal_list, emoji_bytes_list)
+    )
+    emoji_bytes[None] = None
+
     # The records channel is the source of truth for the exact picked/OCR'd
     # Mastery Rank (Discord roles only carry coarse buckets), so prefer it for
     # the Mastery Rank row when present. The record read (HTTP/cache) and the
@@ -1011,10 +1096,6 @@ async def _member_profile_info_lines(
 
     # Clan — match the member's clan role to its slot for name + emoji.
     if any(s.role_id for s in CLAN_SLOTS):
-        slot = next(
-            (s for s in CLAN_SLOTS if s.role_id and s.role_id in role_ids),
-            None,
-        )
         if slot is not None:
             clan_role = member.guild.get_role(slot.role_id)
             clan_color = (
@@ -1025,23 +1106,19 @@ async def _member_profile_info_lines(
             rows.append((
                 "Clan",
                 _strip_clan_tag(slot.clan_name or "") or "\u2014",
-                await _fetch_emoji_bytes(slot.emoji),
+                emoji_bytes.get(slot.emoji),
                 clan_color,
             ))
         else:
             rows.append(("Clan", "\u2014", None))
 
     # Platform — first configured platform role the member holds.
-    platforms = {p: rid for p, rid in PLATFORM_ROLE_IDS.items() if rid}
     if platforms:
-        member_platform = next(
-            (p for p, rid in platforms.items() if rid in role_ids), None
-        )
         if member_platform is not None:
             rows.append((
                 "Platform",
                 member_platform,
-                await _fetch_emoji_bytes(PLATFORM_EMOJIS.get(member_platform)),
+                emoji_bytes.get(PLATFORM_EMOJIS.get(member_platform)),
             ))
         else:
             rows.append(("Platform", "\u2014", None))
@@ -1073,7 +1150,7 @@ async def _member_profile_info_lines(
         rows.append((
             "Mastery Rank",
             mr_value,
-            await _fetch_emoji_bytes(MASTERY_RANK_EMOJI_RAW),
+            emoji_bytes.get(MASTERY_RANK_EMOJI_RAW),
         ))
 
     # Syndicate — members may pledge to several. Emit a per-faction list of
@@ -1081,16 +1158,13 @@ async def _member_profile_info_lines(
     # per-faction SYNDICATE_EMOJI_<KEY>, falling back to the role's own
     # colour + the shared SYNDICATE_EMOJI for an unrecognised name.
     if SYNDICATE_ROLE_IDS:
-        syn_ids = set(SYNDICATE_ROLE_IDS)
         factions: list[tuple] = []
-        for r in member.roles:
-            if r.id not in syn_ids:
-                continue
+        for r in syndicate_roles:
             color, emoji_literal = _syndicate_style(r.name)
             if color is None and r.color.value:
                 color = r.color.to_rgb()
             factions.append((
-                r.name, color, await _fetch_emoji_bytes(emoji_literal),
+                r.name, color, emoji_bytes.get(emoji_literal),
             ))
         rows.append(("Syndicate", factions))
 
@@ -2879,30 +2953,9 @@ def _evict_cached_screenshot(user_id: int) -> None:
     """Drop the member's cached screenshot (on leave)."""
     _screenshot_cache.pop(user_id, None)
 
-# Maps a record body label to the profile dict key it populates. Mirrors the
-# lines emitted by :func:`_member_record_profile_lines`.
-_RECORD_PROFILE_LABELS = {
-    "in-game name": "in_game_name",
-    "mastery rank": "mastery_rank",
-    "clan": "clan",
-    "platform": "platform",
-    "syndicate": "syndicate",
-}
-
-# A record body line: "Key: **Value**", optionally prefixed by the "-# "
-# small-text marker the container uses.
-_RECORD_LINE_RE = re.compile(
-    r"^\s*(?:-#\s*)?([A-Za-z][\w \-]*?):\s*\*\*(.+?)\*\*\s*$",
-    re.MULTILINE,
-)
-
-# Discord epoch (2015-01-01) in ms, for deriving a timestamp from a snowflake.
-_DISCORD_EPOCH_MS = 1420070400000
-
-
-def _snowflake_ts(snowflake: int) -> int:
-    """Return the unix-seconds creation time encoded in a Discord snowflake."""
-    return int((((int(snowflake) >> 22) + _DISCORD_EPOCH_MS) / 1000))
+# Record body parsing (labels, line regex, snowflake timestamps, V2 text
+# walk, embed parse-back) lives in gpbot.records; re-exported above as the
+# private bot.* names tests and callers already use.
 
 
 def _records_channel_id() -> int:
@@ -2912,98 +2965,6 @@ def _records_channel_id() -> int:
     except Exception:
         cid = None
     return int(cid or MEMBER_RECORDS_CHANNEL_ID or 0)
-
-
-def _collect_v2_text(components: object) -> str:
-    """Walk a Components V2 tree and join every type-10 ``content`` string."""
-    parts: list[str] = []
-
-    def _walk(node: object) -> None:
-        if isinstance(node, dict):
-            if node.get("type") == 10 and isinstance(node.get("content"), str):
-                parts.append(node["content"])
-            _walk(node.get("components"))
-            _walk(node.get("items"))
-        elif isinstance(node, list):
-            for child in node:
-                _walk(child)
-
-    _walk(components)
-    return "\n".join(parts)
-
-
-_EXACT_MASTERY_RE = re.compile(r"^(MR|LR)\s*(\d+)$", re.IGNORECASE)
-
-
-def _is_exact_mastery_rank(value: str) -> bool:
-    """True when ``value`` is an exact ``MR n`` / ``LR n`` rank with a real
-    (>= 1) number.
-
-    The records channel stores the exact OCR rank and prefers it over the
-    coarse role bucket on every refresh, so a bogus ``MR 0`` (a stray UI/credit
-    digit the OCR misread) would otherwise stick forever and never update to
-    the member's real rank. Rejecting rank 0 here drops that bad value on read
-    so the role bucket wins instead. Rank roles run MR 1-30 / Legendary 1-8 and
-    the mastery editor already requires ``> 0``, so 0 is never a real rank.
-    """
-    m = _EXACT_MASTERY_RE.match(value or "")
-    return bool(m) and int(m.group(2)) >= 1
-
-
-def _parse_record_profile_text(text: str) -> dict:
-    """Parse a record body's ``Key: **Value**`` lines into a profile dict.
-
-    Recognises the labels emitted by :func:`_member_record_profile_lines`.
-    The Mastery Rank value is kept only when it's an exact ``MR n`` / ``LR n``
-    rank (the OCR-exact override); a coarse role-bucket name is dropped so the
-    returned shape matches the old durable-store semantics (where
-    ``mastery_rank`` was always the exact rank or absent).
-    """
-    out: dict = {}
-    for m in _RECORD_LINE_RE.finditer(text or ""):
-        key = _RECORD_PROFILE_LABELS.get(m.group(1).strip().lower())
-        if not key or key in out:
-            continue
-        value = m.group(2).strip()
-        if key == "mastery_rank" and not _is_exact_mastery_rank(value):
-            continue
-        out[key] = value
-    return out
-
-
-def _parse_record_embed(embeds: object) -> dict:
-    """Parse a member record's profile fields out of its rich ``embeds``.
-
-    Mirrors :func:`_parse_record_profile_text` but reads the structured
-    ``embeds[].fields`` (``{name, value}``) written by
-    :func:`_build_member_record_embed`. Field names map through
-    ``_RECORD_PROFILE_LABELS``; values may be wrapped in ``**bold**``. Mastery
-    Rank is kept only when it's an exact ``MR n`` / ``LR n`` rank.
-    """
-    out: dict = {}
-    if not isinstance(embeds, list):
-        return out
-    for embed in embeds:
-        if not isinstance(embed, dict):
-            continue
-        for field in embed.get("fields") or []:
-            if not isinstance(field, dict):
-                continue
-            name = str(field.get("name", "")).strip().rstrip(":").strip().lower()
-            key = _RECORD_PROFILE_LABELS.get(name)
-            if not key or key in out:
-                continue
-            value = str(field.get("value", "")).strip()
-            if value.startswith("`") and value.endswith("`") and len(value) > 2:
-                value = value[1:-1].strip()
-            elif value.startswith("**") and value.endswith("**") and len(value) > 4:
-                value = value[2:-2].strip()
-            if not value:
-                continue
-            if key == "mastery_rank" and not _is_exact_mastery_rank(value):
-                continue
-            out[key] = value
-    return out
 
 
 async def _fetch_record_message(channel_id: int, message_id: int) -> dict | None:
@@ -3152,28 +3113,15 @@ async def _handle_onboarding_interaction(
 
     Ownership check: only the target member may interact.
     """
-    parts = custom_id.split(":")
-    # parts[0] = "onboard", parts[1] = user_id, parts[2] = action
-    try:
-        target_id = int(parts[1])
-    except (IndexError, ValueError):
+    parsed = parse_onboard_custom_id(
+        custom_id,
+        select_values=(interaction.data or {}).get("values"),
+    )
+    if parsed is None:
         return
-
-    action = parts[2] if len(parts) > 2 else ""
+    target_id, _action, slot_token = parsed
     user = interaction.user
     guild = interaction.guild
-
-    # The clan dropdown carries the chosen slot in the select's values, while
-    # legacy clan buttons encoded it in the custom_id. Normalise both to a
-    # single ``slot_token`` (a slot number string or "none").
-    slot_token: str | None = None
-    if action == "clanselect":
-        values = (interaction.data or {}).get("values") or []
-        slot_token = str(values[0]) if values else None
-    elif action == "clan":
-        slot_token = parts[3] if len(parts) > 3 else None
-    elif action == "none":
-        slot_token = "none"
 
     # Ownership gate — reject any other user with an ephemeral.
     if user.id != target_id:
@@ -3284,22 +3232,28 @@ async def _onboarding_reprompt_sweep() -> None:
         posted_ts = row["posted_ts"]
         reprompt_count = row["reprompt_count"]
 
-        elapsed = now - posted_ts
-        if elapsed < window_secs:
-            continue
-
         guild = client.get_guild(guild_id)
         if guild is None:
             continue
         member = guild.get_member(user_id)
-        if member is None:
+
+        decision = reprompt_decision(
+            posted_ts=posted_ts,
+            reprompt_count=reprompt_count,
+            now=now,
+            window_secs=window_secs,
+            max_reprompts=ONBOARDING_MAX_REPROMPTS,
+            member_present=member is not None,
+        )
+        if decision is RepromptDecision.WAIT:
+            continue
+        if decision is RepromptDecision.CLEANUP:
             # Member left; clean up.
             await asyncio.to_thread(
                 analytics.delete_onboarding_prompt, guild_id, user_id
             )
             continue
-
-        if reprompt_count >= ONBOARDING_MAX_REPROMPTS:
+        if decision is RepromptDecision.STOP:
             logger.info(
                 "onboarding: %s in guild %s hit max reprompts (%d); stopping",
                 user_id, guild_id, ONBOARDING_MAX_REPROMPTS,
@@ -5554,18 +5508,8 @@ class _ManageScreenshotModal(discord.ui.Modal):
                 )
 
 
-class _VerifyResult(NamedTuple):
-    """Outcome of :func:`_verify_member_from_screenshot`.
-
-    ``summary`` holds the human-readable per-field lines (empty when the
-    screenshot couldn't be read). ``in_game_name`` and ``mastery_rank`` carry
-    the OCR-only fields — the handle + exact rank that aren't recoverable from
-    Discord roles — so callers can thread them into the member-records log.
-    """
-
-    summary: list[str]
-    in_game_name: str | None
-    mastery_rank: str | None
+# _VerifyResult / VerifyState live in gpbot.verify (imported at top) so the
+# pipeline states are unit-testable without a gateway connection.
 
 
 async def _verify_member_from_screenshot(
@@ -5580,21 +5524,15 @@ async def _verify_member_from_screenshot(
     onboarding + /manage flows, but scoped to a single member's self-service:
     no reactions, no public reply, no verify/incomplete role gating. Returns
     a ``_VerifyResult`` whose ``summary`` describes what was updated; an empty
-    summary means the screenshot couldn't be read.
+    summary means the screenshot couldn't be read (``result.state`` says why:
+    ``INVALID_IMAGE`` vs ``OCR_FAILED``).
     """
-    try:
-        probe = Image.open(io.BytesIO(image_bytes))
-        try:
-            probe.verify()
-        finally:
-            probe.close()
-    except Exception:
-        logger.warning("profile screenshot: invalid image", exc_info=True)
-        return _VerifyResult([], None, None)
+    if not await asyncio.to_thread(validate_image_bytes, image_bytes):
+        return _VerifyResult.failed(VerifyState.INVALID_IMAGE)
 
     fields = await _ocr_profile_fields(image_bytes, filename, content_type)
     if not fields.ok:
-        return _VerifyResult([], None, None)
+        return _VerifyResult.failed(VerifyState.OCR_FAILED)
     profile_name = fields.profile_name
     clan_name = fields.clan_name
     mastery_rank = fields.mastery_rank
@@ -5618,10 +5556,9 @@ async def _verify_member_from_screenshot(
             )
 
     if mastery_rank:
-        m = re.match(r"\s*(MR|LR)\s*(\d+)", mastery_rank, re.IGNORECASE)
-        if m:
-            kind = m.group(1).upper()
-            value = int(m.group(2))
+        token = parse_mastery_token(mastery_rank)
+        if token is not None:
+            kind, value = token
             status = await _apply_mastery_bucket(member, kind, value)
             disp = _format_mastery_display(f"{kind} {value}")
             if status == "assigned":
