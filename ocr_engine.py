@@ -70,10 +70,11 @@ _OLLAMA_OCR_PROMPT = (
     "number, and the CLAN name. Output only the raw transcribed text — no "
     "commentary, no markdown, no explanations."
 )
-# Short connect timeout shared by every OCR HTTP call: a down/refusing
-# backend (Ollama not running, OCR.space unreachable) fails over in seconds
-# instead of consuming the full read timeout before the next engine runs.
-OCR_CONNECT_TIMEOUT = 5
+# Short connect timeout (seconds) shared by every OCR HTTP call: a
+# down/refusing backend (Ollama not running, OCR.space unreachable) fails
+# over in seconds instead of consuming the full read timeout before the
+# next engine runs.
+OCR_CONNECT_TIMEOUT = _int_env("OCR_CONNECT_TIMEOUT", 5)
 
 # OCR.space free tier rejects uploads >1 MB. We re-encode oversize images as
 # JPEG before sending so large PNG screenshots still get verified.
