@@ -6342,6 +6342,11 @@ class _TitlesModal(discord.ui.Modal):
     partial args. The /manage Edit page's Titles button opens the same modal
     with ``member`` fixed — the member select is omitted since the target is
     already known from the panel.
+
+    Styled to recreate Discord's native slash-command argument sheet for
+    /titles exactly: the command description as a leading text display,
+    lowercase field labels, and each field's ``@app_commands.describe``
+    string as its Label description.
     """
 
     def __init__(
@@ -6352,8 +6357,11 @@ class _TitlesModal(discord.ui.Modal):
         title_text: str | None = None,
         reason: str | None = None,
     ) -> None:
-        super().__init__(title="Titles", timeout=600)
+        super().__init__(title="titles", timeout=600)
         self._gp_member = member
+        self.add_item(discord.ui.TextDisplay(
+            "Add or remove a member's cosmetic profile title."
+        ))
         self.action_select = discord.ui.Select(
             min_values=1, max_values=1,
             options=[
@@ -6367,7 +6375,7 @@ class _TitlesModal(discord.ui.Modal):
             ],
         )
         self.add_item(discord.ui.Label(
-            text="Action",
+            text="action",
             description="Whether to add or remove the title.",
             component=self.action_select,
         ))
@@ -6380,26 +6388,32 @@ class _TitlesModal(discord.ui.Modal):
                 min_values=1, max_values=1, required=True,
             )
             self.add_item(discord.ui.Label(
-                text="Member",
+                text="member",
                 description="The member whose title to change.",
                 component=self.member_select,
             ))
         self.title_input = discord.ui.TextInput(
-            label="Title",
-            placeholder="The title text (case-insensitive when removing).",
             default=title_text or None,
             required=True,
             max_length=100,
         )
-        self.add_item(self.title_input)
+        self.add_item(discord.ui.Label(
+            text="title",
+            description="The title text (case-insensitive when removing).",
+            component=self.title_input,
+        ))
         self.reason_input = discord.ui.TextInput(
-            label="Reason",
-            placeholder="Optional citation shown when adding.",
             default=reason or None,
             required=False,
             max_length=200,
         )
-        self.add_item(self.reason_input)
+        self.add_item(discord.ui.Label(
+            text="reason",
+            description=(
+                "Optional citation shown when adding (ignored on remove)."
+            ),
+            component=self.reason_input,
+        ))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         # Defence in depth: re-check Manage Server before mutating the store.

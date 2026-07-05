@@ -645,12 +645,12 @@ class ManagePanelTests(unittest.TestCase):
         self.assertEqual(modal._gp_admin_id, 123)
 
     def test_titles_modal_includes_member_select_without_member(self):
-        """/titles run bare opens the full form: action, member, title,
-        reason."""
+        """/titles run bare opens the full form: description text, action,
+        member, title, reason."""
         import discord
         modal = self.b._TitlesModal()
         self.assertIsInstance(modal.member_select, discord.ui.UserSelect)
-        self.assertEqual(len(modal.children), 4)
+        self.assertEqual(len(modal.children), 5)
 
     def test_titles_modal_member_select_is_required(self):
         """min_values=1 with required=False is a contradiction Discord
@@ -663,7 +663,7 @@ class ManagePanelTests(unittest.TestCase):
         select."""
         modal = self.b._TitlesModal(member=Mock(id=7))
         self.assertIsNone(modal.member_select)
-        self.assertEqual(len(modal.children), 3)
+        self.assertEqual(len(modal.children), 4)
 
     def test_titles_modal_prefills_partial_args(self):
         modal = self.b._TitlesModal(
