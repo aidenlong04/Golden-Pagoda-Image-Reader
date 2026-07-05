@@ -54,6 +54,20 @@ from logic import (
 import analytics
 import records_index
 from config import _csv, _csv_ids, _float_env, _int_env
+from gpbot.bootstrap import build_client_tree
+from gpbot.components_v2 import (
+    DISCORD_API_BASE as _DISCORD_API_BASE,
+    interaction_callback as _v2_interaction_callback,
+    interaction_edit_original_v2 as _v2_interaction_edit_original,
+    v2_multipart_request as _v2_multipart_http,
+)
+from gpbot.concurrency import (
+    get_or_create_lock,
+    run_heavy_job,
+    spawn_bg_task as _spawn_bg_task_impl,
+)
+from gpbot.discord_http import discord_call_with_retry
+from gpbot.routing import CustomIDRouter
 from ocr_engine import OCR_API_KEY, OLLAMA_OCR_MODEL, _ocr
 from envstore import (  # noqa: F401  (some re-exported for tests via bot.*)
     ENV_FILE_PATH,
@@ -270,12 +284,7 @@ CLAN_SLOTS: list[ClanSlot] = _load_clan_slots()
 
 # ---------- Discord client --------------------------------------------------
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
+client, tree = build_client_tree()
 
 BOT_START_TIME = time.time()
 HEALTH_PATH = os.getenv("HEALTH_PATH", "./data/gp_health")
@@ -284,6 +293,8 @@ HEALTH_INTERVAL = _int_env("HEALTH_INTERVAL", 20)
 # Populated after tree.sync(); used to render clickable slash-command mentions
 # (`</name:id>`) inside ephemeral replies fired from component buttons.
 _COMMAND_IDS: dict[str, int] = {}
+_CUSTOM_ID_ROUTER = CustomIDRouter()
+_CUSTOM_ID_ROUTES_REGISTERED = False
 
 # Strong refs for fire-and-forget tasks. asyncio docs warn that
 # create_task() return values must be kept alive or the task may be
@@ -309,13 +320,13 @@ async def _run_heavy(func, /, *args, **kwargs):
     Instruments ``heavy_semaphore_metrics`` (from utils.metrics) so the
     /status page can surface current/peak/queued counts and average wait.
     """
-    enqueue_ts = heavy_semaphore_metrics.record_enqueue()
-    async with _HEAVY_JOB_SEMAPHORE:
-        heavy_semaphore_metrics.record_acquire(enqueue_ts)
-        try:
-            return await asyncio.to_thread(func, *args, **kwargs)
-        finally:
-            heavy_semaphore_metrics.record_release()
+    return await run_heavy_job(
+        _HEAVY_JOB_SEMAPHORE,
+        heavy_semaphore_metrics,
+        func,
+        *args,
+        **kwargs,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -342,36 +353,14 @@ async def _discord_call_with_retry(coro_factory, /, *, label: str = "discord cal
     label:
         Human-readable description for logging.
     """
-    from utils.retry import exponential_backoff
-    last: Exception | None = None
-    for attempt in range(1, _DISCORD_RETRY_MAX + 1):
-        try:
-            await coro_factory()
-            return
-        except discord.HTTPException as exc:
-            last = exc
-            if exc.status == 429:
-                # Respect the Retry-After header when Discord provides it.
-                retry_after = getattr(exc, "retry_after", None)
-                if retry_after and isinstance(retry_after, (int, float)) and retry_after > 0:
-                    delay = min(float(retry_after), _DISCORD_RETRY_MAX_DELAY)
-                else:
-                    delay = exponential_backoff(
-                        attempt,
-                        base=_DISCORD_RETRY_BASE,
-                        cap=_DISCORD_RETRY_MAX_DELAY,
-                    )
-                if attempt < _DISCORD_RETRY_MAX:
-                    logger.warning(
-                        "%s: rate-limited (attempt %d/%d); sleeping %.1fs",
-                        label, attempt, _DISCORD_RETRY_MAX, delay,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-            # Non-429 or final attempt — propagate.
-            raise
-    if last is not None:
-        raise last
+    await discord_call_with_retry(
+        coro_factory,
+        label=label,
+        logger=logger,
+        max_attempts=_DISCORD_RETRY_MAX,
+        base_delay=_DISCORD_RETRY_BASE,
+        max_delay=_DISCORD_RETRY_MAX_DELAY,
+    )
 
 async def _health_task() -> None:
     # Liveness signal: touch HEALTH_PATH every HEALTH_INTERVAL seconds. The
@@ -407,10 +396,7 @@ def _spawn_bg_task(coro) -> asyncio.Task:
     """Schedule a coroutine on the running loop and keep a strong reference
     so the GC can't reap it mid-await. Self-cleans on completion and logs
     any unhandled exception via ``_bg_task_done``."""
-    task = asyncio.create_task(coro)
-    _BG_TASKS.add(task)
-    task.add_done_callback(_bg_task_done)
-    return task
+    return _spawn_bg_task_impl(coro, task_set=_BG_TASKS, on_done=_bg_task_done)
 
 
 # Persistent aiohttp session for Discord REST + CDN fetches. Reusing a
@@ -1182,10 +1168,8 @@ def _assign_role_buttons(
 
 # Components V2 multipart bodies bypass discord.py's HTTPClient (it can't
 # cleanly post arbitrary V2 multipart) and go straight out via aiohttp with
-# the bot token. One base URL + User-Agent + sender keeps the POST (new
-# reply) and PATCH (attachment swap) paths in lock-step.
-_DISCORD_API_BASE = "https://discord.com/api/v10"
-_V2_USER_AGENT = "GoldenPagoda (https://github.com/aidenlong04, 1.0)"
+# the bot token. One base URL + sender keeps the POST (new reply) and PATCH
+# (attachment swap) paths in lock-step.
 
 
 async def _v2_multipart_request(
@@ -1209,36 +1193,24 @@ async def _v2_multipart_request(
     Raises ``discord.HTTPException`` on any 4xx/5xx so callers can fall back
     or log it (e.g. ``_post_channel_embed`` / ``_edit_channel_embed``).
     """
-    form = aiohttp.FormData()
-    form.add_field(
-        "payload_json", json.dumps(payload),
-        content_type="application/json",
-    )
-    form.add_field(
-        "files[0]", file_bytes,
-        filename=file_name, content_type=file_content_type,
-    )
-    for idx, (extra_bytes, extra_name) in enumerate(extra_files or [], start=1):
-        form.add_field(
-            f"files[{idx}]", extra_bytes,
-            filename=extra_name, content_type="image/png",
-        )
-    headers = {
-        "Authorization": f"Bot {DISCORD_TOKEN}",
-        "User-Agent": _V2_USER_AGENT,
-    }
-    timeout = aiohttp.ClientTimeout(total=15)
     session = await _get_http_session()
-    async with session.request(
-        method, url, data=form, headers=headers, timeout=timeout
-    ) as resp:
-        if resp.status >= 400:
-            text = await resp.text()
-            raise discord.HTTPException(resp, text)  # type: ignore[arg-type]
-        try:
-            return await resp.json()
-        except (aiohttp.ContentTypeError, ValueError):
-            return None
+    holder: dict[str, object] = {}
+
+    async def _request():
+        holder["data"] = await _v2_multipart_http(
+            session,
+            method=method,
+            url=url,
+            bot_token=DISCORD_TOKEN,
+            payload=payload,
+            file_bytes=file_bytes,
+            file_name=file_name,
+            file_content_type=file_content_type,
+            extra_files=extra_files,
+        )
+
+    await _discord_call_with_retry(_request, label=f"v2 multipart {method}")
+    return holder.get("data")
 
 
 async def _delete_message(channel_id: int, message_id: int) -> None:
@@ -1246,13 +1218,17 @@ async def _delete_message(channel_id: int, message_id: int) -> None:
     swallowed (already gone); other HTTP errors are logged."""
     from discord.http import Route
 
+    route = Route(
+        "DELETE",
+        "/channels/{channel_id}/messages/{message_id}",
+        channel_id=channel_id,
+        message_id=message_id,
+    )
     try:
-        await client.http.request(Route(
-            "DELETE",
-            "/channels/{channel_id}/messages/{message_id}",
-            channel_id=channel_id,
-            message_id=message_id,
-        ))
+        await _discord_call_with_retry(
+            lambda: client.http.request(route),
+            label=f"delete message {message_id}",
+        )
     except discord.NotFound:
         pass
     except discord.HTTPException:
@@ -1309,7 +1285,16 @@ async def _post_channel_v2(
         channel_id=channel_id,
     )
     try:
-        data = await client.http.request(route, json=payload)
+        holder: dict[str, object] = {}
+
+        async def _request():
+            holder["data"] = await client.http.request(route, json=payload)
+
+        await _discord_call_with_retry(
+            _request,
+            label=f"post channel v2 {channel_id}",
+        )
+        data = holder.get("data")
         return _extract_message_id(data)
     except discord.HTTPException:
         logger.exception("_post_channel_v2: failed to post to channel %s", channel_id)
@@ -2726,11 +2711,7 @@ def _record_write_lock(user_id: int) -> asyncio.Lock:
     freshly-indexed record and edit it in place instead. Created lazily on the
     running loop; keyed by the globally-unique user id (matches the index key).
     """
-    lock = _RECORD_WRITE_LOCKS.get(user_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _RECORD_WRITE_LOCKS[user_id] = lock
-    return lock
+    return get_or_create_lock(_RECORD_WRITE_LOCKS, user_id)
 
 
 async def _edit_or_create_member_record(
@@ -3868,27 +3849,19 @@ async def _interaction_callback(
     *,
     ephemeral: bool = True,
 ) -> None:
-    from discord.http import Route
-
     flags = COMPONENTS_V2_FLAG
     if ephemeral:
         flags |= EPHEMERAL_FLAG
-    route = Route(
-        "POST",
-        "/interactions/{interaction_id}/{interaction_token}/callback",
-        interaction_id=interaction.id,
-        interaction_token=interaction.token,
-    )
-    await client.http.request(
-        route,
-        json={
-            "type": callback_type,
-            "data": {
-                "flags": flags,
-                "components": components,
-                "allowed_mentions": _ALLOWED_MENTIONS_NONE,
-            },
-        },
+    await _discord_call_with_retry(
+        lambda: _v2_interaction_callback(
+            http_client=client.http,
+            interaction=interaction,
+            callback_type=callback_type,
+            components=components,
+            flags=flags,
+            allowed_mentions=_ALLOWED_MENTIONS_NONE,
+        ),
+        label="interaction callback",
     )
     with contextlib.suppress(AttributeError):
         interaction.response._responded = True  # type: ignore[attr-defined]
@@ -3905,20 +3878,14 @@ async def _interaction_edit_original_v2(
     ``@original`` route directly. The message keeps its IS_COMPONENTS_V2
     flag, so the edit only needs to carry the new component tree.
     """
-    from discord.http import Route
-
-    route = Route(
-        "PATCH",
-        "/webhooks/{application_id}/{interaction_token}/messages/@original",
-        application_id=interaction.application_id,
-        interaction_token=interaction.token,
-    )
-    await client.http.request(
-        route,
-        json={
-            "components": components,
-            "allowed_mentions": _ALLOWED_MENTIONS_NONE,
-        },
+    await _discord_call_with_retry(
+        lambda: _v2_interaction_edit_original(
+            http_client=client.http,
+            interaction=interaction,
+            components=components,
+            allowed_mentions=_ALLOWED_MENTIONS_NONE,
+        ),
+        label="interaction edit original",
     )
 
 
@@ -6037,25 +6004,9 @@ async def onboard_cmd(
     )
 
 
-@client.event
-async def on_interaction(interaction: discord.Interaction) -> None:
-    if interaction.type != discord.InteractionType.component:
-        return
-    data = interaction.data or {}
-    custom_id = str(data.get("custom_id", ""))
-
-    if custom_id.startswith("manage:"):
-        await _handle_manage_interaction(interaction, custom_id)
-        return
-    if custom_id.startswith("onboard:"):
-        await _handle_onboarding_interaction(interaction, custom_id)
-        return
-    if custom_id.startswith("mreview:"):
-        await _handle_mreview_interaction(interaction, custom_id)
-        return
-    if not custom_id.startswith("status:"):
-        return
-
+async def _handle_status_interaction(
+    interaction: discord.Interaction, custom_id: str
+) -> None:
     parts = custom_id.split(":", 1)
     if len(parts) != 2 or parts[1] == "noop":
         try:
@@ -6102,6 +6053,29 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         await _interaction_callback(interaction, 7, components)  # UPDATE_MESSAGE
     except Exception:
         logger.exception("pagination failed")
+
+
+def _register_custom_id_routes() -> None:
+    global _CUSTOM_ID_ROUTES_REGISTERED
+    if _CUSTOM_ID_ROUTES_REGISTERED:
+        return
+    _CUSTOM_ID_ROUTER.register_prefix("manage:", _handle_manage_interaction)
+    _CUSTOM_ID_ROUTER.register_prefix("onboard:", _handle_onboarding_interaction)
+    _CUSTOM_ID_ROUTER.register_prefix("mreview:", _handle_mreview_interaction)
+    _CUSTOM_ID_ROUTER.register_prefix("status:", _handle_status_interaction)
+    _CUSTOM_ID_ROUTES_REGISTERED = True
+
+
+_register_custom_id_routes()
+
+
+@client.event
+async def on_interaction(interaction: discord.Interaction) -> None:
+    if interaction.type != discord.InteractionType.component:
+        return
+    data = interaction.data or {}
+    custom_id = str(data.get("custom_id", ""))
+    await _CUSTOM_ID_ROUTER.dispatch(interaction, custom_id)
 
 
 
