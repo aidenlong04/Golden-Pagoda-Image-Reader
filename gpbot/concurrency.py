@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 
 
 async def run_heavy_job(semaphore, metrics, func, /, *args, **kwargs):
@@ -13,7 +14,12 @@ async def run_heavy_job(semaphore, metrics, func, /, *args, **kwargs):
             metrics.record_release()
 
 
-def spawn_bg_task(coro, *, task_set: set[asyncio.Task], on_done):
+def spawn_bg_task(
+    coro,
+    *,
+    task_set: set[asyncio.Task],
+    on_done: Callable[[asyncio.Task], None],
+):
     task = asyncio.create_task(coro)
     task_set.add(task)
     task.add_done_callback(on_done)

@@ -3,15 +3,18 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 
 
+InteractionHandler = Callable[[object, str], Awaitable[object | None]]
+
+
 class CustomIDRouter:
     def __init__(self):
-        self._routes: list[tuple[str, Callable]] = []
-        self._default_handler: Callable | None = None
+        self._routes: list[tuple[str, InteractionHandler]] = []
+        self._default_handler: InteractionHandler | None = None
 
-    def register_prefix(self, prefix: str, handler: Callable):
+    def register_prefix(self, prefix: str, handler: InteractionHandler):
         self._routes.append((prefix, handler))
 
-    def register_default(self, handler: Callable):
+    def register_default(self, handler: InteractionHandler):
         self._default_handler = handler
 
     async def dispatch(self, interaction, custom_id: str):
