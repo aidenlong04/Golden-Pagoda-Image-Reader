@@ -56,7 +56,7 @@ class TestIsExactMasteryRank:
         assert not is_exact_mastery_rank("MR 1-10")
         assert not is_exact_mastery_rank("Legendary")
         assert not is_exact_mastery_rank("")
-        assert not is_exact_mastery_rank(None)  # type: ignore[arg-type]
+        assert not is_exact_mastery_rank(None)
 
 
 class TestParseRecordProfileText:
@@ -85,7 +85,7 @@ class TestParseRecordProfileText:
 
     def test_empty_input(self):
         assert parse_record_profile_text("") == {}
-        assert parse_record_profile_text(None) == {}  # type: ignore[arg-type]
+        assert parse_record_profile_text(None) == {}
 
 
 class TestParseRecordEmbed:

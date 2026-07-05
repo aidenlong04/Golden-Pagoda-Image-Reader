@@ -56,7 +56,7 @@ def collect_v2_text(components: object) -> str:
     return "\n".join(parts)
 
 
-def is_exact_mastery_rank(value: str) -> bool:
+def is_exact_mastery_rank(value: str | None) -> bool:
     """True when ``value`` is an exact ``MR n`` / ``LR n`` rank with a real
     (>= 1) number.
 
@@ -71,7 +71,7 @@ def is_exact_mastery_rank(value: str) -> bool:
     return bool(m) and int(m.group(2)) >= 1
 
 
-def parse_record_profile_text(text: str) -> dict:
+def parse_record_profile_text(text: str | None) -> dict:
     """Parse a record body's ``Key: **Value**`` lines into a profile dict.
 
     Recognises the labels emitted by ``bot._member_record_profile_lines``.

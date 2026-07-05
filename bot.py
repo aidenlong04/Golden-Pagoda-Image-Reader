@@ -2868,7 +2868,7 @@ async def _edit_or_create_member_record(
             ids = await asyncio.to_thread(
                 records_index.get_record_message_ids, member.id
             )
-            channel_id = await asyncio.to_thread(_records_channel_id)
+            channel_id = _records_channel_id()
             if ids and channel_id:
                 await _edit_member_record(
                     channel_id, ids[-1], member, summary_lines,
@@ -3025,7 +3025,7 @@ async def _read_member_profile_from_records(
     (``in_game_name`` / ``mastery_rank`` / ``platform`` / ``clan`` /
     ``last_verified_ts``) or None when no record exists / can't be read.
     """
-    channel_id = await asyncio.to_thread(_records_channel_id)
+    channel_id = _records_channel_id()
     if not channel_id:
         return None
     try:
