@@ -1120,10 +1120,10 @@ async def _member_profile_info_lines(
     # holds no configured clan role; a configured name in the store is
     # role-derived, so the role (or its absence) wins.
     stored_clan = (stored or {}).get("clan")
+    stored_clan = stored_clan.strip() if isinstance(stored_clan, str) else ""
     clan_override = (
-        stored_clan.strip()
-        if isinstance(stored_clan, str) and stored_clan.strip()
-        and _configured_clan_slot_for_name(stored_clan) is None
+        stored_clan
+        if stored_clan and _configured_clan_slot_for_name(stored_clan) is None
         else None
     )
 
@@ -1144,6 +1144,8 @@ async def _member_profile_info_lines(
                 clan_color,
             ))
         elif clan_override:
+            # Free-text clan: no configured slot, so no emoji (the card
+            # renders it in the gold fallback colour).
             rows.append(("Clan", clan_override, None))
         else:
             rows.append(("Clan", "\u2014", None))
