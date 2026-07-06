@@ -40,12 +40,15 @@ class VerifyResult(NamedTuple):
     screenshot couldn't be read). ``in_game_name`` and ``mastery_rank`` carry
     the OCR-only fields — the handle + exact rank that aren't recoverable from
     Discord roles — so callers can thread them into the durable member store.
+    ``clan_name`` is the OCR'd clan (whether or not it matched a configured
+    slot) so callers can store a non-configured ("not affiliated") clan.
     """
 
     summary: list[str]
     in_game_name: str | None
     mastery_rank: str | None
     state: VerifyState = VerifyState.VERIFIED
+    clan_name: str | None = None
 
     @property
     def ok(self) -> bool:

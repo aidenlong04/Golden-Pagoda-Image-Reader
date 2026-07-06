@@ -509,6 +509,149 @@ class MemberProfileInfoLinesTests(unittest.TestCase):
         self.assertEqual(value, "1-7")
 
 
+class ProfileClanOverrideTests(unittest.TestCase):
+    """A stored free-text ("not affiliated") clan surfaces as the Clan row
+    on /profile when the member holds no configured clan role."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+
+    def _clan_row(self, *, member_role_ids, clan_slots, stored_clan):
+        import asyncio
+        b = self.b
+
+        class _Role:
+            def __init__(self, rid, name):
+                self.id = rid
+                self.name = name
+                self.color = Mock(value=0)
+
+        roles = [_Role(rid, f"Role {rid}") for rid in member_role_ids]
+
+        class _Guild:
+            id = 7
+
+            def get_role(self, rid):
+                return next((r for r in roles if r.id == rid), None)
+
+        member = Mock()
+        member.roles = roles
+        member.id = 5
+        member.guild = _Guild()
+
+        async def _fake_fetch(_literal):
+            return None
+
+        async def _fake_profile(*a, **k):
+            return {"clan": stored_clan} if stored_clan else None
+
+        orig = (
+            b.MR_ROLE_IDS, b.CLAN_SLOTS, b.PLATFORM_ROLE_IDS,
+            b.SYNDICATE_ROLE_IDS, b._fetch_emoji_bytes,
+            b._member_profile_from_records, b.analytics.list_member_titles,
+        )
+        b.MR_ROLE_IDS = []
+        b.CLAN_SLOTS = clan_slots
+        b.PLATFORM_ROLE_IDS = {}
+        b.SYNDICATE_ROLE_IDS = []
+        b._fetch_emoji_bytes = _fake_fetch
+        b._member_profile_from_records = _fake_profile
+        b.analytics.list_member_titles = lambda *a, **k: []
+        try:
+            rows = asyncio.run(b._member_profile_info_lines(member))
+        finally:
+            (
+                b.MR_ROLE_IDS, b.CLAN_SLOTS, b.PLATFORM_ROLE_IDS,
+                b.SYNDICATE_ROLE_IDS, b._fetch_emoji_bytes,
+                b._member_profile_from_records,
+                b.analytics.list_member_titles,
+            ) = orig
+        return next((r for r in rows if r[0] == "Clan"), None)
+
+    def _slot(self, no, name, role_id):
+        from logic import ClanSlot
+        return ClanSlot(slot=no, clan_name=name, role_id=role_id)
+
+    def test_stored_free_text_clan_shown_without_clan_role(self):
+        row = self._clan_row(
+            member_role_ids=[],
+            clan_slots=[self._slot(1, "Golden Pagoda", 1001)],
+            stored_clan="Some Other Clan",
+        )
+        self.assertIsNotNone(row)
+        self.assertEqual(row[1], "Some Other Clan")
+
+    def test_configured_clan_role_wins_over_stored_override(self):
+        row = self._clan_row(
+            member_role_ids=[1001],
+            clan_slots=[self._slot(1, "Golden Pagoda", 1001)],
+            stored_clan="Some Other Clan",
+        )
+        self.assertIsNotNone(row)
+        self.assertEqual(row[1], "Golden Pagoda")
+
+    def test_stored_configured_name_without_role_is_dropped(self):
+        # A configured clan name in the store is role-derived: dropping the
+        # role must drop the Clan value too (em-dash), never resurrect it.
+        row = self._clan_row(
+            member_role_ids=[],
+            clan_slots=[self._slot(1, "Golden Pagoda", 1001)],
+            stored_clan="Golden Pagoda",
+        )
+        self.assertIsNotNone(row)
+        self.assertEqual(row[1], "\u2014")
+
+    def test_override_shown_even_without_configured_slots(self):
+        row = self._clan_row(
+            member_role_ids=[],
+            clan_slots=[],
+            stored_clan="Some Other Clan",
+        )
+        self.assertIsNotNone(row)
+        self.assertEqual(row[1], "Some Other Clan")
+
+    def test_no_row_when_nothing_configured_and_no_override(self):
+        row = self._clan_row(
+            member_role_ids=[], clan_slots=[], stored_clan=None,
+        )
+        self.assertIsNone(row)
+
+
+class VerifyClanOverrideTests(unittest.TestCase):
+    """_verify_clan_override: OCR'd non-configured clans become free-text
+    clan overrides; configured clans stay role-derived."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+        from logic import ClanSlot
+        self._orig_slots = self.b.CLAN_SLOTS
+        self.b.CLAN_SLOTS = [
+            ClanSlot(slot=1, clan_name="Golden Pagoda", role_id=1001),
+        ]
+
+    def tearDown(self):
+        self.b.CLAN_SLOTS = self._orig_slots
+
+    def test_non_configured_clan_becomes_override(self):
+        r = self.b._VerifyResult(
+            ["Clan **Some Other Clan** isn't configured on this server."],
+            "Player#1", "MR 9", clan_name="Some Other Clan",
+        )
+        self.assertEqual(self.b._verify_clan_override(r), "Some Other Clan")
+
+    def test_configured_clan_returns_none(self):
+        r = self.b._VerifyResult(
+            ["Clan: ok"], "Player#1", "MR 9", clan_name="Golden Pagoda",
+        )
+        self.assertIsNone(self.b._verify_clan_override(r))
+
+    def test_no_clan_returns_none(self):
+        r = self.b._VerifyResult(["line"], "Player#1", "MR 9")
+        self.assertIsNone(self.b._verify_clan_override(r))
+
+
 class ManagePanelTests(unittest.TestCase):
     """Tests for the /manage admin backup console (styled after /status)."""
 

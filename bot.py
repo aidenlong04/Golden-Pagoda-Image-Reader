@@ -1116,9 +1116,20 @@ async def _member_profile_info_lines(
         ),
     )
     mastery_override = (stored or {}).get("mastery_rank")
+    # A stored free-text ("not affiliated") clan — shown only when the member
+    # holds no configured clan role; a configured name in the store is
+    # role-derived, so the role (or its absence) wins.
+    stored_clan = (stored or {}).get("clan")
+    clan_override = (
+        stored_clan.strip()
+        if isinstance(stored_clan, str) and stored_clan.strip()
+        and _configured_clan_slot_for_name(stored_clan) is None
+        else None
+    )
 
-    # Clan — match the member's clan role to its slot for name + emoji.
-    if any(s.role_id for s in CLAN_SLOTS):
+    # Clan — match the member's clan role to its slot for name + emoji,
+    # falling back to the stored free-text ("not affiliated") clan.
+    if any(s.role_id for s in CLAN_SLOTS) or clan_override:
         if slot is not None:
             clan_role = member.guild.get_role(slot.role_id)
             clan_color = (
@@ -1132,6 +1143,8 @@ async def _member_profile_info_lines(
                 emoji_bytes.get(slot.emoji),
                 clan_color,
             ))
+        elif clan_override:
+            rows.append(("Clan", clan_override, None))
         else:
             rows.append(("Clan", "\u2014", None))
 
@@ -2260,6 +2273,7 @@ async def _handle_mreview_interaction(
                     member,
                     in_game_name=result.in_game_name,
                     mastery_rank=result.mastery_rank,
+                    clan_override=_verify_clan_override(result),
                     image_bytes=image_bytes,
                 )
         except Exception:
@@ -2719,6 +2733,7 @@ class _OnboardingVerifyModal(_GPModal):
             member,
             in_game_name=result.in_game_name,
             mastery_rank=result.mastery_rank,
+            clan_override=_verify_clan_override(result),
             image_bytes=image_bytes,
         ))
 
@@ -6050,7 +6065,21 @@ async def _verify_member_from_screenshot(
         else:
             summary.append(f"Mastery Rank: **{mastery_rank}**")
 
-    return _VerifyResult(summary, profile_name, mastery_rank)
+    return _VerifyResult(
+        summary, profile_name, mastery_rank, clan_name=clan_name
+    )
+
+
+def _verify_clan_override(result: _VerifyResult) -> str | None:
+    """Return the OCR'd clan from ``result`` as a free-text ("not
+    affiliated") ``clan_override`` when it doesn't name a configured clan,
+    else None (a configured clan is role-derived — the role carries it)."""
+    if not result.clan_name:
+        return None
+    stripped = _strip_clan_tag(result.clan_name)
+    if stripped and _configured_clan_slot_for_name(stripped) is None:
+        return stripped
+    return None
 
 
 async def _ingest_profile_screenshot(
@@ -6090,6 +6119,7 @@ async def _ingest_profile_screenshot(
             member,
             in_game_name=result.in_game_name,
             mastery_rank=result.mastery_rank,
+            clan_override=_verify_clan_override(result),
             image_bytes=image_bytes,
         )
         if finalize_onboarding:
