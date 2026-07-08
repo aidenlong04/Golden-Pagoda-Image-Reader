@@ -63,3 +63,15 @@ class TestVerifyResult:
 
     def test_verified_with_empty_summary_not_ok(self):
         assert not VerifyResult([], None, None).ok
+
+    def test_clan_name_defaults_none(self):
+        r = VerifyResult(["line"], "Player#1", "MR 9")
+        assert r.clan_name is None
+
+    def test_clan_name_carried(self):
+        r = VerifyResult(["line"], "Player#1", "MR 9", clan_name="My Clan")
+        assert r.clan_name == "My Clan"
+        assert r.ok
+
+    def test_failed_factory_has_no_clan_name(self):
+        assert VerifyResult.failed(VerifyState.OCR_FAILED).clan_name is None
