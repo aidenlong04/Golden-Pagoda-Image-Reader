@@ -214,14 +214,14 @@ ACCENT_INCOMPLETE = _int_env("ACCENT_INCOMPLETE", 0x99AAB5)  # grey
 # Role granted to users whose screenshot was readable but couldn't be fully
 # verified automatically (platform icon missing, unconfigured clan, etc).
 # A staff member then manually completes verification.
-INCOMPLETE_ROLE_ID = _int_env("INCOMPLETE_ROLE_ID", 1381447170229538917)
+INCOMPLETE_ROLE_ID = _int_env("INCOMPLETE_ROLE_ID", 1459326361968574555)
 
 # Auto-delete bot replies after this many seconds (0 = keep forever).
 REPLY_TTL_SECONDS = _int_env("REPLY_TTL_SECONDS", 180)
 
 # Role removed from a member on successful verification (e.g. an "unverified"
 # gate role). Set to 0 to disable.
-VERIFY_REMOVE_ROLE_ID = _int_env("VERIFY_REMOVE_ROLE_ID", 1459326361968574555)
+VERIFY_REMOVE_ROLE_ID = _int_env("VERIFY_REMOVE_ROLE_ID", 1381447170229538917)
 
 # Onboarding flow: welcome prompt + screenshot verification for new joins.
 # Hours before a pending welcome prompt triggers a re-prompt (default: 5h).
