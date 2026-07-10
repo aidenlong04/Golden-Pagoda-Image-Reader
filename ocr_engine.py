@@ -292,14 +292,14 @@ def _ocr_via_ollama(
     return text, []
 
 
-def _preprocess_for_tesseract(image_bytes: bytes) -> Image.Image:
+def _preprocess_for_tesseract(img: Image.Image) -> Image.Image:
     """Upscale + grayscale + autocontrast. Tesseract is dramatically more
     accurate on Warframe's stylized UI font when the input is enlarged and
     contrast-normalized first.
 
-    Caller is responsible for closing the returned Image.
+    Takes an already-decoded image (so callers decode once) and returns a
+    derived one; caller is responsible for closing both.
     """
-    img = Image.open(io.BytesIO(image_bytes))
     if img.mode != "L":
         img = ImageOps.grayscale(img)
     # Upscale only when the source is modestly sized; very large screenshots
@@ -315,15 +315,22 @@ def _ocr_via_tesseract(
 ) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]]:
     if pytesseract is None:
         raise RuntimeError("pytesseract not installed")
+    # Decode once; the raw image doubles as the fallback input when
+    # preprocessing fails (no second decode of the same bytes).
+    raw = Image.open(io.BytesIO(image_bytes))
     try:
-        prepared = _preprocess_for_tesseract(image_bytes)
-    except Exception:
-        logger.exception("Tesseract preprocess failed; falling back to raw image")
-        prepared = Image.open(io.BytesIO(image_bytes))
-    try:
-        text = pytesseract.image_to_string(prepared, config=TESSERACT_CONFIG)
+        try:
+            prepared = _preprocess_for_tesseract(raw)
+        except Exception:
+            logger.exception("Tesseract preprocess failed; falling back to raw image")
+            prepared = raw
+        try:
+            text = pytesseract.image_to_string(prepared, config=TESSERACT_CONFIG)
+        finally:
+            if prepared is not raw:
+                prepared.close()
     finally:
-        prepared.close()
+        raw.close()
     return text, []
 
 
@@ -443,6 +450,11 @@ def _supplement_title_bar_ocr(
     top portion of the image.
     """
     if pytesseract is None:
+        return ocr_text, ocr_words
+    # Cheap gate before touching the image: boxless backends (Ollama returns
+    # no word boxes) can only be checked against the raw text — when the
+    # PlayerName#NNN token is already there, the strip re-OCR is pure waste.
+    if not ocr_words and _TITLE_NAME_RE.search(ocr_text or ""):
         return ocr_text, ocr_words
     img = None
     try:

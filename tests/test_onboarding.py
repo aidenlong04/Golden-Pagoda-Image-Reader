@@ -1169,6 +1169,19 @@ class ScreenshotCacheTests(unittest.TestCase):
         # Evicting a missing entry is a no-op.
         self.bot._evict_cached_screenshot(999)
 
+    def test_lru_cap_evicts_least_recently_used(self):
+        cap = self.bot._SCREENSHOT_CACHE_MAX
+        for uid in range(cap):
+            self.bot._cache_screenshot(uid, b"x")
+        # Touch user 0 so it becomes most-recently-used.
+        self.assertEqual(self.bot._get_cached_screenshot(0), b"x")
+        # One over the cap evicts the least-recently-used entry (user 1).
+        self.bot._cache_screenshot(cap, b"new")
+        self.assertEqual(len(self.bot._screenshot_cache), cap)
+        self.assertIsNone(self.bot._get_cached_screenshot(1))
+        self.assertEqual(self.bot._get_cached_screenshot(0), b"x")
+        self.assertEqual(self.bot._get_cached_screenshot(cap), b"new")
+
 
 class EditMemberRecordCacheTests(unittest.IsolatedAsyncioTestCase):
     """_edit_member_record prefers the cached screenshot over a CDN re-fetch."""
