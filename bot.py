@@ -4385,7 +4385,7 @@ async def _apply_platform_role(
         return "no_match"
     plat_ids = {rid for rid in PLATFORM_ROLE_IDS.values() if rid}
     return await _sync_role_set(
-        member, plat_ids | {target.id}, {target.id}, "Manage: platform edit"
+        member, plat_ids, {target.id}, "Manage: platform edit"
     )
 
 
@@ -4402,7 +4402,7 @@ async def _apply_clan_slot(member: discord.Member, slot: "ClanSlot") -> str:
         return "no_match"
     clan_ids = {s.role_id for s in CLAN_SLOTS if s.role_id}
     return await _sync_role_set(
-        member, clan_ids | {target.id}, {target.id}, "Manage: clan edit"
+        member, clan_ids, {target.id}, "Manage: clan edit"
     )
 
 

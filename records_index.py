@@ -65,7 +65,9 @@ def _load_cached(path: Path | str) -> dict:
         return cached[1]
     index = load_index(p)
     if len(_cache) >= _CACHE_MAX_ENTRIES:
-        _cache.clear()
+        # Evict the oldest-inserted entry (dicts preserve insertion order);
+        # in practice only tests ever use more than one path.
+        _cache.pop(next(iter(_cache)))
     _cache[key] = (sig, index)
     return index
 
