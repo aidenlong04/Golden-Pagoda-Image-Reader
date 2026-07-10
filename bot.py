@@ -11,6 +11,7 @@ import re
 import sys
 import time
 import warnings
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from typing import NamedTuple
@@ -63,6 +64,7 @@ from gpbot.components_v2 import (
 )
 from gpbot.concurrency import (
     get_or_create_lock,
+    prune_lock_if_unused,
     run_heavy_job,
     spawn_bg_task as _spawn_bg_task_impl,
 )
@@ -3189,6 +3191,9 @@ async def _edit_or_create_member_record(
                 mastery_rank=mastery_rank,
                 summary_lines=summary_lines,
             )
+        # Keep the per-member lock map bounded: drop the lock now that it is
+        # released, unless another writer already holds or awaits it.
+        prune_lock_if_unused(_RECORD_WRITE_LOCKS, member.id)
     except Exception:
         logger.exception(
             "records: edit_or_create failed for %s", member.id
@@ -3239,8 +3244,12 @@ def _member_record_jump_urls(guild_id: int, user_id: int) -> list[str]:
 #     from the Discord CDN (`_edit_member_record`); and
 #   * the staff "Verify" button on a halted "not affiliated" submission OCRs the
 #     cached screenshot to assign roles (the submission itself runs no OCR).
-# The entry is evicted when the member leaves the server (`on_member_remove`).
-_screenshot_cache: dict[int, bytes] = {}
+# The entry is evicted when the member leaves the server (`on_member_remove`),
+# and the cache is LRU-bounded (`_SCREENSHOT_CACHE_MAX`) so members who never
+# leave can't grow it forever — it's purely a CDN-refetch optimization, so
+# evicting the least-recently-used entry only costs a later CDN round-trip.
+_SCREENSHOT_CACHE_MAX = 100
+_screenshot_cache: "OrderedDict[int, bytes]" = OrderedDict()
 
 
 def _cache_screenshot(user_id: int, image_bytes: bytes | None) -> None:
@@ -3251,11 +3260,17 @@ def _cache_screenshot(user_id: int, image_bytes: bytes | None) -> None:
     """
     if image_bytes:
         _screenshot_cache[user_id] = image_bytes
+        _screenshot_cache.move_to_end(user_id)
+        while len(_screenshot_cache) > _SCREENSHOT_CACHE_MAX:
+            _screenshot_cache.popitem(last=False)
 
 
 def _get_cached_screenshot(user_id: int) -> bytes | None:
     """Return the member's most recent cached screenshot bytes, if any."""
-    return _screenshot_cache.get(user_id)
+    image_bytes = _screenshot_cache.get(user_id)
+    if image_bytes is not None:
+        _screenshot_cache.move_to_end(user_id)
+    return image_bytes
 
 
 def _evict_cached_screenshot(user_id: int) -> None:
@@ -4318,6 +4333,43 @@ def _member_current_mr_role(member: discord.Member) -> "discord.Role | None":
     return next((r for r in member.roles if r.id in mr_ids), None)
 
 
+async def _sync_role_set(
+    member: discord.Member,
+    universe_ids: set[int],
+    wanted_ids: set[int],
+    reason: str,
+) -> str:
+    """Make ``member``'s roles within ``universe_ids`` exactly match
+    ``wanted_ids`` (adds missing, removes extras; roles outside the universe
+    are untouched). The shared engine behind the platform / clan / syndicate
+    role-sync helpers.
+
+    Returns ``"assigned"`` (incl. no-op) or ``"error"`` (role edit failed).
+    """
+    wanted = wanted_ids & universe_ids
+    have = {r.id for r in member.roles if r.id in universe_ids}
+    to_add = [
+        role for rid in (wanted - have)
+        if (role := member.guild.get_role(rid)) is not None
+    ]
+    to_remove = [
+        role for rid in (have - wanted)
+        if (role := member.guild.get_role(rid)) is not None
+    ]
+    ops = []
+    if to_add:
+        ops.append(member.add_roles(*to_add, reason=reason))
+    if to_remove:
+        ops.append(member.remove_roles(*to_remove, reason=reason))
+    try:
+        if ops:
+            await _gather_role_ops(*ops)
+    except discord.HTTPException:
+        logger.exception("role sync failed (%s)", reason)
+        return "error"
+    return "assigned"
+
+
 async def _apply_platform_role(
     member: discord.Member, platform: str
 ) -> str:
@@ -4332,22 +4384,9 @@ async def _apply_platform_role(
     if target is None:
         return "no_match"
     plat_ids = {rid for rid in PLATFORM_ROLE_IDS.values() if rid}
-    have_ids = {r.id for r in member.roles}
-    to_remove = [
-        r for r in member.roles if r.id in plat_ids and r.id != target.id
-    ]
-    ops = []
-    if to_remove:
-        ops.append(member.remove_roles(*to_remove, reason="Manage: platform edit"))
-    if target.id not in have_ids:
-        ops.append(member.add_roles(target, reason="Manage: platform edit"))
-    try:
-        if ops:
-            await _gather_role_ops(*ops)
-    except discord.HTTPException:
-        logger.exception("manage: platform role swap failed")
-        return "error"
-    return "assigned"
+    return await _sync_role_set(
+        member, plat_ids, {target.id}, "Manage: platform edit"
+    )
 
 
 async def _apply_clan_slot(member: discord.Member, slot: "ClanSlot") -> str:
@@ -4362,22 +4401,9 @@ async def _apply_clan_slot(member: discord.Member, slot: "ClanSlot") -> str:
     if target is None:
         return "no_match"
     clan_ids = {s.role_id for s in CLAN_SLOTS if s.role_id}
-    have_ids = {r.id for r in member.roles}
-    to_remove = [
-        r for r in member.roles if r.id in clan_ids and r.id != target.id
-    ]
-    ops = []
-    if to_remove:
-        ops.append(member.remove_roles(*to_remove, reason="Manage: clan edit"))
-    if target.id not in have_ids:
-        ops.append(member.add_roles(target, reason="Manage: clan edit"))
-    try:
-        if ops:
-            await _gather_role_ops(*ops)
-    except discord.HTTPException:
-        logger.exception("manage: clan role swap failed")
-        return "error"
-    return "assigned"
+    return await _sync_role_set(
+        member, clan_ids, {target.id}, "Manage: clan edit"
+    )
 
 
 async def _remove_configured_clan_roles(member: discord.Member) -> str:
@@ -4386,16 +4412,9 @@ async def _remove_configured_clan_roles(member: discord.Member) -> str:
     Returns ``"assigned"`` (incl. no-op) or ``"error"`` (role edit failed).
     """
     clan_ids = {s.role_id for s in CLAN_SLOTS if s.role_id}
-    to_remove = [r for r in member.roles if r.id in clan_ids]
-    try:
-        if to_remove:
-            await member.remove_roles(
-                *to_remove, reason="Manage: clan edit (not affiliated)"
-            )
-    except discord.HTTPException:
-        logger.exception("manage: clan role removal failed")
-        return "error"
-    return "assigned"
+    return await _sync_role_set(
+        member, clan_ids, set(), "Manage: clan edit (not affiliated)"
+    )
 
 
 async def _sync_syndicate_roles(
@@ -4406,31 +4425,9 @@ async def _sync_syndicate_roles(
 
     Returns ``"assigned"`` (incl. no-op) or ``"error"``.
     """
-    syn_ids = set(SYNDICATE_ROLE_IDS)
-    wanted = wanted_ids & syn_ids
-    have = {r.id for r in member.roles if r.id in syn_ids}
-    to_add = [
-        role for rid in (wanted - have)
-        if (role := member.guild.get_role(rid)) is not None
-    ]
-    to_remove = [
-        role for rid in (have - wanted)
-        if (role := member.guild.get_role(rid)) is not None
-    ]
-    ops = []
-    if to_add:
-        ops.append(member.add_roles(*to_add, reason="Manage: syndicate edit"))
-    if to_remove:
-        ops.append(member.remove_roles(
-            *to_remove, reason="Manage: syndicate edit"
-        ))
-    try:
-        if ops:
-            await _gather_role_ops(*ops)
-    except discord.HTTPException:
-        logger.exception("manage: syndicate role sync failed")
-        return "error"
-    return "assigned"
+    return await _sync_role_set(
+        member, set(SYNDICATE_ROLE_IDS), wanted_ids, "Manage: syndicate edit"
+    )
 
 
 def _manage_edit_page_components(

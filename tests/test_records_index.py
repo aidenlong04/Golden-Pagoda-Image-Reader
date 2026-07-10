@@ -66,3 +66,24 @@ def test_get_message_ids_coerces_str_ids(tmp_path):
         encoding="utf-8",
     )
     assert ri.get_record_message_ids(5, path=p) == [10, 11]
+
+
+def test_cached_read_reuses_parse_but_sees_external_writes(tmp_path):
+    p = tmp_path / "records_index.json"
+    ri.add_record(10, 1000, channel_id=99, path=p)
+    assert ri.get_record_message_ids(10, path=p) == [1000]
+    # External write (another process / test fixture) bumps the stat
+    # signature, so the cache must reload rather than serve stale data.
+    p.write_text(
+        json.dumps({"version": 1, "channel_id": 5, "users": {"10": [7]}}),
+        encoding="utf-8",
+    )
+    assert ri.get_record_message_ids(10, path=p) == [7]
+    assert ri.get_channel_id(path=p) == 5
+
+
+def test_cache_survives_file_deletion(tmp_path):
+    p = tmp_path / "records_index.json"
+    ri.add_record(10, 1000, path=p)
+    p.unlink()
+    assert ri.get_record_message_ids(10, path=p) == []

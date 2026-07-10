@@ -14,6 +14,7 @@ Modular pieces of the bot, extracted from the ``bot.py`` orchestrator:
 from .bootstrap import build_client_tree
 from .concurrency import (
     get_or_create_lock,
+    prune_lock_if_unused,
     run_heavy_job,
     spawn_bg_task,
 )
@@ -54,6 +55,7 @@ __all__ = [
     "parse_onboard_custom_id",
     "parse_record_embed",
     "parse_record_profile_text",
+    "prune_lock_if_unused",
     "reprompt_decision",
     "run_heavy_job",
     "snowflake_ts",

@@ -31,6 +31,46 @@ RECORDS_INDEX_PATH = Path(
 
 _INDEX_VERSION = 1
 
+# In-memory cache of parsed indexes keyed by path, validated by a cheap
+# ``stat()`` signature so an external write (another process, a test fixture)
+# is still picked up. Saves the full read + JSON parse that used to run on
+# every ``get_record_message_ids`` / ``get_channel_id`` / ``add_record`` call
+# — the hot path of every record read/write and ``/profile`` use.
+_CACHE_MAX_ENTRIES = 8
+_cache: dict[str, tuple[tuple[int, int] | None, dict]] = {}
+
+
+def _stat_signature(p: Path) -> tuple[int, int] | None:
+    """Return ``(mtime_ns, size)`` for ``p``, or None when unreadable."""
+    try:
+        st = p.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _invalidate_cache(p: Path) -> None:
+    _cache.pop(str(p), None)
+
+
+def _load_cached(path: Path | str) -> dict:
+    """Return the parsed index for ``path``, reusing the in-memory copy while
+    the file on disk is unchanged. Callers must treat the result as shared —
+    mutations must go through ``add_record`` (which refreshes the cache)."""
+    p = Path(path)
+    key = str(p)
+    sig = _stat_signature(p)
+    cached = _cache.get(key)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+    index = load_index(p)
+    if len(_cache) >= _CACHE_MAX_ENTRIES:
+        # Evict the oldest-inserted entry (dicts preserve insertion order);
+        # in practice only tests ever use more than one path.
+        _cache.pop(next(iter(_cache)))
+    _cache[key] = (sig, index)
+    return index
+
 
 def _empty_index(channel_id: int | None = None) -> dict:
     return {"version": _INDEX_VERSION, "channel_id": channel_id, "users": {}}
@@ -68,9 +108,11 @@ def save_index(index: dict, path: Path | str = RECORDS_INDEX_PATH) -> bool:
             json.dumps(index, indent=2, sort_keys=True), encoding="utf-8"
         )
         os.replace(tmp, p)
+        _invalidate_cache(p)
         return True
     except Exception:
         logger.warning("failed to save records index to %s", p, exc_info=True)
+        _invalidate_cache(p)
         return False
 
 
@@ -108,16 +150,27 @@ def add_record(
     Safe to call off the event loop (e.g. via ``asyncio.to_thread``) from the
     bot whenever a new record is posted.
     """
-    index = load_index(path)
+    index = _load_cached(path)
     index_add(index, user_id, message_id, channel_id=channel_id)
-    return save_index(index, path)
+    # index_add mutated the shared cached dict, but this is synchronous code
+    # with no reader in between; save_index below either commits the mutation
+    # (and add_record re-primes the cache) or, on failure, invalidates the
+    # entry so the next read reloads the untouched on-disk file.
+    ok = save_index(index, path)
+    if ok:
+        # Re-prime the cache with the just-written index so the next read
+        # (typically the record edit that follows immediately) skips the
+        # disk read + parse entirely.
+        p = Path(path)
+        _cache[str(p)] = (_stat_signature(p), index)
+    return ok
 
 
 def get_record_message_ids(
     user_id: int, *, path: Path | str = RECORDS_INDEX_PATH
 ) -> list[int]:
     """Return the record message IDs for ``user_id`` (newest appended last)."""
-    index = load_index(path)
+    index = _load_cached(path)
     raw = index.get("users", {}).get(str(user_id), [])
     out: list[int] = []
     for mid in raw:
@@ -130,7 +183,7 @@ def get_record_message_ids(
 
 def get_channel_id(*, path: Path | str = RECORDS_INDEX_PATH) -> int | None:
     """Return the records channel ID stored in the index, if any."""
-    cid = load_index(path).get("channel_id")
+    cid = _load_cached(path).get("channel_id")
     try:
         return int(cid) if cid is not None else None
     except (TypeError, ValueError):
