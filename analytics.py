@@ -844,8 +844,10 @@ def summary() -> dict:
     # Slow path: take the write lock only for init + the snapshot
     # double-check, then run the read-only aggregation queries OUTSIDE it
     # (they use the dedicated read connection; WAL lets them run concurrently
-    # with writes). Two threads may occasionally both recompute — harmless —
-    # but telemetry writes are never blocked behind the ~7 queries.
+    # with writes). Two threads may occasionally both recompute and race the
+    # snapshot store — last-writer-wins is fine (both results are valid and
+    # the assignment is a single atomic reference store) — but telemetry
+    # writes are never blocked behind the ~7 queries.
     with _lock:
         _init()
         if _disabled:

@@ -152,6 +152,10 @@ def add_record(
     """
     index = _load_cached(path)
     index_add(index, user_id, message_id, channel_id=channel_id)
+    # index_add mutated the shared cached dict, but this is synchronous code
+    # with no reader in between; save_index below either commits the mutation
+    # (and add_record re-primes the cache) or, on failure, invalidates the
+    # entry so the next read reloads the untouched on-disk file.
     ok = save_index(index, path)
     if ok:
         # Re-prime the cache with the just-written index so the next read
