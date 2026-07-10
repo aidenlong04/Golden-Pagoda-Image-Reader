@@ -40,3 +40,20 @@ def get_or_create_lock(lock_map: dict[Any, asyncio.Lock], key: Any) -> asyncio.L
         lock = asyncio.Lock()
         lock_map[key] = lock
     return lock
+
+
+def prune_lock_if_unused(lock_map: dict[Any, asyncio.Lock], key: Any) -> None:
+    """Drop ``key``'s lock from ``lock_map`` when nothing holds or awaits it.
+
+    Call after releasing a lock obtained via ``get_or_create_lock`` so the map
+    stays bounded instead of accumulating one idle ``asyncio.Lock`` per key
+    forever. Skips locks that are held or have queued waiters — a waiter still
+    holds a reference to the mapped lock, and pruning it would let a later
+    caller mint a second lock for the same key (breaking mutual exclusion).
+    """
+    lock = lock_map.get(key)
+    if lock is None or lock.locked():
+        return
+    if getattr(lock, "_waiters", None):
+        return
+    del lock_map[key]

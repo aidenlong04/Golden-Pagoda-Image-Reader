@@ -50,7 +50,6 @@ _conn: sqlite3.Connection | None = None
 # Separate read-only connection for analytics queries (summary, profile
 # reads). WAL mode allows concurrent readers without blocking the writer
 # at all, so a dedicated reader never delays writes.
-_read_lock = threading.Lock()
 _read_conn: sqlite3.Connection | None = None
 
 # Summary snapshot cache — avoids re-running ~7 SQL queries on every
@@ -750,9 +749,10 @@ def _empty_summary() -> dict:
 def _compute_summary() -> dict:
     """Run the actual SQL queries and return a fresh summary dict.
 
-    Must be called with ``_lock`` held (or from a context where no concurrent
-    writes are possible).  Uses ``_connect_read`` to avoid blocking the write
-    lock while running the ~7 aggregation queries.
+    Uses ``_connect_read`` (a dedicated read-only connection; WAL lets it run
+    concurrently with the writer), so callers must NOT hold the write
+    ``_lock`` while this runs — holding it would block every telemetry write
+    for the duration of the ~7 aggregation queries.
     """
     out: dict = _empty_summary()
     try:
@@ -841,7 +841,11 @@ def summary() -> dict:
     if _disabled:
         return _empty_summary()
 
-    # Slow path: recompute under the write lock, then update the cache.
+    # Slow path: take the write lock only for init + the snapshot
+    # double-check, then run the read-only aggregation queries OUTSIDE it
+    # (they use the dedicated read connection; WAL lets them run concurrently
+    # with writes). Two threads may occasionally both recompute — harmless —
+    # but telemetry writes are never blocked behind the ~7 queries.
     with _lock:
         _init()
         if _disabled:
@@ -850,6 +854,6 @@ def summary() -> dict:
         snap = _summary_snapshot
         if snap is not None and (time.time() - snap[1]) < ANALYTICS_SUMMARY_TTL:
             return snap[0]
-        result = _compute_summary()
-        _summary_snapshot = (result, time.time())
-        return result
+    result = _compute_summary()
+    _summary_snapshot = (result, time.time())
+    return result

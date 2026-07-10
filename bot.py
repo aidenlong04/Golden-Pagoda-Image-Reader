@@ -11,6 +11,7 @@ import re
 import sys
 import time
 import warnings
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from typing import NamedTuple
@@ -63,6 +64,7 @@ from gpbot.components_v2 import (
 )
 from gpbot.concurrency import (
     get_or_create_lock,
+    prune_lock_if_unused,
     run_heavy_job,
     spawn_bg_task as _spawn_bg_task_impl,
 )
@@ -3189,6 +3191,9 @@ async def _edit_or_create_member_record(
                 mastery_rank=mastery_rank,
                 summary_lines=summary_lines,
             )
+        # Keep the per-member lock map bounded: drop the lock now that it is
+        # released, unless another writer already holds or awaits it.
+        prune_lock_if_unused(_RECORD_WRITE_LOCKS, member.id)
     except Exception:
         logger.exception(
             "records: edit_or_create failed for %s", member.id
@@ -3239,8 +3244,12 @@ def _member_record_jump_urls(guild_id: int, user_id: int) -> list[str]:
 #     from the Discord CDN (`_edit_member_record`); and
 #   * the staff "Verify" button on a halted "not affiliated" submission OCRs the
 #     cached screenshot to assign roles (the submission itself runs no OCR).
-# The entry is evicted when the member leaves the server (`on_member_remove`).
-_screenshot_cache: dict[int, bytes] = {}
+# The entry is evicted when the member leaves the server (`on_member_remove`),
+# and the cache is LRU-bounded (`_SCREENSHOT_CACHE_MAX`) so members who never
+# leave can't grow it forever — it's purely a CDN-refetch optimization, so
+# evicting the least-recently-used entry only costs a later CDN round-trip.
+_SCREENSHOT_CACHE_MAX = 100
+_screenshot_cache: "OrderedDict[int, bytes]" = OrderedDict()
 
 
 def _cache_screenshot(user_id: int, image_bytes: bytes | None) -> None:
@@ -3251,11 +3260,17 @@ def _cache_screenshot(user_id: int, image_bytes: bytes | None) -> None:
     """
     if image_bytes:
         _screenshot_cache[user_id] = image_bytes
+        _screenshot_cache.move_to_end(user_id)
+        while len(_screenshot_cache) > _SCREENSHOT_CACHE_MAX:
+            _screenshot_cache.popitem(last=False)
 
 
 def _get_cached_screenshot(user_id: int) -> bytes | None:
     """Return the member's most recent cached screenshot bytes, if any."""
-    return _screenshot_cache.get(user_id)
+    image_bytes = _screenshot_cache.get(user_id)
+    if image_bytes is not None:
+        _screenshot_cache.move_to_end(user_id)
+    return image_bytes
 
 
 def _evict_cached_screenshot(user_id: int) -> None:
