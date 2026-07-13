@@ -215,7 +215,7 @@ class WatchState:
         return cls(
             enabled=_int_env(ENV_ENABLED) == 1,
             channel_id=_int_env(ENV_CHANNEL),
-            codeword=(os.getenv(ENV_CODEWORD) or "").strip(),
+            codeword=normalize_codeword(os.getenv(ENV_CODEWORD)),
             admin_ids=set(_csv_ids(ENV_ADMIN_IDS)),
             current_fish=fish,
         )
@@ -254,7 +254,21 @@ class Verdict:
     quality: str | None = None
 
 
+# Characters that can't appear in an OCR transcript and render invisibly (or
+# as markdown noise) in the error message: markdown backticks/quotes pasted
+# around the word, plus zero-width/invisible unicode Discord inputs can carry.
+# A codeword containing these is unpassable AND shows as "codeword ``" in the
+# rejection reply — normalize them away at every entry point.
+_CODEWORD_JUNK_RE = re.compile(r"[`\"'\u200b\u200c\u200d\u2060\ufeff]")
+
+
+def normalize_codeword(raw: str | None) -> str:
+    """Sanitize a configured codeword (modal input / .env value)."""
+    return _CODEWORD_JUNK_RE.sub("", raw or "").strip()
+
+
 def _contains_codeword(text: str, codeword: str) -> bool:
+    codeword = normalize_codeword(codeword)
     if not codeword:
         return True
     pattern = re.compile(
@@ -305,6 +319,7 @@ def problem_messages(
                 "Retry with a clearer image."
             )
         elif problem == PROBLEM_CODEWORD:
+            codeword = normalize_codeword(codeword)
             if codeword:
                 out.append(
                     f"The codeword `{codeword}` is not in your screenshot. "

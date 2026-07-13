@@ -6895,7 +6895,9 @@ class _WatchCodewordModal(_GPModal):
                     "Operator, you can't use this.", ephemeral=True
                 )
             return
-        _WATCH_STATE.codeword = (self.codeword_input.value or "").strip()
+        _WATCH_STATE.codeword = fishwatch.normalize_codeword(
+            self.codeword_input.value
+        )
         await asyncio.to_thread(_persist_watch_state)
         await _interaction_callback(interaction, 7, _watch_components())
 

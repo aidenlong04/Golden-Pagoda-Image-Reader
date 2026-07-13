@@ -143,6 +143,35 @@ def test_evaluate_no_codeword_configured():
     assert v.ok
 
 
+def test_normalize_codeword_strips_junk():
+    assert fishwatch.normalize_codeword("`cerebral`") == "cerebral"
+    assert fishwatch.normalize_codeword('"cerebral"') == "cerebral"
+    assert fishwatch.normalize_codeword(" cerebral ") == "cerebral"
+    assert fishwatch.normalize_codeword("\u200bcerebral\u200b") == "cerebral"
+    assert fishwatch.normalize_codeword("``") == ""
+    assert fishwatch.normalize_codeword(None) == ""
+
+
+def test_evaluate_codeword_with_pasted_backticks_still_matches():
+    # A codeword pasted with markdown backticks must still match the plain
+    # OCR text instead of becoming unpassable.
+    text = "Norg\nchat: cerebral"
+    v = evaluate_submission(text, codeword="`cerebral`", expected_fish="Norg")
+    assert v.ok
+
+
+def test_evaluate_junk_only_codeword_treated_as_unset():
+    v = evaluate_submission("Norg 39.9 kg", codeword="``", expected_fish="Norg")
+    assert v.ok
+
+
+def test_problem_messages_never_render_empty_codeword():
+    v = fishwatch.Verdict(False, (PROBLEM_CODEWORD,), "Norg")
+    msgs = problem_messages(v, codeword="\u200b`", expected_fish=None)
+    assert "``" not in " ".join(msgs)
+    assert any("codeword is required" in m for m in msgs)
+
+
 def test_evaluate_wrong_fish():
     text = "Mawfish\nMedium\nchat: cerebral"
     v = evaluate_submission(text, codeword="cerebral", expected_fish="Norg")
