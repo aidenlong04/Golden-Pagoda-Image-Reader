@@ -280,20 +280,27 @@ def problem_messages(
     for problem in verdict.problems:
         if problem == PROBLEM_UNREADABLE:
             out.append(
-                "The screenshot is too low quality to read — the text is "
-                "not visible or is illegible. Please retry with a new, "
-                "clearer image."
+                "**Submission rejected — unreadable screenshot**\n"
+                "The screenshot text is not visible or is illegible.\n"
+                "-# Retry with a new, clearer image."
             )
         elif problem == PROBLEM_CODEWORD:
-            out.append(
-                "The codeword is required. Make sure the current codeword "
-                "is visible in your chat box and submit a new screenshot."
-                if codeword_set
-                else "The codeword is required."
-            )
+            if codeword_set:
+                out.append(
+                    "**Submission rejected — codeword missing**\n"
+                    "The current codeword was not found in your screenshot.\n"
+                    "-# Make sure the codeword is visible in your chat box "
+                    "and submit a new screenshot."
+                )
+            else:
+                out.append(
+                    "**Submission rejected — codeword missing**\n"
+                    "-# A codeword is required."
+                )
         elif problem == PROBLEM_WRONG_FISH:
             out.append(
-                f"That's a **{verdict.fish}** — the fish being watched is "
-                f"**{expected_fish}**. Submit a {expected_fish} screenshot."
+                "**Submission rejected — wrong fish**\n"
+                f"Detected: `{verdict.fish}` — Expected: `{expected_fish}`\n"
+                f"-# Submit a {expected_fish} screenshot."
             )
     return out

@@ -161,12 +161,21 @@ def test_problem_messages_cover_all_problems():
     v = evaluate_submission("Mawfish", codeword="cerebral", expected_fish="Norg")
     msgs = problem_messages(v, codeword_set=True, expected_fish="Norg")
     joined = " ".join(msgs)
-    assert "codeword is required" in joined
+    assert "codeword missing" in joined
     assert "Norg" in joined and "Mawfish" in joined
 
     v2 = evaluate_submission("", codeword="", expected_fish=None)
     msgs2 = problem_messages(v2, codeword_set=False, expected_fish=None)
-    assert any("retry with a new" in m for m in msgs2)
+    assert any("Retry" in m for m in msgs2)
+
+    # No emoji characters in any error message.
+    import re
+    _EMOJI_RE = re.compile(
+        r"[\U0001F000-\U0001FFFF\u2600-\u27BF\u2B00-\u2BFF\u274C\u2705]"
+    )
+    all_msgs = msgs + msgs2
+    for m in all_msgs:
+        assert not _EMOJI_RE.search(m), f"Emoji found in message: {m!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +309,7 @@ def test_process_watch_submission_fail_then_pass(monkeypatch):
     assert bot._watch_error_replies[7] == [9001]
     msg.add_reaction.assert_awaited_with("\u274C")
     body = posted[0][1][0]["components"][0]["content"]
-    assert "retry" in body
+    assert "Retry" in body
 
     # 2) Wrong fish + codeword present.
     ocr_text["value"] = "Mawfish\nLarge\nchat: cerebral"

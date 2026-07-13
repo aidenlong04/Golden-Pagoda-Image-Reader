@@ -7027,7 +7027,7 @@ async def _process_watch_submission(
     lines = fishwatch.problem_messages(
         verdict, codeword_set=bool(codeword), expected_fish=expected_fish
     )
-    body = f"<@{user_id}>\n" + "\n".join(f"\u274C {line}" for line in lines)
+    body = f"<@{user_id}>\n" + "\n\n".join(lines)
     reply_id = await _post_channel_v2(
         channel_id,
         [{"type": 17, "accent_color": ACCENT_FAIL,
