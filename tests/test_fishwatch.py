@@ -221,8 +221,8 @@ def test_watch_prompt_lists_every_fish():
     prompt = build_watch_prompt()
     for fish in FISH:
         assert fish.name in prompt
-    assert "green" in prompt
     assert "chat" in prompt
+    assert "green" not in prompt.lower()
 
 
 # ---------------------------------------------------------------------------

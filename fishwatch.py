@@ -149,8 +149,10 @@ def build_watch_prompt() -> str:
     Built from the annotated training screenshot provided with the feature
     request: the caught fish's name renders letter-spaced at the top centre,
     its size (Small/Medium/Large) directly beneath, the weight in the
-    right-hand description block, and the session codeword is the
-    green-highlighted word in the chat box at the bottom left.
+    right-hand description block, and the session codeword appears
+    somewhere in the chat box at the bottom left. (The highlighting in
+    the reference image only marked where to look — submissions don't
+    need the codeword highlighted.)
     """
     names = ", ".join(f.name for f in FISH)
     return (
@@ -161,8 +163,8 @@ def build_watch_prompt() -> str:
         f"{names}; (2) the size word (Small, Medium or Large) directly "
         "under the fish name; (3) the weight in kg or quality in points "
         "from the description panel on the right; (4) every chat line in "
-        "the chat box at the bottom left, including any word highlighted "
-        "in green after the player name. Output only the raw transcribed "
+        "the chat box at the bottom left, including every word after "
+        "each player name. Output only the raw transcribed "
         "text — no commentary, no markdown, no explanations."
     )
 
@@ -285,8 +287,7 @@ def problem_messages(
         elif problem == PROBLEM_CODEWORD:
             out.append(
                 "The codeword is required. Make sure the current codeword "
-                "is visible (highlighted in green in your chat box) and "
-                "submit a new screenshot."
+                "is visible in your chat box and submit a new screenshot."
                 if codeword_set
                 else "The codeword is required."
             )
