@@ -396,6 +396,61 @@ def test_fish_catch_idempotent_per_message(analytics_module):
     assert [r["weight"] for r in top["norg"]] == [12.5]
 
 
+def test_fish_catch_stores_quality(analytics_module):
+    a = analytics_module
+    a.record_fish_catch(
+        guild_id=2, channel_id=555, message_id=100, user_id=7,
+        fish="Norg", weight=39.9, unit="kg", quality="Large",
+    )
+    a.record_fish_catch(
+        guild_id=2, channel_id=555, message_id=101, user_id=8,
+        fish="Scrubber", weight=6.0, unit="points",
+    )
+    top = a.top_fish_catches(2)
+    assert top["norg"][0]["quality"] == "Large"
+    assert top["scrubber"][0]["quality"] is None
+
+
+def test_fish_catch_leaderboard_pagination(analytics_module):
+    a = analytics_module
+    catches = [
+        ("Norg", 39.9, "kg", "Large"),
+        ("Mawfish", 25.0, "kg", "Medium"),
+        ("Longwinder", 14.0, "points", "Adorned"),
+        ("Scrubber", 6.0, "points", None),
+    ]
+    for i, (fish, weight, unit, quality) in enumerate(catches):
+        a.record_fish_catch(
+            guild_id=2, channel_id=555, message_id=100 + i, user_id=10 + i,
+            fish=fish, weight=weight, unit=unit, quality=quality,
+            caught_ts=1000 + i,
+        )
+    rows, total = a.fish_catch_leaderboard(2, offset=0, limit=3)
+    assert total == 4
+    assert [r["weight"] for r in rows] == [39.9, 25.0, 14.0]
+    assert rows[0]["quality"] == "Large"
+    rows, total = a.fish_catch_leaderboard(2, offset=3, limit=3)
+    assert total == 4
+    assert [r["fish_name"] for r in rows] == ["Scrubber"]
+    assert rows[0]["quality"] is None
+    # Scoped per guild.
+    assert a.fish_catch_leaderboard(999) == ([], 0)
+
+
+def test_fish_catch_leaderboard_ties_first_submission_wins(analytics_module):
+    a = analytics_module
+    a.record_fish_catch(
+        guild_id=2, channel_id=555, message_id=201, user_id=11,
+        fish="Norg", weight=39.9, unit="kg", caught_ts=2000,
+    )
+    a.record_fish_catch(
+        guild_id=2, channel_id=555, message_id=200, user_id=10,
+        fish="Norg", weight=39.9, unit="kg", caught_ts=1000,
+    )
+    rows, _total = a.fish_catch_leaderboard(2)
+    assert [r["user_id"] for r in rows] == [10, 11]
+
+
 def test_delete_member_data_anonymizes_fish_catches(analytics_module):
     a = analytics_module
     a.record_fish_catch(

@@ -117,6 +117,25 @@ _POINTS_RE = re.compile(
 )
 
 
+# Catch quality tiers as they render under the fish name on a catch:
+# Small/Medium/Large for weighed fish, Basic/Adorned/Magnificent for
+# servofish quality.
+_QUALITY_RE = re.compile(
+    r"(?<![A-Za-z])(Small|Medium|Large|Basic|Adorned|Magnificent)"
+    r"(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def extract_quality(text: str) -> str | None:
+    """Pull the catch quality tier (e.g. ``Large`` or ``Adorned``) out of
+    an OCR transcript, or ``None`` when no tier word appears."""
+    if not text:
+        return None
+    m = _QUALITY_RE.search(text)
+    return m.group(1).capitalize() if m else None
+
+
 def extract_weight(text: str, fish_name: str) -> float | None:
     """Pull the caught weight (kg) or quality (points) out of an OCR
     transcript, matched against the unit the species is measured in.
@@ -232,6 +251,7 @@ class Verdict:
     fish: str | None
     weight: float | None = None
     unit: str | None = None
+    quality: str | None = None
 
 
 def _contains_codeword(text: str, codeword: str) -> bool:
@@ -269,6 +289,7 @@ def evaluate_submission(
     return Verdict(
         not problems, tuple(problems), fish,
         weight=weight, unit=fish_unit(fish) if weight is not None else None,
+        quality=extract_quality(text),
     )
 
 
