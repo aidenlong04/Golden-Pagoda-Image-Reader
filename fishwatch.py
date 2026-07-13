@@ -121,11 +121,11 @@ def build_watch_prompt() -> str:
         "line by line. Pay special attention to: (1) the fish name shown "
         "letter-spaced at the top centre of the screen — it is one of: "
         f"{names}; (2) the size word (Small, Medium or Large) directly "
-        "under the fish name; (3) the weight in kg from the description "
-        "panel on the right; (4) every chat line in the chat box at the "
-        "bottom left, including any word highlighted in green after the "
-        "player name. Output only the raw transcribed text — no "
-        "commentary, no markdown, no explanations."
+        "under the fish name; (3) the weight in kg or quality in points "
+        "from the description panel on the right; (4) every chat line in "
+        "the chat box at the bottom left, including any word highlighted "
+        "in green after the player name. Output only the raw transcribed "
+        "text — no commentary, no markdown, no explanations."
     )
 
 

@@ -373,7 +373,10 @@ def _ocr_with_prompt(
     prompt hash into the image hash so prompt changes never collide with the
     profile-OCR cache entries for the same bytes.
     """
-    key = _cache_key(hashlib.sha256(prompt.encode("utf-8")).digest() + image_bytes)
+    key = _cache_key(
+        hashlib.sha256(prompt.encode("utf-8")).digest()
+        + hashlib.sha256(image_bytes).digest()
+    )
     cached = _cache_get(key)
     if cached is not None:
         return cached

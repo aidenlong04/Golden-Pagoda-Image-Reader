@@ -1,9 +1,13 @@
 """Tests for fishwatch.py — the /watch fish-submission rules."""
 from __future__ import annotations
 
-import os
+import asyncio
+import io
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from PIL import Image
 
 import fishwatch
 from fishwatch import (
@@ -224,16 +228,7 @@ def test_watch_prompt_lists_every_fish():
 # bot.py watcher integration (stubbed Discord I/O)
 # ---------------------------------------------------------------------------
 
-import asyncio  # noqa: E402
-from types import SimpleNamespace  # noqa: E402
-from unittest.mock import AsyncMock  # noqa: E402
-
 # A 1x1 PNG so validate_image_bytes passes.
-import io  # noqa: E402
-
-from PIL import Image  # noqa: E402
-
-
 def _png_1px() -> bytes:
     buf = io.BytesIO()
     Image.new("RGB", (1, 1)).save(buf, format="PNG")

@@ -6905,7 +6905,10 @@ async def _process_watch_submission(
         mention_user_ids=[user_id],
     )
     if reply_id and _WATCH_STATE.enabled:
-        _watch_error_replies[user_id] = [reply_id]
+        # Append (not replace): concurrent in-flight submissions from the
+        # same member must all stay tracked so the next attempt cleans up
+        # every outstanding error reply.
+        _watch_error_replies.setdefault(user_id, []).append(reply_id)
 
 
 @client.event
