@@ -197,7 +197,7 @@ def test_problem_messages_cover_all_problems():
     msgs = problem_messages(v, codeword="cerebral", expected_fish="Norg")
     joined = " ".join(msgs)
     assert "codeword `cerebral` is not in your screenshot" in joined
-    assert "Current fish is `Norg`" in joined
+    assert "but the current fish is `Norg`" in joined
     assert "You submitted `Mawfish`" in joined
 
     v2 = evaluate_submission("", codeword="", expected_fish=None)
