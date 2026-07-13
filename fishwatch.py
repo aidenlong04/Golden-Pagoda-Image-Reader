@@ -301,27 +301,22 @@ def problem_messages(
     for problem in verdict.problems:
         if problem == PROBLEM_UNREADABLE:
             out.append(
-                "**Submission rejected — unreadable screenshot**\n"
-                "The screenshot text is not visible or is illegible.\n"
-                "-# Retry with a new, clearer image."
+                "Could not read your screenshot. "
+                "Retry with a clearer image."
             )
         elif problem == PROBLEM_CODEWORD:
             if codeword_set:
                 out.append(
-                    "**Submission rejected — codeword missing**\n"
-                    "The current codeword was not found in your screenshot.\n"
-                    "-# Make sure the codeword is visible in your chat box "
-                    "and submit a new screenshot."
+                    "The codeword is not in your screenshot. "
+                    "Type it in chat so it shows on screen, "
+                    "then submit a new screenshot."
                 )
             else:
-                out.append(
-                    "**Submission rejected — codeword missing**\n"
-                    "-# A codeword is required."
-                )
+                out.append("A codeword is required.")
         elif problem == PROBLEM_WRONG_FISH:
             out.append(
-                "**Submission rejected — wrong fish**\n"
-                f"Detected: `{verdict.fish}` — Expected: `{expected_fish}`\n"
-                f"-# Submit a {expected_fish} screenshot."
+                f"Wrong fish: you submitted `{verdict.fish}`, "
+                f"but the watch is for `{expected_fish}`. "
+                f"Submit a {expected_fish} screenshot."
             )
     return out

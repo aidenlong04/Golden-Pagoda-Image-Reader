@@ -167,7 +167,7 @@ def test_problem_messages_cover_all_problems():
     v = evaluate_submission("Mawfish", codeword="cerebral", expected_fish="Norg")
     msgs = problem_messages(v, codeword_set=True, expected_fish="Norg")
     joined = " ".join(msgs)
-    assert "codeword missing" in joined
+    assert "codeword is not in your screenshot" in joined
     assert "Norg" in joined and "Mawfish" in joined
 
     v2 = evaluate_submission("", codeword="", expected_fish=None)
