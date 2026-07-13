@@ -332,7 +332,7 @@ def problem_messages(
         elif problem == PROBLEM_WRONG_FISH:
             out.append(
                 f"You submitted `{verdict.fish}`, "
-                f"Current fish is `{expected_fish}`. "
+                f"but the current fish is `{expected_fish}`. "
                 "Please submit the correct fish."
             )
     return out
