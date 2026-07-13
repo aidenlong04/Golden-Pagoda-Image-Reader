@@ -256,8 +256,9 @@ class Verdict:
 
 # Characters that can't appear in an OCR transcript and render invisibly (or
 # as markdown noise) in the error message: markdown backticks/quotes pasted
-# around the word, plus zero-width/invisible unicode Discord inputs can carry.
-# A codeword containing these is unpassable AND shows as "codeword ``" in the
+# around the word, plus zero-width/invisible unicode Discord inputs can carry
+# (U+200B/C/D zero-width space/non-joiner/joiner, U+2060 word joiner,
+# U+FEFF zero-width no-break space/BOM). A codeword containing these is unpassable AND shows as "codeword ``" in the
 # rejection reply — normalize them away at every entry point.
 _CODEWORD_JUNK_RE = re.compile(r"[`\"'\u200b\u200c\u200d\u2060\ufeff]")
 
