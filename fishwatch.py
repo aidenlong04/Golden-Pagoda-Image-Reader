@@ -101,6 +101,44 @@ def canonical_fish(name: str) -> str | None:
     return fish.name if fish else None
 
 
+def fish_unit(fish_name: str) -> str:
+    """The measurement unit for a fish: ``"kg"`` (weight) or ``"points"``."""
+    fish = FISH_BY_KEY.get((fish_name or "").strip().casefold())
+    if fish and fish.quality.endswith("points"):
+        return "points"
+    return "kg"
+
+
+_WEIGHT_KG_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*kg(?![A-Za-z])", re.IGNORECASE
+)
+_POINTS_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*(?:points?|pts?)(?![A-Za-z])", re.IGNORECASE
+)
+
+
+def extract_weight(text: str, fish_name: str) -> float | None:
+    """Pull the caught weight (kg) or quality (points) out of an OCR
+    transcript, matched against the unit the species is measured in.
+
+    Returns the first plausible number for the fish's unit, or ``None``
+    when the transcript carries no readable measurement (submissions still
+    pass — the measurement only feeds the /watch records leaderboard).
+    """
+    if not text:
+        return None
+    pattern = _POINTS_RE if fish_unit(fish_name) == "points" else _WEIGHT_KG_RE
+    for m in pattern.finditer(text):
+        try:
+            value = float(m.group(1).replace(",", "."))
+        except ValueError:
+            continue
+        # Reject junk OCR digits: zero/negative or absurdly large values.
+        if 0 < value < 1000:
+            return value
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Vision-model OCR prompt
 # ---------------------------------------------------------------------------
@@ -190,6 +228,8 @@ class Verdict:
     ok: bool
     problems: tuple[str, ...]
     fish: str | None
+    weight: float | None = None
+    unit: str | None = None
 
 
 def _contains_codeword(text: str, codeword: str) -> bool:
@@ -223,7 +263,11 @@ def evaluate_submission(
         problems.append(PROBLEM_CODEWORD)
     if expected_fish and fish.casefold() != expected_fish.casefold():
         problems.append(PROBLEM_WRONG_FISH)
-    return Verdict(not problems, tuple(problems), fish)
+    weight = extract_weight(text, fish)
+    return Verdict(
+        not problems, tuple(problems), fish,
+        weight=weight, unit=fish_unit(fish) if weight is not None else None,
+    )
 
 
 def problem_messages(

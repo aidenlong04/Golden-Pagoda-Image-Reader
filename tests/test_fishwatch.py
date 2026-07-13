@@ -238,11 +238,12 @@ def _png_1px() -> bytes:
 _PNG_1PX = _png_1px()
 
 
-def _fake_message(*, author_id=7, channel_id=555, message_id=42):
+def _fake_message(*, author_id=7, channel_id=555, message_id=42, guild_id=1):
     return SimpleNamespace(
         id=message_id,
         author=SimpleNamespace(id=author_id, bot=False),
         channel=SimpleNamespace(id=channel_id),
+        guild=SimpleNamespace(id=guild_id),
         add_reaction=AsyncMock(),
     )
 
@@ -278,6 +279,11 @@ def test_process_watch_submission_fail_then_pass(monkeypatch):
     monkeypatch.setattr(bot, "_run_heavy", fake_run_heavy)
     monkeypatch.setattr(bot, "_watch_error_replies", {})
     monkeypatch.setattr(bot._WATCH_STATE, "enabled", True)
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        bot.analytics, "record_fish_catch",
+        lambda **kw: recorded.append(kw),
+    )
 
     msg = _fake_message()
     att = _fake_attachment(_PNG_1PX)
@@ -314,6 +320,12 @@ def test_process_watch_submission_fail_then_pass(monkeypatch):
     assert 7 not in bot._watch_error_replies
     msg3.add_reaction.assert_awaited_with("\u2705")
     assert len(posted) == 2  # no new error reply
+    # The measured weight was recorded for the leaderboard.
+    assert len(recorded) == 1
+    assert recorded[0]["fish"] == "Norg"
+    assert recorded[0]["weight"] == pytest.approx(39.9)
+    assert recorded[0]["unit"] == "kg"
+    assert recorded[0]["message_id"] == 44
 
 
 def test_watch_components_and_state(monkeypatch):
@@ -327,11 +339,97 @@ def test_watch_components_and_state(monkeypatch):
         ),
     )
     comps = bot._watch_components()
-    assert comps[0]["content"].endswith("Fish Watch")
-    row = comps[1]["components"][-1]["components"]
-    ids = [b["custom_id"] for b in row]
-    assert ids[:4] == [
+    assert "Fish Watch" in comps[0]["content"]
+    rows = comps[1]["components"]
+    ids = [b["custom_id"] for b in rows[1]["components"]]
+    assert ids == [
         "watch:start", "watch:stop", "watch:codeword", "watch:admins",
+    ]
+    nav_ids = [b["custom_id"] for b in rows[2]["components"]]
+    assert nav_ids == [
+        "watch:page:-1", "watch:noop", "watch:page:1", "watch:page:0",
     ]
     body = comps[1]["components"][0]["content"]
     assert "cerebral" in body and "Norg" in body and "<#555>" in body
+
+
+# ---------------------------------------------------------------------------
+# Weight extraction + Records leaderboard page
+# ---------------------------------------------------------------------------
+
+def test_extract_weight_kg():
+    text = "N o r g\nLarge\n24.35 kg\nchat: cerebral"
+    assert fishwatch.extract_weight(text, "Norg") == pytest.approx(24.35)
+
+
+def test_extract_weight_points_for_servofish():
+    text = "Longwinder\nMedium\n14 points\nchat: cerebral"
+    assert fishwatch.extract_weight(text, "Longwinder") == pytest.approx(14)
+    # A kg figure does not satisfy a points-measured species.
+    assert fishwatch.extract_weight("Longwinder 14 kg", "Longwinder") is None
+
+
+def test_extract_weight_rejects_junk():
+    assert fishwatch.extract_weight("", "Norg") is None
+    assert fishwatch.extract_weight("Norg Large", "Norg") is None
+    assert fishwatch.extract_weight("Norg 0 kg", "Norg") is None
+    assert fishwatch.extract_weight("Norg 99999 kg", "Norg") is None
+
+
+def test_fish_unit():
+    assert fishwatch.fish_unit("Norg") == "kg"
+    assert fishwatch.fish_unit("Scrubber") == "points"
+
+
+def test_evaluate_submission_carries_weight():
+    v = evaluate_submission(
+        "Norg\nLarge\n39.9 kg\nchat: cerebral",
+        codeword="cerebral", expected_fish="Norg",
+    )
+    assert v.ok and v.weight == pytest.approx(39.9) and v.unit == "kg"
+    v2 = evaluate_submission(
+        "Norg\nLarge\nchat: cerebral",
+        codeword="cerebral", expected_fish="Norg",
+    )
+    assert v2.ok and v2.weight is None and v2.unit is None
+
+
+def test_watch_records_page_empty(monkeypatch):
+    import bot
+
+    comps = bot._watch_components(1, guild_id=1, top={})
+    assert "Records" in comps[0]["content"]
+    body = comps[1]["components"][0]["content"]
+    assert "No catches recorded yet" in body
+    nav_ids = [b["custom_id"] for b in comps[1]["components"][-1]["components"]]
+    assert nav_ids == [
+        "watch:page:0", "watch:noop", "watch:page:2", "watch:page:1",
+    ]
+
+
+def test_watch_records_page_lists_top_catches():
+    import bot
+
+    top = {
+        "norg": [
+            {"fish_name": "Norg", "weight": 39.9, "unit": "kg",
+             "user_id": 7, "channel_id": 555, "message_id": 44,
+             "caught_ts": 1},
+            {"fish_name": "Norg", "weight": 30.0, "unit": "kg",
+             "user_id": None, "channel_id": 555, "message_id": 45,
+             "caught_ts": 2},
+        ],
+        "longwinder": [
+            {"fish_name": "Longwinder", "weight": 14.0, "unit": "points",
+             "user_id": 8, "channel_id": 555, "message_id": 46,
+             "caught_ts": 3},
+        ],
+    }
+    comps = bot._watch_components(1, guild_id=99, top=top)
+    body = comps[1]["components"][0]["content"]
+    assert "Norg" in body and "39.9 kg" in body and "30 kg" in body
+    assert "<@7>" in body and "former member" in body
+    assert "14 points" in body
+    assert "https://discord.com/channels/99/555/44" in body
+    # Fish with no recorded catches are omitted.
+    assert "Mawfish" not in body

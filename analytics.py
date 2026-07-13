@@ -209,6 +209,22 @@ def _init() -> None:
                     updated_ts INTEGER NOT NULL,
                     PRIMARY KEY (guild_id, user_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS fish_catches (
+                    id INTEGER PRIMARY KEY,
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    user_id INTEGER,
+                    fish_key TEXT NOT NULL,
+                    fish_name TEXT NOT NULL,
+                    weight REAL NOT NULL,
+                    unit TEXT NOT NULL,
+                    caught_ts INTEGER NOT NULL,
+                    UNIQUE (guild_id, message_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_fish_catches_top
+                    ON fish_catches(guild_id, fish_key, weight DESC);
                 """
             )
             conn.commit()
@@ -373,6 +389,98 @@ def revoke_title(*, guild_id: int, user_id: int, title: str) -> bool:
             return False
 
 
+def record_fish_catch(
+    *,
+    guild_id: int,
+    channel_id: int,
+    message_id: int,
+    user_id: int,
+    fish: str,
+    weight: float,
+    unit: str,
+    caught_ts: int | None = None,
+) -> None:
+    """Log one passing fish-watch submission's measured catch.
+
+    Idempotent per ``(guild_id, message_id)`` — re-processing the same
+    screenshot message refreshes the row instead of duplicating it.
+    Fail-soft like :func:`record_verification`.
+    """
+    fish = (fish or "").strip()
+    if not fish or weight is None:
+        return
+    if _disabled:
+        return
+    with _lock:
+        _init()
+        if _disabled:
+            return
+        try:
+            with _connect() as conn:
+                conn.execute(
+                    "INSERT INTO fish_catches"
+                    " (guild_id, channel_id, message_id, user_id,"
+                    "  fish_key, fish_name, weight, unit, caught_ts)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(guild_id, message_id) DO UPDATE SET"
+                    "  fish_key=excluded.fish_key,"
+                    "  fish_name=excluded.fish_name,"
+                    "  weight=excluded.weight,"
+                    "  unit=excluded.unit",
+                    (
+                        guild_id,
+                        channel_id,
+                        message_id,
+                        user_id,
+                        fish.casefold(),
+                        fish,
+                        float(weight),
+                        unit,
+                        int(caught_ts if caught_ts is not None else time.time()),
+                    ),
+                )
+                conn.commit()
+        except Exception:
+            logger.exception("analytics: record_fish_catch failed")
+
+
+def top_fish_catches(guild_id: int, per_fish: int = 3) -> dict[str, list[dict]]:
+    """The heaviest recorded catches per species for the /watch leaderboard.
+
+    Returns ``{fish_key: [row, ...]}`` with up to ``per_fish`` rows per
+    species ordered heaviest-first (ties broken oldest-first, so the first
+    member to reach a weight keeps the higher rank). Each row carries
+    ``fish_name`` / ``weight`` / ``unit`` / ``user_id`` / ``channel_id`` /
+    ``message_id`` / ``caught_ts``. Fail-soft: empty dict when disabled.
+    """
+    if _disabled:
+        return {}
+    with _lock:
+        _init()
+        if _disabled:
+            return {}
+        try:
+            with _connect() as conn:
+                rows = conn.execute(
+                    "SELECT fish_key, fish_name, weight, unit, user_id,"
+                    " channel_id, message_id, caught_ts FROM ("
+                    "  SELECT *, ROW_NUMBER() OVER ("
+                    "   PARTITION BY fish_key"
+                    "   ORDER BY weight DESC, caught_ts ASC, id ASC"
+                    "  ) AS rn FROM fish_catches WHERE guild_id=?"
+                    " ) WHERE rn <= ?"
+                    " ORDER BY fish_key, weight DESC, caught_ts ASC",
+                    (guild_id, int(per_fish)),
+                ).fetchall()
+        except Exception:
+            logger.exception("analytics: top_fish_catches failed")
+            return {}
+    out: dict[str, list[dict]] = {}
+    for row in rows:
+        out.setdefault(row["fish_key"], []).append(dict(row))
+    return out
+
+
 def get_member_profile(guild_id: int, user_id: int) -> dict | None:
     """Return a member's durable profile snapshot, or ``None`` when absent.
 
@@ -501,10 +609,13 @@ def delete_member_data(*, guild_id: int, user_id: int) -> dict:
     Fail-soft like the rest of the module.
 
     Returns a small audit dict ``{"titles", "events_anonymized",
-    "onboarding", "profile"}`` with the number of rows touched in each table
-    (all zero when disabled).
+    "onboarding", "profile", "fish_catches_anonymized"}`` with the number of
+    rows touched in each table (all zero when disabled).
     """
-    out = {"titles": 0, "events_anonymized": 0, "onboarding": 0, "profile": 0}
+    out = {
+        "titles": 0, "events_anonymized": 0, "onboarding": 0, "profile": 0,
+        "fish_catches_anonymized": 0,
+    }
     if _disabled:
         return out
     with _lock:
@@ -543,6 +654,12 @@ def delete_member_data(*, guild_id: int, user_id: int) -> dict:
                         (guild_id, user_id),
                     )
                     profile = cur.rowcount or 0
+                    cur = conn.execute(
+                        "UPDATE fish_catches SET user_id=NULL"
+                        " WHERE guild_id=? AND user_id=?",
+                        (guild_id, user_id),
+                    )
+                    fish_catches = cur.rowcount or 0
                     conn.execute("COMMIT")
                 except Exception:
                     conn.execute("ROLLBACK")
@@ -552,6 +669,7 @@ def delete_member_data(*, guild_id: int, user_id: int) -> dict:
                 out["events_anonymized"] = events
                 out["onboarding"] = onboarding
                 out["profile"] = profile
+                out["fish_catches_anonymized"] = fish_catches
             if out["events_anonymized"] or out["titles"]:
                 invalidate_summary_cache()
         except Exception:

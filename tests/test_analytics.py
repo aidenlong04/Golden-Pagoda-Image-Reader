@@ -210,7 +210,7 @@ def test_delete_member_data_scoped_to_user_and_guild(analytics_module):
 
 def test_delete_member_data_missing_is_zero(analytics_module):
     result = analytics_module.delete_member_data(guild_id=2, user_id=999)
-    assert result == {"titles": 0, "events_anonymized": 0, "onboarding": 0, "profile": 0}
+    assert result == {"titles": 0, "events_anonymized": 0, "onboarding": 0, "profile": 0, "fish_catches_anonymized": 0}
 
 
 def test_delete_member_data_fail_soft_when_disabled(tmp_path, monkeypatch):
@@ -219,7 +219,7 @@ def test_delete_member_data_fail_soft_when_disabled(tmp_path, monkeypatch):
     importlib.reload(analytics)
     # Must not raise; returns the zeroed audit dict.
     result = analytics.delete_member_data(guild_id=2, user_id=5)
-    assert result == {"titles": 0, "events_anonymized": 0, "onboarding": 0, "profile": 0}
+    assert result == {"titles": 0, "events_anonymized": 0, "onboarding": 0, "profile": 0, "fish_catches_anonymized": 0}
 
 
 def test_delete_member_data_is_atomic_on_failure(analytics_module, monkeypatch):
@@ -254,7 +254,7 @@ def test_delete_member_data_is_atomic_on_failure(analytics_module, monkeypatch):
     # connection; re-validate over a fresh real connection.
 
     # The whole purge must roll back: nothing reported, nothing deleted.
-    assert result == {"titles": 0, "events_anonymized": 0, "onboarding": 0, "profile": 0}
+    assert result == {"titles": 0, "events_anonymized": 0, "onboarding": 0, "profile": 0, "fish_catches_anonymized": 0}
     assert [t["title"] for t in a.list_member_titles(2, 5)] == ["keep me"]
     with a._connect() as conn:
         row = conn.execute(
@@ -331,3 +331,51 @@ def test_delete_member_data_clears_profile(analytics_module):
     assert a.get_member_profile(2, 5) is None
     # A different member in the same guild is untouched.
     assert a.get_member_profile(2, 6)["in_game_name"] == "Keep#2"
+
+
+def test_fish_catch_record_and_top(analytics_module):
+    a = analytics_module
+    catches = [
+        ("Norg", 30.0, 10), ("Norg", 39.9, 11), ("Norg", 25.0, 12),
+        ("Norg", 38.0, 13),
+        ("Longwinder", 14.0, 20),
+    ]
+    for i, (fish, weight, uid) in enumerate(catches):
+        a.record_fish_catch(
+            guild_id=2, channel_id=555, message_id=100 + i, user_id=uid,
+            fish=fish, weight=weight,
+            unit="points" if fish == "Longwinder" else "kg",
+            caught_ts=1000 + i,
+        )
+    top = a.top_fish_catches(2)
+    assert [r["weight"] for r in top["norg"]] == [39.9, 38.0, 30.0]
+    assert top["norg"][0]["user_id"] == 11
+    assert top["norg"][0]["channel_id"] == 555
+    assert [r["weight"] for r in top["longwinder"]] == [14.0]
+    assert top["longwinder"][0]["unit"] == "points"
+    # Scoped per guild.
+    assert a.top_fish_catches(999) == {}
+
+
+def test_fish_catch_idempotent_per_message(analytics_module):
+    a = analytics_module
+    for weight in (10.0, 12.5):
+        a.record_fish_catch(
+            guild_id=2, channel_id=555, message_id=100, user_id=7,
+            fish="Norg", weight=weight, unit="kg",
+        )
+    top = a.top_fish_catches(2)
+    assert [r["weight"] for r in top["norg"]] == [12.5]
+
+
+def test_delete_member_data_anonymizes_fish_catches(analytics_module):
+    a = analytics_module
+    a.record_fish_catch(
+        guild_id=2, channel_id=555, message_id=100, user_id=7,
+        fish="Norg", weight=39.9, unit="kg",
+    )
+    result = a.delete_member_data(guild_id=2, user_id=7)
+    assert result["fish_catches_anonymized"] == 1
+    top = a.top_fish_catches(2)
+    assert top["norg"][0]["user_id"] is None
+    assert top["norg"][0]["weight"] == 39.9

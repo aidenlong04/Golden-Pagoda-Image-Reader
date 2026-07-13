@@ -6630,11 +6630,99 @@ def _watch_fish_reference_lines() -> str:
     return "\n".join(parts)
 
 
-def _watch_components() -> list[dict]:
-    """The /watch panel: a single V2 container styled after /status with the
-    Start / Stop / Set codeword / Set admin button row."""
+# (page key, title) for the paginated /watch panel — page bodies are built
+# inline in _watch_components (they need the watch state / leaderboard).
+_WATCH_PAGES: list[tuple[str, str]] = [
+    ("watch",   "Watch"),
+    ("records", "Records"),
+]
+
+_WATCH_MEDALS = ("\U0001F947", "\U0001F948", "\U0001F949")  # gold/silver/bronze
+
+
+def _watch_nav_row(page: int) -> dict:
+    return _pagination_nav_row(
+        len(_WATCH_PAGES), page,
+        prev_id=f"watch:page:{page - 1}",
+        noop_id="watch:noop",
+        next_id=f"watch:page:{page + 1}",
+        refresh_id=f"watch:page:{page}",
+    )
+
+
+def _format_catch_weight(weight: float, unit: str) -> str:
+    return f"{weight:g} {unit}"
+
+
+def _watch_records_body(guild_id: int, top: dict[str, list[dict]]) -> str:
+    """The Records page: heaviest three catches per species, rebuilt from
+    the fish_catches table on every view so it always shows live data."""
+    if not top:
+        return (
+            "*No catches recorded yet — passing submissions with a readable "
+            "weight land here automatically.*"
+        )
+    parts: list[str] = [
+        "-# Top catches per species, from passing watch submissions. "
+        "Links jump to the submitted screenshot."
+    ]
+    for planet in fishwatch.PLANETS:
+        lines: list[str] = []
+        for f in fishwatch.FISH:
+            if f.planet != planet:
+                continue
+            entries = top.get(f.name.casefold())
+            if not entries:
+                continue
+            lines.append(f"**{f.name}** \u2014 max {f.quality}")
+            for rank, row in enumerate(entries[:len(_WATCH_MEDALS)]):
+                who = (
+                    f"<@{row['user_id']}>" if row.get("user_id")
+                    else "*former member*"
+                )
+                url = (
+                    f"https://discord.com/channels/{guild_id}/"
+                    f"{row['channel_id']}/{row['message_id']}"
+                )
+                lines.append(
+                    f"-# {_WATCH_MEDALS[rank]} "
+                    f"**{_format_catch_weight(row['weight'], row['unit'])}**"
+                    f" \u2014 {who} \u00B7 [view]({url})"
+                )
+        if lines:
+            parts.append(f"### {planet}")
+            parts.extend(lines)
+    return "\n".join(parts)
+
+
+def _watch_components(
+    page: int = 0,
+    *,
+    guild_id: int = 0,
+    top: dict[str, list[dict]] | None = None,
+) -> list[dict]:
+    """The /watch panel: a single V2 container styled after /status with a
+    Watch (config) page and a Records (top-catches leaderboard) page."""
+    page = max(0, min(page, len(_WATCH_PAGES) - 1))
+    key, title = _WATCH_PAGES[page]
+    nav_row = _watch_nav_row(page)
     state = _WATCH_STATE
     running = state.enabled and state.channel_id
+
+    if key == "records":
+        container_components: list[dict] = [
+            {"type": 10, "content": _watch_records_body(guild_id, top or {})},
+            nav_row,
+        ]
+        return [
+            {"type": 10, "content": f"### \U0001F3A3  Fish Watch \u2014 {title}"},
+            {
+                "type": 17,
+                "accent_color": ACCENT_PASS if running else ACCENT_FAIL,
+                "components": container_components,
+            },
+        ]
+
     status_line = (
         "\u2705 **Watching**" if running else "\u26D4 **Stopped**"
     )
@@ -6674,18 +6762,17 @@ def _watch_components() -> list[dict]:
              "custom_id": "watch:codeword"},
             {"type": 2, "style": 1, "label": "Set admin",
              "custom_id": "watch:admins"},
-            {"type": 2, "style": 2, "emoji": {"name": "\U0001F504"},
-             "custom_id": "watch:refresh"},
         ],
     }
     return [
-        {"type": 10, "content": "### \U0001F3A3  Fish Watch"},
+        {"type": 10, "content": f"### \U0001F3A3  Fish Watch \u2014 {title}"},
         {
             "type": 17,
             "accent_color": ACCENT_PASS if running else ACCENT_FAIL,
             "components": [
                 {"type": 10, "content": body},
                 button_row,
+                nav_row,
             ],
         },
     ]
@@ -6787,6 +6874,27 @@ async def _handle_watch_interaction(
             await _interaction_callback(interaction, 6, [])
         return
     action = custom_id.split(":", 1)[1] if ":" in custom_id else ""
+    if action == "noop":
+        with contextlib.suppress(Exception):
+            await _interaction_callback(interaction, 6, [])
+        return
+    if action.startswith("page:"):
+        try:
+            page = int(action.split(":", 1)[1])
+        except ValueError:
+            page = 0
+        page = max(0, min(page, len(_WATCH_PAGES) - 1))
+        top: dict[str, list[dict]] | None = None
+        if _WATCH_PAGES[page][0] == "records":
+            top = await asyncio.to_thread(
+                analytics.top_fish_catches, guild.id
+            )
+        with contextlib.suppress(Exception):
+            await _interaction_callback(
+                interaction, 7,
+                _watch_components(page, guild_id=guild.id, top=top),
+            )
+        return
     if action == "codeword":
         with contextlib.suppress(discord.HTTPException):
             await interaction.response.send_modal(_WatchCodewordModal())
@@ -6887,9 +6995,21 @@ async def _process_watch_submission(
     if verdict.ok:
         with contextlib.suppress(discord.HTTPException):
             await message.add_reaction("\u2705")
+        if verdict.weight is not None and message.guild is not None:
+            # Feed the /watch Records leaderboard (fail-soft, off-loop).
+            await asyncio.to_thread(
+                analytics.record_fish_catch,
+                guild_id=message.guild.id,
+                channel_id=channel_id,
+                message_id=message.id,
+                user_id=user_id,
+                fish=verdict.fish or "",
+                weight=verdict.weight,
+                unit=verdict.unit or "kg",
+            )
         logger.info(
-            "watch: %s passed (%s) for user %s",
-            message.id, verdict.fish, user_id,
+            "watch: %s passed (%s, %s) for user %s",
+            message.id, verdict.fish, verdict.weight, user_id,
         )
         return
     with contextlib.suppress(discord.HTTPException):

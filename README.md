@@ -157,8 +157,13 @@ full env reference.
   old bot error replies are deleted. Codeword changes only apply to newly
   sent images; **Stop** cleanly halts the watcher. The fish roster
   (names + max weight/quality, from `aidenlong04/warframe-item-pull`) covers
-  Earth, Venus and Deimos. State persists to `.env` (`FISH_WATCH_*`).
-  Requires **Manage Server**.
+  Earth, Venus and Deimos. The panel is paginated (Prev/Next/Refresh like
+  `/status`): a **Records** page shows a live leaderboard of the three
+  heaviest catches recorded per species (weight/points OCR'd from passing
+  submissions), each with the catcher and a jump link to the submitted
+  screenshot. Catches live in the analytics SQLite DB (`fish_catches`) and
+  are anonymised by the on-leave data purge. State persists to `.env`
+  (`FISH_WATCH_*`). Requires **Manage Server**.
 - `/manage member:<member>` — paginated ephemeral admin console (styled like
   `/status`, with Prev/Next/Refresh). The **Overview**, **Titles** and
   **Data & Clear** pages inspect a member's stored profile + titles and let
