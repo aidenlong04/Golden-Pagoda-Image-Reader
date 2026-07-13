@@ -150,7 +150,7 @@ full env reference.
   posted in the channel is OCR'd (fish-tuned Ollama vision prompt, with the
   usual OCR.space/Tesseract fallbacks) and checked: illegible/bad-quality
   screenshots get an ❌ react + a retry request; a missing or wrong codeword
-  (the word highlighted in green in the member's chat box) gets an ❌ react +
+  (the word must be visible in the member's chat box) gets an ❌ react +
   "codeword required"; and once a watch admin names a fish in the channel,
   submissions showing any other fish get an ❌ react + a wrong-fish error.
   A corrected submission that meets the criteria gets a ✅ and the member's

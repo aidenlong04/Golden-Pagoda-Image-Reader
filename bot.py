@@ -6789,8 +6789,8 @@ class _WatchCodewordModal(_GPModal):
     def __init__(self) -> None:
         super().__init__(title="watch \u2014 set codeword", timeout=600)
         self.add_item(discord.ui.TextDisplay(
-            "The word members must have highlighted in green in their "
-            "chat box. Applies to newly sent images only."
+            "The word members must have visible in their chat box. "
+            "Applies to newly sent images only."
         ))
         self.codeword_input = discord.ui.TextInput(
             default=_WATCH_STATE.codeword or None,
