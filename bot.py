@@ -7002,7 +7002,9 @@ async def _process_watch_submission(
             # Feed the /watch Records leaderboard (fail-soft, off-loop).
             # caught_ts is the message's post time — not OCR completion
             # time — so leaderboard ties go to the first submission even
-            # when concurrent OCR jobs finish out of order.
+            # when concurrent OCR jobs finish out of order. created_at is
+            # always set on a real discord.Message; the None fallback
+            # (record_fish_catch defaults to now) only covers doubles.
             created = getattr(message, "created_at", None)
             await asyncio.to_thread(
                 analytics.record_fish_catch,

@@ -444,6 +444,12 @@ def record_fish_catch(
             logger.exception("analytics: record_fish_catch failed")
 
 
+# Leaderboard ranking: heaviest first, ties to the first submission —
+# oldest caught_ts (post time), then lowest message_id (Discord snowflake,
+# so exact-second ties still go to the earlier submission).
+_FISH_RANK_ORDER = "weight DESC, caught_ts ASC, message_id ASC"
+
+
 def top_fish_catches(guild_id: int, per_fish: int = 3) -> dict[str, list[dict]]:
     """The heaviest recorded catches per species for the /watch leaderboard.
 
@@ -469,11 +475,10 @@ def top_fish_catches(guild_id: int, per_fish: int = 3) -> dict[str, list[dict]]:
                     " channel_id, message_id, caught_ts FROM ("
                     "  SELECT *, ROW_NUMBER() OVER ("
                     "   PARTITION BY fish_key"
-                    "   ORDER BY weight DESC, caught_ts ASC, message_id ASC"
+                    f"   ORDER BY {_FISH_RANK_ORDER}"
                     "  ) AS rn FROM fish_catches WHERE guild_id=?"
                     " ) WHERE rn <= ?"
-                    " ORDER BY fish_key, weight DESC, caught_ts ASC,"
-                    "  message_id ASC",
+                    f" ORDER BY fish_key, {_FISH_RANK_ORDER}",
                     (guild_id, int(per_fish)),
                 ).fetchall()
         except Exception:
