@@ -215,7 +215,7 @@ class WatchState:
         return cls(
             enabled=_int_env(ENV_ENABLED) == 1,
             channel_id=_int_env(ENV_CHANNEL),
-            codeword=(os.getenv(ENV_CODEWORD) or "").strip(),
+            codeword=normalize_codeword(os.getenv(ENV_CODEWORD)),
             admin_ids=set(_csv_ids(ENV_ADMIN_IDS)),
             current_fish=fish,
         )
@@ -254,7 +254,22 @@ class Verdict:
     quality: str | None = None
 
 
+# Characters that can't appear in an OCR transcript and render invisibly (or
+# as markdown noise) in the error message: markdown backticks/quotes pasted
+# around the word, plus zero-width/invisible unicode Discord inputs can carry
+# (U+200B/C/D zero-width space/non-joiner/joiner, U+2060 word joiner,
+# U+FEFF zero-width no-break space/BOM). A codeword containing these is unpassable AND shows as "codeword ``" in the
+# rejection reply — normalize them away at every entry point.
+_CODEWORD_JUNK_RE = re.compile(r"[`\"'\u200b\u200c\u200d\u2060\ufeff]")
+
+
+def normalize_codeword(raw: str | None) -> str:
+    """Sanitize a configured codeword (modal input / .env value)."""
+    return _CODEWORD_JUNK_RE.sub("", raw or "").strip()
+
+
 def _contains_codeword(text: str, codeword: str) -> bool:
+    codeword = normalize_codeword(codeword)
     if not codeword:
         return True
     pattern = re.compile(
@@ -294,34 +309,30 @@ def evaluate_submission(
 
 
 def problem_messages(
-    verdict: Verdict, *, codeword_set: bool, expected_fish: str | None
+    verdict: Verdict, *, codeword: str, expected_fish: str | None
 ) -> list[str]:
     """Human-readable error lines for a failing verdict."""
     out: list[str] = []
     for problem in verdict.problems:
         if problem == PROBLEM_UNREADABLE:
             out.append(
-                "**Submission rejected — unreadable screenshot**\n"
-                "The screenshot text is not visible or is illegible.\n"
-                "-# Retry with a new, clearer image."
+                "Could not read your screenshot. "
+                "Retry with a clearer image."
             )
         elif problem == PROBLEM_CODEWORD:
-            if codeword_set:
+            codeword = normalize_codeword(codeword)
+            if codeword:
                 out.append(
-                    "**Submission rejected — codeword missing**\n"
-                    "The current codeword was not found in your screenshot.\n"
-                    "-# Make sure the codeword is visible in your chat box "
-                    "and submit a new screenshot."
+                    f"The codeword `{codeword}` is not in your screenshot. "
+                    "Type it in chat so it shows on screen, "
+                    "then submit a new screenshot."
                 )
             else:
-                out.append(
-                    "**Submission rejected — codeword missing**\n"
-                    "-# A codeword is required."
-                )
+                out.append("A codeword is required.")
         elif problem == PROBLEM_WRONG_FISH:
             out.append(
-                "**Submission rejected — wrong fish**\n"
-                f"Detected: `{verdict.fish}` — Expected: `{expected_fish}`\n"
-                f"-# Submit a {expected_fish} screenshot."
+                f"You submitted `{verdict.fish}`, "
+                f"Current fish is `{expected_fish}`. "
+                "Please submit the correct fish."
             )
     return out

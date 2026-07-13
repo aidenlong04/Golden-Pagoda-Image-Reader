@@ -888,6 +888,48 @@ class OnLeaveClearTests(unittest.TestCase):
         self.assertNotIn(5, self.b._watch_error_replies)
 
 
+class WatchPendingDeleteTests(unittest.TestCase):
+    """Tests for the rejected-screenshot delayed-delete machinery."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+
+    def test_reject_delete_window_is_five_minutes(self):
+        self.assertEqual(self.b._WATCH_REJECT_DELETE_SECONDS, 300)
+
+    def test_cancel_watch_pending_deletes_cancels_and_clears(self):
+        task = Mock()
+        self.b._watch_pending_deletes[123] = task
+        try:
+            self.b._cancel_watch_pending_deletes()
+        finally:
+            self.b._watch_pending_deletes.pop(123, None)
+        task.cancel.assert_called_once()
+        self.assertEqual(self.b._watch_pending_deletes, {})
+
+    def test_delete_watch_submission_later_deletes_and_untracks(self):
+        import asyncio
+        calls = []
+
+        async def fake_delete(cid, mid):
+            calls.append((cid, mid))
+
+        orig_delete = self.b._delete_message
+        orig_delay = self.b._WATCH_REJECT_DELETE_SECONDS
+        self.b._delete_message = fake_delete
+        self.b._WATCH_REJECT_DELETE_SECONDS = 0
+        try:
+            self.b._watch_pending_deletes[42] = Mock()
+            asyncio.run(self.b._delete_watch_submission_later(7, 42))
+        finally:
+            self.b._delete_message = orig_delete
+            self.b._WATCH_REJECT_DELETE_SECONDS = orig_delay
+            self.b._watch_pending_deletes.pop(42, None)
+        self.assertEqual(calls, [(7, 42)])
+        self.assertNotIn(42, self.b._watch_pending_deletes)
+
+
 class CardTextHelperTests(unittest.TestCase):
     """Tests for the shared card-text helpers."""
 

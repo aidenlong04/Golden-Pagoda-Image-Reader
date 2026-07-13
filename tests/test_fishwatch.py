@@ -143,6 +143,35 @@ def test_evaluate_no_codeword_configured():
     assert v.ok
 
 
+def test_normalize_codeword_strips_junk():
+    assert fishwatch.normalize_codeword("`cerebral`") == "cerebral"
+    assert fishwatch.normalize_codeword('"cerebral"') == "cerebral"
+    assert fishwatch.normalize_codeword(" cerebral ") == "cerebral"
+    assert fishwatch.normalize_codeword("\u200bcerebral\u200b") == "cerebral"
+    assert fishwatch.normalize_codeword("``") == ""
+    assert fishwatch.normalize_codeword(None) == ""
+
+
+def test_evaluate_codeword_with_pasted_backticks_still_matches():
+    # A codeword pasted with markdown backticks must still match the plain
+    # OCR text instead of becoming unpassable.
+    text = "Norg\nchat: cerebral"
+    v = evaluate_submission(text, codeword="`cerebral`", expected_fish="Norg")
+    assert v.ok
+
+
+def test_evaluate_junk_only_codeword_treated_as_unset():
+    v = evaluate_submission("Norg 39.9 kg", codeword="``", expected_fish="Norg")
+    assert v.ok
+
+
+def test_problem_messages_never_render_empty_codeword():
+    v = fishwatch.Verdict(False, (PROBLEM_CODEWORD,), "Norg")
+    msgs = problem_messages(v, codeword="\u200b`", expected_fish=None)
+    assert "``" not in " ".join(msgs)
+    assert any("codeword is required" in m for m in msgs)
+
+
 def test_evaluate_wrong_fish():
     text = "Mawfish\nMedium\nchat: cerebral"
     v = evaluate_submission(text, codeword="cerebral", expected_fish="Norg")
@@ -165,13 +194,14 @@ def test_evaluate_no_expected_fish_accepts_any():
 
 def test_problem_messages_cover_all_problems():
     v = evaluate_submission("Mawfish", codeword="cerebral", expected_fish="Norg")
-    msgs = problem_messages(v, codeword_set=True, expected_fish="Norg")
+    msgs = problem_messages(v, codeword="cerebral", expected_fish="Norg")
     joined = " ".join(msgs)
-    assert "codeword missing" in joined
-    assert "Norg" in joined and "Mawfish" in joined
+    assert "codeword `cerebral` is not in your screenshot" in joined
+    assert "Current fish is `Norg`" in joined
+    assert "You submitted `Mawfish`" in joined
 
     v2 = evaluate_submission("", codeword="", expected_fish=None)
-    msgs2 = problem_messages(v2, codeword_set=False, expected_fish=None)
+    msgs2 = problem_messages(v2, codeword="", expected_fish=None)
     assert any("Retry" in m for m in msgs2)
 
     # No emoji characters in any error message.
