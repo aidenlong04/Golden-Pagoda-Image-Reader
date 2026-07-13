@@ -91,7 +91,8 @@ from gpbot.verify import (
     parse_mastery_token,
     validate_image_bytes,
 )
-from ocr_engine import OCR_API_KEY, OLLAMA_OCR_MODEL, _ocr
+import fishwatch
+from ocr_engine import OCR_API_KEY, OLLAMA_OCR_MODEL, _ocr, _ocr_with_prompt
 from envstore import (  # noqa: F401  (some re-exported for tests via bot.*)
     ENV_FILE_PATH,
     PLATFORM_ROLE_ID_ENV_KEYS,
@@ -1601,6 +1602,9 @@ async def on_member_remove(member: discord.Member) -> None:
     )
     # Drop the member's cached screenshot bytes (privacy + memory).
     _evict_cached_screenshot(member.id)
+    # Drop any tracked fish-watch error replies for the member — their
+    # next-submission cleanup can never fire once they've left.
+    _watch_error_replies.pop(member.id, None)
     _spawn_bg_task(
         _clear_member_data_on_leave(guild.id, member.id, str(label))
     )
@@ -6599,6 +6603,477 @@ async def onboard_cmd(
     )
 
 
+# ---------- /watch (fishing screenshot watcher) ------------------------------
+
+# Fish-watch state: loaded from .env at import, mutated by the /watch panel
+# buttons, and mirrored back to .env on every change so it survives restarts.
+_WATCH_STATE = fishwatch.WatchState.from_env()
+
+# Latest bot error reply per submitting user (message IDs in the watched
+# channel). When a member submits a corrected image that meets the criteria,
+# their old error replies are deleted.
+_watch_error_replies: dict[int, list[int]] = {}
+
+
+def _persist_watch_state() -> None:
+    """Mirror the in-memory watch state to os.environ + the .env file."""
+    for key, value in _WATCH_STATE.env_items():
+        os.environ[key] = value
+        _update_env_value(key, value)
+
+
+def _watch_fish_reference_lines() -> str:
+    parts: list[str] = []
+    for planet in fishwatch.PLANETS:
+        fishes = " \u00B7 ".join(
+            f"{f.name} ({f.quality})"
+            for f in fishwatch.FISH if f.planet == planet
+        )
+        parts.append(f"-# **{planet}:** {fishes}")
+    return "\n".join(parts)
+
+
+# (page key, title) for the paginated /watch panel — page bodies are built
+# inline in _watch_components (they need the watch state / leaderboard).
+_WATCH_PAGES: list[tuple[str, str]] = [
+    ("watch",   "Watch"),
+    ("records", "Records"),
+]
+
+_WATCH_MEDALS = ("\U0001F947", "\U0001F948", "\U0001F949")  # gold/silver/bronze
+
+
+def _watch_nav_row(page: int) -> dict:
+    return _pagination_nav_row(
+        len(_WATCH_PAGES), page,
+        prev_id=f"watch:page:{page - 1}",
+        noop_id="watch:noop",
+        next_id=f"watch:page:{page + 1}",
+        refresh_id=f"watch:page:{page}",
+    )
+
+
+def _format_catch_value(weight: float, unit: str) -> str:
+    return f"{weight:g} {unit}"
+
+
+def _watch_records_body(guild_id: int, top: dict[str, list[dict]]) -> str:
+    """The Records page: heaviest three catches per species, rebuilt from
+    the fish_catches table on every view so it always shows live data."""
+    if not top:
+        return (
+            "*No catches recorded yet — passing submissions with a readable "
+            "weight land here automatically.*"
+        )
+    parts: list[str] = [
+        "-# Top catches per species, from passing watch submissions. "
+        "Links jump to the submitted screenshot."
+    ]
+    for planet in fishwatch.PLANETS:
+        lines: list[str] = []
+        for f in fishwatch.FISH:
+            if f.planet != planet:
+                continue
+            entries = top.get(f.name.casefold())
+            if not entries:
+                continue
+            lines.append(f"**{f.name}** \u2014 max {f.quality}")
+            for rank, row in enumerate(entries[:len(_WATCH_MEDALS)]):
+                who = (
+                    f"<@{row['user_id']}>" if row.get("user_id")
+                    else "*former member*"
+                )
+                url = (
+                    f"https://discord.com/channels/{guild_id}/"
+                    f"{row['channel_id']}/{row['message_id']}"
+                )
+                lines.append(
+                    f"-# {_WATCH_MEDALS[rank]} "
+                    f"**{_format_catch_value(row['weight'], row['unit'])}**"
+                    f" \u2014 {who} \u00B7 [view]({url})"
+                )
+        if lines:
+            parts.append(f"### {planet}")
+            parts.extend(lines)
+    return "\n".join(parts)
+
+
+def _watch_components(
+    page: int = 0,
+    *,
+    guild_id: int = 0,
+    top: dict[str, list[dict]] | None = None,
+) -> list[dict]:
+    """The /watch panel: a single V2 container styled after /status with a
+    Watch (config) page and a Records (top-catches leaderboard) page."""
+    page = max(0, min(page, len(_WATCH_PAGES) - 1))
+    key, title = _WATCH_PAGES[page]
+    nav_row = _watch_nav_row(page)
+    state = _WATCH_STATE
+    running = state.enabled and state.channel_id
+
+    if key == "records":
+        container_components: list[dict] = [
+            {"type": 10, "content": _watch_records_body(guild_id, top or {})},
+            nav_row,
+        ]
+        return [
+            {"type": 10, "content": f"### \U0001F3A3  Fish Watch \u2014 {title}"},
+            {
+                "type": 17,
+                "accent_color": ACCENT_PASS if running else ACCENT_FAIL,
+                "components": container_components,
+            },
+        ]
+
+    status_line = (
+        "\u2705 **Watching**" if running else "\u26D4 **Stopped**"
+    )
+    channel_line = (
+        f"<#{state.channel_id}>" if state.channel_id else "*not set*"
+    )
+    codeword_line = f"`{state.codeword}`" if state.codeword else "*not set*"
+    admins_line = (
+        " ".join(f"<@{uid}>" for uid in sorted(state.admin_ids))
+        if state.admin_ids else "*not set*"
+    )
+    fish = fishwatch.FISH_BY_KEY.get((state.current_fish or "").casefold())
+    fish_line = (
+        f"**{fish.name}** \u2014 {fish.planet}, max {fish.quality}, "
+        f"{fish.rarity}"
+        if fish else "*not set \u2014 a watch admin names a fish in the "
+        "watched channel to set it*"
+    )
+    body = (
+        f"{status_line}\n"
+        f"**Channel:** {channel_line}\n"
+        f"**Codeword:** {codeword_line}\n"
+        f"-# > A new codeword only applies to newly sent images.\n"
+        f"**Watch admins:** {admins_line}\n"
+        f"**Current fish:** {fish_line}\n\n"
+        f"{_watch_fish_reference_lines()}"
+    )
+    button_row = {
+        "type": 1,
+        "components": [
+            {"type": 2, "style": 3, "label": "Start",
+             "custom_id": "watch:start",
+             "disabled": bool(running) or not state.channel_id},
+            {"type": 2, "style": 4, "label": "Stop",
+             "custom_id": "watch:stop", "disabled": not running},
+            {"type": 2, "style": 1, "label": "Set codeword",
+             "custom_id": "watch:codeword"},
+            {"type": 2, "style": 1, "label": "Set admin",
+             "custom_id": "watch:admins"},
+        ],
+    }
+    return [
+        {"type": 10, "content": f"### \U0001F3A3  Fish Watch \u2014 {title}"},
+        {
+            "type": 17,
+            "accent_color": ACCENT_PASS if running else ACCENT_FAIL,
+            "components": [
+                {"type": 10, "content": body},
+                button_row,
+                nav_row,
+            ],
+        },
+    ]
+
+
+class _WatchCodewordModal(_GPModal):
+    """Set the fish-watch codeword. The new codeword only applies to images
+    sent after it is saved — in-flight submissions keep the codeword that
+    was active when they were posted."""
+
+    def __init__(self) -> None:
+        super().__init__(title="watch \u2014 set codeword", timeout=600)
+        self.add_item(discord.ui.TextDisplay(
+            "The word members must have highlighted in green in their "
+            "chat box. Applies to newly sent images only."
+        ))
+        self.codeword_input = discord.ui.TextInput(
+            default=_WATCH_STATE.codeword or None,
+            required=False,
+            max_length=50,
+        )
+        self.add_item(discord.ui.Label(
+            text="codeword",
+            description="Leave blank to disable the codeword check.",
+            component=self.codeword_input,
+        ))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        user = interaction.user
+        if not (
+            isinstance(user, discord.Member)
+            and user.guild_permissions.manage_guild
+        ):
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "Operator, you can't use this.", ephemeral=True
+                )
+            return
+        _WATCH_STATE.codeword = (self.codeword_input.value or "").strip()
+        await asyncio.to_thread(_persist_watch_state)
+        await _interaction_callback(interaction, 7, _watch_components())
+
+
+class _WatchAdminModal(_GPModal):
+    """Pick the watch admins — the members whose fish-name messages in the
+    watched channel set the fish being watched."""
+
+    def __init__(self) -> None:
+        super().__init__(title="watch \u2014 set admin", timeout=600)
+        self.add_item(discord.ui.TextDisplay(
+            "Members whose messages naming a fish set the watched fish. "
+            "The selection replaces the current watch-admin list."
+        ))
+        # required=True must accompany min_values=1 — Discord rejects a
+        # modal select with min_values > 0 that isn't required (400).
+        self.admin_select = discord.ui.UserSelect(
+            min_values=1, max_values=10, required=True,
+            default_values=[
+                discord.Object(id=uid)
+                for uid in sorted(_WATCH_STATE.admin_ids)[:10]
+            ],
+        )
+        self.add_item(discord.ui.Label(
+            text="watch admins",
+            description="Up to 10 members.",
+            component=self.admin_select,
+        ))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        user = interaction.user
+        if not (
+            isinstance(user, discord.Member)
+            and user.guild_permissions.manage_guild
+        ):
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "Operator, you can't use this.", ephemeral=True
+                )
+            return
+        _WATCH_STATE.admin_ids = {
+            picked.id for picked in (self.admin_select.values or [])
+        }
+        await asyncio.to_thread(_persist_watch_state)
+        await _interaction_callback(interaction, 7, _watch_components())
+
+
+async def _handle_watch_interaction(
+    interaction: discord.Interaction, custom_id: str
+) -> None:
+    """Dispatch the /watch panel buttons. Re-checks Manage Server on every
+    click as defence in depth even though the panel is ephemeral."""
+    user = interaction.user
+    guild = interaction.guild
+    if guild is None or not (
+        isinstance(user, discord.Member)
+        and user.guild_permissions.manage_guild
+    ):
+        with contextlib.suppress(Exception):
+            await _interaction_callback(interaction, 6, [])
+        return
+    action = custom_id.split(":", 1)[1] if ":" in custom_id else ""
+    if action == "noop":
+        with contextlib.suppress(Exception):
+            await _interaction_callback(interaction, 6, [])
+        return
+    if action.startswith("page:"):
+        try:
+            page = int(action.split(":", 1)[1])
+        except ValueError:
+            page = 0
+        page = max(0, min(page, len(_WATCH_PAGES) - 1))
+        top: dict[str, list[dict]] | None = None
+        if _WATCH_PAGES[page][0] == "records":
+            top = await asyncio.to_thread(
+                analytics.top_fish_catches, guild.id
+            )
+        with contextlib.suppress(Exception):
+            await _interaction_callback(
+                interaction, 7,
+                _watch_components(page, guild_id=guild.id, top=top),
+            )
+        return
+    if action == "codeword":
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.send_modal(_WatchCodewordModal())
+        return
+    if action == "admins":
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.send_modal(_WatchAdminModal())
+        return
+    if action == "start" and _WATCH_STATE.channel_id:
+        _WATCH_STATE.enabled = True
+        await asyncio.to_thread(_persist_watch_state)
+        logger.info(
+            "watch: started by %s on channel %s",
+            user.id, _WATCH_STATE.channel_id,
+        )
+    elif action == "stop":
+        # Cleanly close the watcher: disable, persist, and drop the
+        # per-user error-reply tracking so no stale deletes fire later.
+        _WATCH_STATE.enabled = False
+        _watch_error_replies.clear()
+        await asyncio.to_thread(_persist_watch_state)
+        logger.info("watch: stopped by %s", user.id)
+    with contextlib.suppress(Exception):
+        await _interaction_callback(interaction, 7, _watch_components())
+
+
+@tree.command(
+    name="watch",
+    description=(
+        "Watch a channel's fishing screenshots for quality, codeword and "
+        "the declared fish."
+    ),
+)
+@app_commands.describe(
+    channel="The channel to watch (defaults to the current channel).",
+)
+@app_commands.default_permissions(manage_guild=True)
+async def watch_cmd(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+) -> None:
+    user = interaction.user
+    if interaction.guild is None or not (
+        isinstance(user, discord.Member)
+        and user.guild_permissions.manage_guild
+    ):
+        await interaction.response.send_message(
+            "Operator, you can't use this.", ephemeral=True
+        )
+        return
+    if channel is not None:
+        _WATCH_STATE.channel_id = channel.id
+    elif not _WATCH_STATE.channel_id and interaction.channel_id:
+        _WATCH_STATE.channel_id = interaction.channel_id
+    await asyncio.to_thread(_persist_watch_state)
+    await _interaction_callback(interaction, 4, _watch_components())
+
+
+async def _process_watch_submission(
+    message: discord.Message,
+    attachment: discord.Attachment,
+    *,
+    codeword: str,
+    expected_fish: str | None,
+) -> None:
+    """OCR one watched-channel screenshot and enforce the watch rules.
+
+    ``codeword``/``expected_fish`` are snapshotted at message receipt so a
+    codeword changed mid-OCR only applies to newly sent images.
+    """
+    try:
+        image_bytes = await attachment.read()
+    except discord.HTTPException:
+        logger.exception("watch: failed to download attachment")
+        return
+    text = ""
+    if validate_image_bytes(image_bytes):
+        try:
+            text, _words, _engine = await _run_heavy(
+                _ocr_with_prompt,
+                image_bytes,
+                attachment.filename,
+                attachment.content_type or "image/png",
+                fishwatch.build_watch_prompt(),
+            )
+        except Exception:
+            logger.exception("watch: OCR failed for %s", message.id)
+    verdict = fishwatch.evaluate_submission(
+        text, codeword=codeword, expected_fish=expected_fish
+    )
+    # A new submission supersedes the member's previous attempt: delete the
+    # old bot error replies whether or not this one passes (a pass leaves
+    # the channel clean; a fail replaces them with the current errors).
+    user_id = message.author.id
+    channel_id = message.channel.id
+    for old_id in _watch_error_replies.pop(user_id, []):
+        await _delete_message(channel_id, old_id)
+    if verdict.ok:
+        with contextlib.suppress(discord.HTTPException):
+            await message.add_reaction("\u2705")
+        if verdict.weight is not None and message.guild is not None:
+            # Feed the /watch Records leaderboard (fail-soft, off-loop).
+            # caught_ts is the message's post time — not OCR completion
+            # time — so leaderboard ties go to the first submission even
+            # when concurrent OCR jobs finish out of order. created_at is
+            # always set on a real discord.Message; the None fallback
+            # (record_fish_catch defaults to now) only covers doubles.
+            created = getattr(message, "created_at", None)
+            await asyncio.to_thread(
+                analytics.record_fish_catch,
+                guild_id=message.guild.id,
+                channel_id=channel_id,
+                message_id=message.id,
+                user_id=user_id,
+                fish=verdict.fish or "",
+                weight=verdict.weight,
+                unit=verdict.unit or "kg",
+                caught_ts=int(created.timestamp()) if created else None,
+            )
+        logger.info(
+            "watch: %s passed (%s, %s) for user %s",
+            message.id, verdict.fish, verdict.weight, user_id,
+        )
+        return
+    with contextlib.suppress(discord.HTTPException):
+        await message.add_reaction("\u274C")
+    lines = fishwatch.problem_messages(
+        verdict, codeword_set=bool(codeword), expected_fish=expected_fish
+    )
+    body = f"<@{user_id}>\n" + "\n".join(f"\u274C {line}" for line in lines)
+    reply_id = await _post_channel_v2(
+        channel_id,
+        [{"type": 17, "accent_color": ACCENT_FAIL,
+          "components": [{"type": 10, "content": body}]}],
+        mention_user_ids=[user_id],
+    )
+    if reply_id and _WATCH_STATE.enabled:
+        # Append (not replace): concurrent in-flight submissions from the
+        # same member must all stay tracked so the next attempt cleans up
+        # every outstanding error reply.
+        _watch_error_replies.setdefault(user_id, []).append(reply_id)
+
+
+@client.event
+async def on_message(message: discord.Message) -> None:
+    if message.author.bot or message.guild is None:
+        return
+    state = _WATCH_STATE
+    if not state.enabled or message.channel.id != state.channel_id:
+        return
+    # A watch admin naming a fish (no screenshot) sets the fish being
+    # watched; every later submission must show that fish until the admin
+    # names a new one.
+    if message.author.id in state.admin_ids and not message.attachments:
+        fish = fishwatch.find_fish(message.content or "")
+        if fish:
+            state.current_fish = fish
+            await asyncio.to_thread(_persist_watch_state)
+            with contextlib.suppress(discord.HTTPException):
+                await message.add_reaction("\U0001F3A3")
+            logger.info(
+                "watch: admin %s set fish to %s", message.author.id, fish
+            )
+        return
+    attachment = _first_image_attachment(message)
+    if attachment is None:
+        return
+    # Snapshot codeword + fish at receipt: a codeword set after this message
+    # was sent must not apply to it.
+    _spawn_bg_task(_process_watch_submission(
+        message, attachment,
+        codeword=state.codeword,
+        expected_fish=state.current_fish,
+    ))
+
+
 async def _handle_status_interaction(
     interaction: discord.Interaction, custom_id: str
 ) -> None:
@@ -6659,6 +7134,7 @@ def _register_custom_id_routes() -> None:
     _CUSTOM_ID_ROUTER.register_prefix("mreview:", _handle_mreview_interaction)
     _CUSTOM_ID_ROUTER.register_prefix("alias:", _handle_alias_interaction)
     _CUSTOM_ID_ROUTER.register_prefix("status:", _handle_status_interaction)
+    _CUSTOM_ID_ROUTER.register_prefix("watch:", _handle_watch_interaction)
     _CUSTOM_ID_ROUTES_REGISTERED = True
 
 

@@ -144,6 +144,28 @@ full env reference.
 - `/status` — paginated ephemeral status panel (bot, roles, channels, OCR,
   stats, clans, latency). Surfaces uvloop, RSS, BG tasks, the pooled HTTP
   session and the analytics SQLite WAL state. Requires **Manage Server**.
+- `/watch [channel]` — watch a channel's fishing-screenshot submissions.
+  Opens an ephemeral panel (styled like `/status`) with **Start**, **Stop**,
+  **Set codeword** and **Set admin** buttons. While watching, every image
+  posted in the channel is OCR'd (fish-tuned Ollama vision prompt, with the
+  usual OCR.space/Tesseract fallbacks) and checked: illegible/bad-quality
+  screenshots get an ❌ react + a retry request; a missing or wrong codeword
+  (the word highlighted in green in the member's chat box) gets an ❌ react +
+  "codeword required"; and once a watch admin names a fish in the channel,
+  submissions showing any other fish get an ❌ react + a wrong-fish error.
+  A corrected submission that meets the criteria gets a ✅ and the member's
+  old bot error replies are deleted. Codeword changes only apply to newly
+  sent images; **Stop** cleanly halts the watcher. The fish roster
+  (names + max weight/quality, from `aidenlong04/warframe-item-pull`) covers
+  Earth, Venus and Deimos. The panel is paginated (Prev/Next/Refresh like
+  `/status`): a **Records** page shows a live leaderboard of the three
+  heaviest catches recorded per species (weight/points OCR'd from passing
+  submissions), each with the catcher and a jump link to the submitted
+  screenshot. Ties go to the first submission — ranked by the message's
+  post time, so the first member to reach a weight keeps the higher rank.
+  Catches live in the analytics SQLite DB (`fish_catches`) and
+  are anonymised by the on-leave data purge. State persists to `.env`
+  (`FISH_WATCH_*`). Requires **Manage Server**.
 - `/manage member:<member>` — paginated ephemeral admin console (styled like
   `/status`, with Prev/Next/Refresh). The **Overview**, **Titles** and
   **Data & Clear** pages inspect a member's stored profile + titles and let
