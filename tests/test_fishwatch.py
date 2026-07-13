@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import io
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -23,6 +24,11 @@ from fishwatch import (
     evaluate_submission,
     find_fish,
     problem_messages,
+)
+
+# Matches common emoji Unicode ranges — used to assert error messages are emoji-free.
+_EMOJI_RE = re.compile(
+    r"[\U0001F000-\U0001FFFF\u2600-\u27BF\u2B00-\u2BFF\u274C\u2705]"
 )
 
 
@@ -169,10 +175,6 @@ def test_problem_messages_cover_all_problems():
     assert any("Retry" in m for m in msgs2)
 
     # No emoji characters in any error message.
-    import re
-    _EMOJI_RE = re.compile(
-        r"[\U0001F000-\U0001FFFF\u2600-\u27BF\u2B00-\u2BFF\u274C\u2705]"
-    )
     all_msgs = msgs + msgs2
     for m in all_msgs:
         assert not _EMOJI_RE.search(m), f"Emoji found in message: {m!r}"
