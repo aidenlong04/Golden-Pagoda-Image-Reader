@@ -6614,6 +6614,32 @@ _WATCH_STATE = fishwatch.WatchState.from_env()
 # their old error replies are deleted.
 _watch_error_replies: dict[int, list[int]] = {}
 
+# How long a rejected screenshot post stays in the channel before the bot
+# deletes it (the member is expected to resubmit a corrected image).
+_WATCH_REJECT_DELETE_SECONDS = 300
+
+# Pending delayed deletes of rejected screenshot posts, keyed by the
+# member's message ID so Stop can cancel them cleanly.
+_watch_pending_deletes: dict[int, asyncio.Task] = {}
+
+
+def _cancel_watch_pending_deletes() -> None:
+    """Cancel every scheduled rejected-post delete (watch stopped)."""
+    for pending in _watch_pending_deletes.values():
+        pending.cancel()
+    _watch_pending_deletes.clear()
+
+
+async def _delete_watch_submission_later(
+    channel_id: int, message_id: int
+) -> None:
+    """Delete a rejected screenshot post after the grace window elapses."""
+    try:
+        await asyncio.sleep(_WATCH_REJECT_DELETE_SECONDS)
+        await _delete_message(channel_id, message_id)
+    finally:
+        _watch_pending_deletes.pop(message_id, None)
+
 
 def _persist_watch_state() -> None:
     """Mirror the in-memory watch state to os.environ + the .env file."""
@@ -6997,10 +7023,12 @@ async def _handle_watch_interaction(
             user.id, _WATCH_STATE.channel_id,
         )
     elif action == "stop":
-        # Cleanly close the watcher: disable, persist, and drop the
-        # per-user error-reply tracking so no stale deletes fire later.
+        # Cleanly close the watcher: disable, persist, drop the per-user
+        # error-reply tracking, and cancel any scheduled rejected-post
+        # deletes so no stale deletes fire later.
         _WATCH_STATE.enabled = False
         _watch_error_replies.clear()
+        _cancel_watch_pending_deletes()
         await asyncio.to_thread(_persist_watch_state)
         logger.info("watch: stopped by %s", user.id)
     with contextlib.suppress(Exception):
@@ -7109,7 +7137,7 @@ async def _process_watch_submission(
     with contextlib.suppress(discord.HTTPException):
         await message.add_reaction("\u274C")
     lines = fishwatch.problem_messages(
-        verdict, codeword_set=bool(codeword), expected_fish=expected_fish
+        verdict, codeword=codeword, expected_fish=expected_fish
     )
     body = f"<@{user_id}>\n" + "\n\n".join(lines)
     reply_id = await _post_channel_v2(
@@ -7123,6 +7151,12 @@ async def _process_watch_submission(
         # same member must all stay tracked so the next attempt cleans up
         # every outstanding error reply.
         _watch_error_replies.setdefault(user_id, []).append(reply_id)
+    if _WATCH_STATE.enabled:
+        # The rejected screenshot needs a resubmission — remove the
+        # member's post after the grace window so it doesn't linger.
+        _watch_pending_deletes[message.id] = _spawn_bg_task(
+            _delete_watch_submission_later(channel_id, message.id)
+        )
 
 
 @client.event

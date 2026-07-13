@@ -154,7 +154,9 @@ full env reference.
   "codeword required"; and once a watch admin names a fish in the channel,
   submissions showing any other fish get an ❌ react + a wrong-fish error.
   A corrected submission that meets the criteria gets a ✅ and the member's
-  old bot error replies are deleted. Codeword changes only apply to newly
+  old bot error replies are deleted; a rejected screenshot post is itself
+  deleted 5 minutes later (the member is expected to resubmit), and
+  **Stop** cancels any pending deletes. Codeword changes only apply to newly
   sent images; **Stop** cleanly halts the watcher. The panel is paginated
   (Prev/Next/Refresh like `/status`): a **Records** page shows a live
   leaderboard of the three heaviest catches recorded per species

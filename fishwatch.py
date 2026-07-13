@@ -294,7 +294,7 @@ def evaluate_submission(
 
 
 def problem_messages(
-    verdict: Verdict, *, codeword_set: bool, expected_fish: str | None
+    verdict: Verdict, *, codeword: str, expected_fish: str | None
 ) -> list[str]:
     """Human-readable error lines for a failing verdict."""
     out: list[str] = []
@@ -305,9 +305,9 @@ def problem_messages(
                 "Retry with a clearer image."
             )
         elif problem == PROBLEM_CODEWORD:
-            if codeword_set:
+            if codeword:
                 out.append(
-                    "The codeword is not in your screenshot. "
+                    f"The codeword `{codeword}` is not in your screenshot. "
                     "Type it in chat so it shows on screen, "
                     "then submit a new screenshot."
                 )
@@ -315,8 +315,8 @@ def problem_messages(
                 out.append("A codeword is required.")
         elif problem == PROBLEM_WRONG_FISH:
             out.append(
-                f"Wrong fish: you submitted `{verdict.fish}`, "
-                f"but the watch is for `{expected_fish}`. "
-                f"Submit a {expected_fish} screenshot."
+                f"You submitted `{verdict.fish}`, "
+                f"Current fish is `{expected_fish}`. "
+                "Please submit the correct fish."
             )
     return out

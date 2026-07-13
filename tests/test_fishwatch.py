@@ -165,13 +165,14 @@ def test_evaluate_no_expected_fish_accepts_any():
 
 def test_problem_messages_cover_all_problems():
     v = evaluate_submission("Mawfish", codeword="cerebral", expected_fish="Norg")
-    msgs = problem_messages(v, codeword_set=True, expected_fish="Norg")
+    msgs = problem_messages(v, codeword="cerebral", expected_fish="Norg")
     joined = " ".join(msgs)
-    assert "codeword is not in your screenshot" in joined
-    assert "Norg" in joined and "Mawfish" in joined
+    assert "codeword `cerebral` is not in your screenshot" in joined
+    assert "Current fish is `Norg`" in joined
+    assert "You submitted `Mawfish`" in joined
 
     v2 = evaluate_submission("", codeword="", expected_fish=None)
-    msgs2 = problem_messages(v2, codeword_set=False, expected_fish=None)
+    msgs2 = problem_messages(v2, codeword="", expected_fish=None)
     assert any("Retry" in m for m in msgs2)
 
     # No emoji characters in any error message.
