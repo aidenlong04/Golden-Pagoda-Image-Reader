@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import io
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -244,6 +245,9 @@ def _fake_message(*, author_id=7, channel_id=555, message_id=42, guild_id=1):
         author=SimpleNamespace(id=author_id, bot=False),
         channel=SimpleNamespace(id=channel_id),
         guild=SimpleNamespace(id=guild_id),
+        created_at=datetime.datetime(
+            2026, 7, 13, 12, 0, 0, tzinfo=datetime.timezone.utc
+        ),
         add_reaction=AsyncMock(),
     )
 
@@ -326,6 +330,8 @@ def test_process_watch_submission_fail_then_pass(monkeypatch):
     assert recorded[0]["weight"] == pytest.approx(39.9)
     assert recorded[0]["unit"] == "kg"
     assert recorded[0]["message_id"] == 44
+    # Ties break on the message's post time, not OCR completion time.
+    assert recorded[0]["caught_ts"] == int(msg3.created_at.timestamp())
 
 
 def test_watch_components_and_state(monkeypatch):

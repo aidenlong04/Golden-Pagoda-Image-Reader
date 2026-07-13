@@ -879,10 +879,13 @@ class OnLeaveClearTests(unittest.TestCase):
             member.id = 5
             member.guild = Mock(id=2)
             member.display_name = "Tenno"
+            self.b._watch_error_replies[5] = [9001]
             asyncio.run(self.b.on_member_remove(member))
         finally:
             self.b._spawn_bg_task = orig
         self.assertEqual(len(captured), 1)
+        # Tracked fish-watch error replies are evicted (memory leak fix).
+        self.assertNotIn(5, self.b._watch_error_replies)
 
 
 class CardTextHelperTests(unittest.TestCase):

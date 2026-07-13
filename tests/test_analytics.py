@@ -357,6 +357,34 @@ def test_fish_catch_record_and_top(analytics_module):
     assert a.top_fish_catches(999) == {}
 
 
+def test_fish_catch_ties_first_submission_wins(analytics_module):
+    a = analytics_module
+    # Same weight: the earlier caught_ts (post time) outranks the later
+    # one, regardless of insertion order into the table.
+    a.record_fish_catch(
+        guild_id=2, channel_id=555, message_id=201, user_id=11,
+        fish="Norg", weight=39.9, unit="kg", caught_ts=2000,
+    )
+    a.record_fish_catch(
+        guild_id=2, channel_id=555, message_id=200, user_id=10,
+        fish="Norg", weight=39.9, unit="kg", caught_ts=1000,
+    )
+    top = a.top_fish_catches(2)
+    assert [r["user_id"] for r in top["norg"]] == [10, 11]
+    # Same caught_ts (same second): the lower message_id — the earlier
+    # Discord snowflake — wins.
+    a.record_fish_catch(
+        guild_id=2, channel_id=555, message_id=301, user_id=21,
+        fish="Mawfish", weight=25.0, unit="kg", caught_ts=1000,
+    )
+    a.record_fish_catch(
+        guild_id=2, channel_id=555, message_id=300, user_id=20,
+        fish="Mawfish", weight=25.0, unit="kg", caught_ts=1000,
+    )
+    top = a.top_fish_catches(2)
+    assert [r["user_id"] for r in top["mawfish"]] == [20, 21]
+
+
 def test_fish_catch_idempotent_per_message(analytics_module):
     a = analytics_module
     for weight in (10.0, 12.5):

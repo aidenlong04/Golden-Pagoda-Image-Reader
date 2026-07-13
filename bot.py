@@ -1602,6 +1602,9 @@ async def on_member_remove(member: discord.Member) -> None:
     )
     # Drop the member's cached screenshot bytes (privacy + memory).
     _evict_cached_screenshot(member.id)
+    # Drop any tracked fish-watch error replies for the member — their
+    # next-submission cleanup can never fire once they've left.
+    _watch_error_replies.pop(member.id, None)
     _spawn_bg_task(
         _clear_member_data_on_leave(guild.id, member.id, str(label))
     )
@@ -6997,6 +7000,10 @@ async def _process_watch_submission(
             await message.add_reaction("\u2705")
         if verdict.weight is not None and message.guild is not None:
             # Feed the /watch Records leaderboard (fail-soft, off-loop).
+            # caught_ts is the message's post time — not OCR completion
+            # time — so leaderboard ties go to the first submission even
+            # when concurrent OCR jobs finish out of order.
+            created = getattr(message, "created_at", None)
             await asyncio.to_thread(
                 analytics.record_fish_catch,
                 guild_id=message.guild.id,
@@ -7006,6 +7013,7 @@ async def _process_watch_submission(
                 fish=verdict.fish or "",
                 weight=verdict.weight,
                 unit=verdict.unit or "kg",
+                caught_ts=int(created.timestamp()) if created else None,
             )
         logger.info(
             "watch: %s passed (%s, %s) for user %s",

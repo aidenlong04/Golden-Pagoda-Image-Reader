@@ -161,7 +161,9 @@ full env reference.
   `/status`): a **Records** page shows a live leaderboard of the three
   heaviest catches recorded per species (weight/points OCR'd from passing
   submissions), each with the catcher and a jump link to the submitted
-  screenshot. Catches live in the analytics SQLite DB (`fish_catches`) and
+  screenshot. Ties go to the first submission — ranked by the message's
+  post time, so the first member to reach a weight keeps the higher rank.
+  Catches live in the analytics SQLite DB (`fish_catches`) and
   are anonymised by the on-leave data purge. State persists to `.env`
   (`FISH_WATCH_*`). Requires **Manage Server**.
 - `/manage member:<member>` — paginated ephemeral admin console (styled like

@@ -448,10 +448,13 @@ def top_fish_catches(guild_id: int, per_fish: int = 3) -> dict[str, list[dict]]:
     """The heaviest recorded catches per species for the /watch leaderboard.
 
     Returns ``{fish_key: [row, ...]}`` with up to ``per_fish`` rows per
-    species ordered heaviest-first (ties broken oldest-first, so the first
-    member to reach a weight keeps the higher rank). Each row carries
-    ``fish_name`` / ``weight`` / ``unit`` / ``user_id`` / ``channel_id`` /
-    ``message_id`` / ``caught_ts``. Fail-soft: empty dict when disabled.
+    species ordered heaviest-first. Ties break oldest-first — first by
+    ``caught_ts`` (the submission's post time), then by ``message_id``
+    (a Discord snowflake, so exact-second ties still go to the earlier
+    submission) — the first member to reach a weight keeps the higher
+    rank. Each row carries ``fish_name`` / ``weight`` / ``unit`` /
+    ``user_id`` / ``channel_id`` / ``message_id`` / ``caught_ts``.
+    Fail-soft: empty dict when disabled.
     """
     if _disabled:
         return {}
@@ -466,10 +469,11 @@ def top_fish_catches(guild_id: int, per_fish: int = 3) -> dict[str, list[dict]]:
                     " channel_id, message_id, caught_ts FROM ("
                     "  SELECT *, ROW_NUMBER() OVER ("
                     "   PARTITION BY fish_key"
-                    "   ORDER BY weight DESC, caught_ts ASC, id ASC"
+                    "   ORDER BY weight DESC, caught_ts ASC, message_id ASC"
                     "  ) AS rn FROM fish_catches WHERE guild_id=?"
                     " ) WHERE rn <= ?"
-                    " ORDER BY fish_key, weight DESC, caught_ts ASC",
+                    " ORDER BY fish_key, weight DESC, caught_ts ASC,"
+                    "  message_id ASC",
                     (guild_id, int(per_fish)),
                 ).fetchall()
         except Exception:
