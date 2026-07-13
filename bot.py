@@ -6650,7 +6650,7 @@ def _watch_nav_row(page: int) -> dict:
     )
 
 
-def _format_catch_weight(weight: float, unit: str) -> str:
+def _format_catch_value(weight: float, unit: str) -> str:
     return f"{weight:g} {unit}"
 
 
@@ -6686,7 +6686,7 @@ def _watch_records_body(guild_id: int, top: dict[str, list[dict]]) -> str:
                 )
                 lines.append(
                     f"-# {_WATCH_MEDALS[rank]} "
-                    f"**{_format_catch_weight(row['weight'], row['unit'])}**"
+                    f"**{_format_catch_value(row['weight'], row['unit'])}**"
                     f" \u2014 {who} \u00B7 [view]({url})"
                 )
         if lines:
