@@ -220,6 +220,7 @@ def _init() -> None:
                     fish_name TEXT NOT NULL,
                     weight REAL NOT NULL,
                     unit TEXT NOT NULL,
+                    quality TEXT,
                     caught_ts INTEGER NOT NULL,
                     UNIQUE (guild_id, message_id)
                 );
@@ -237,6 +238,15 @@ def _init() -> None:
                     logger.info("analytics: added platform_scores column")
                 except Exception:
                     logger.warning("analytics: failed to add platform_scores column", exc_info=True)
+
+            fish_columns = {row[1] for row in conn.execute("PRAGMA table_info(fish_catches)")}
+            if "quality" not in fish_columns:
+                try:
+                    conn.execute("ALTER TABLE fish_catches ADD COLUMN quality TEXT")
+                    conn.commit()
+                    logger.info("analytics: added fish_catches.quality column")
+                except Exception:
+                    logger.warning("analytics: failed to add fish_catches.quality column", exc_info=True)
         _initialized = True
     except Exception:
         logger.exception("analytics: init failed; disabling")
@@ -398,6 +408,7 @@ def record_fish_catch(
     fish: str,
     weight: float,
     unit: str,
+    quality: str | None = None,
     caught_ts: int | None = None,
 ) -> None:
     """Log one passing fish-watch submission's measured catch.
@@ -420,13 +431,14 @@ def record_fish_catch(
                 conn.execute(
                     "INSERT INTO fish_catches"
                     " (guild_id, channel_id, message_id, user_id,"
-                    "  fish_key, fish_name, weight, unit, caught_ts)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "  fish_key, fish_name, weight, unit, quality, caught_ts)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT(guild_id, message_id) DO UPDATE SET"
                     "  fish_key=excluded.fish_key,"
                     "  fish_name=excluded.fish_name,"
                     "  weight=excluded.weight,"
-                    "  unit=excluded.unit",
+                    "  unit=excluded.unit,"
+                    "  quality=excluded.quality",
                     (
                         guild_id,
                         channel_id,
@@ -436,6 +448,7 @@ def record_fish_catch(
                         fish,
                         float(weight),
                         unit,
+                        quality,
                         int(caught_ts if caught_ts is not None else time.time()),
                     ),
                 )
@@ -471,8 +484,8 @@ def top_fish_catches(guild_id: int, per_fish: int = 3) -> dict[str, list[dict]]:
         try:
             with _connect() as conn:
                 rows = conn.execute(
-                    "SELECT fish_key, fish_name, weight, unit, user_id,"
-                    " channel_id, message_id, caught_ts FROM ("
+                    "SELECT fish_key, fish_name, weight, unit, quality,"
+                    " user_id, channel_id, message_id, caught_ts FROM ("
                     "  SELECT *, ROW_NUMBER() OVER ("
                     "   PARTITION BY fish_key"
                     f"   ORDER BY {_FISH_RANK_ORDER}"
@@ -488,6 +501,44 @@ def top_fish_catches(guild_id: int, per_fish: int = 3) -> dict[str, list[dict]]:
     for row in rows:
         out.setdefault(row["fish_key"], []).append(dict(row))
     return out
+
+
+def fish_catch_leaderboard(
+    guild_id: int, *, offset: int = 0, limit: int = 10
+) -> tuple[list[dict], int]:
+    """One page of the all-species largest-catch leaderboard.
+
+    Returns ``(rows, total)``: up to ``limit`` catches from ``offset``
+    ordered by the shared :data:`_FISH_RANK_ORDER` (heaviest first, ties to
+    the first submission), plus the total number of recorded catches for
+    the guild. Each row carries ``fish_name`` / ``weight`` / ``unit`` /
+    ``quality`` / ``user_id`` / ``channel_id`` / ``message_id`` /
+    ``caught_ts``. Fail-soft: ``([], 0)`` when disabled.
+    """
+    if _disabled:
+        return [], 0
+    with _lock:
+        _init()
+        if _disabled:
+            return [], 0
+        try:
+            with _connect() as conn:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM fish_catches WHERE guild_id=?",
+                    (guild_id,),
+                ).fetchone()[0]
+                rows = conn.execute(
+                    "SELECT fish_key, fish_name, weight, unit, quality,"
+                    " user_id, channel_id, message_id, caught_ts"
+                    " FROM fish_catches WHERE guild_id=?"
+                    f" ORDER BY {_FISH_RANK_ORDER}"
+                    " LIMIT ? OFFSET ?",
+                    (guild_id, int(limit), int(offset)),
+                ).fetchall()
+        except Exception:
+            logger.exception("analytics: fish_catch_leaderboard failed")
+            return [], 0
+    return [dict(row) for row in rows], int(total)
 
 
 def get_member_profile(guild_id: int, user_id: int) -> dict | None:

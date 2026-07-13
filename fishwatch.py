@@ -117,6 +117,25 @@ _POINTS_RE = re.compile(
 )
 
 
+# Catch quality tiers as they render under the fish name on a catch:
+# Small/Medium/Large for weighed fish, Basic/Adorned/Magnificent for
+# servofish quality.
+_QUALITY_RE = re.compile(
+    r"(?<![A-Za-z])(Small|Medium|Large|Basic|Adorned|Magnificent)"
+    r"(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def extract_quality(text: str) -> str | None:
+    """Pull the catch quality tier (e.g. ``Large`` or ``Adorned``) out of
+    an OCR transcript, or ``None`` when no tier word appears."""
+    if not text:
+        return None
+    m = _QUALITY_RE.search(text)
+    return m.group(1).capitalize() if m else None
+
+
 def extract_weight(text: str, fish_name: str) -> float | None:
     """Pull the caught weight (kg) or quality (points) out of an OCR
     transcript, matched against the unit the species is measured in.
@@ -232,6 +251,7 @@ class Verdict:
     fish: str | None
     weight: float | None = None
     unit: str | None = None
+    quality: str | None = None
 
 
 def _contains_codeword(text: str, codeword: str) -> bool:
@@ -269,6 +289,7 @@ def evaluate_submission(
     return Verdict(
         not problems, tuple(problems), fish,
         weight=weight, unit=fish_unit(fish) if weight is not None else None,
+        quality=extract_quality(text),
     )
 
 
@@ -280,20 +301,27 @@ def problem_messages(
     for problem in verdict.problems:
         if problem == PROBLEM_UNREADABLE:
             out.append(
-                "The screenshot is too low quality to read — the text is "
-                "not visible or is illegible. Please retry with a new, "
-                "clearer image."
+                "**Submission rejected — unreadable screenshot**\n"
+                "The screenshot text is not visible or is illegible.\n"
+                "-# Retry with a new, clearer image."
             )
         elif problem == PROBLEM_CODEWORD:
-            out.append(
-                "The codeword is required. Make sure the current codeword "
-                "is visible in your chat box and submit a new screenshot."
-                if codeword_set
-                else "The codeword is required."
-            )
+            if codeword_set:
+                out.append(
+                    "**Submission rejected — codeword missing**\n"
+                    "The current codeword was not found in your screenshot.\n"
+                    "-# Make sure the codeword is visible in your chat box "
+                    "and submit a new screenshot."
+                )
+            else:
+                out.append(
+                    "**Submission rejected — codeword missing**\n"
+                    "-# A codeword is required."
+                )
         elif problem == PROBLEM_WRONG_FISH:
             out.append(
-                f"That's a **{verdict.fish}** — the fish being watched is "
-                f"**{expected_fish}**. Submit a {expected_fish} screenshot."
+                "**Submission rejected — wrong fish**\n"
+                f"Detected: `{verdict.fish}` — Expected: `{expected_fish}`\n"
+                f"-# Submit a {expected_fish} screenshot."
             )
     return out

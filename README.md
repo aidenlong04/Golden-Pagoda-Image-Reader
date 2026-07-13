@@ -155,13 +155,14 @@ full env reference.
   submissions showing any other fish get an ❌ react + a wrong-fish error.
   A corrected submission that meets the criteria gets a ✅ and the member's
   old bot error replies are deleted. Codeword changes only apply to newly
-  sent images; **Stop** cleanly halts the watcher. The fish roster
-  (names + max weight/quality, from `aidenlong04/warframe-item-pull`) covers
-  Earth, Venus and Deimos. The panel is paginated (Prev/Next/Refresh like
-  `/status`): a **Records** page shows a live leaderboard of the three
-  heaviest catches recorded per species (weight/points OCR'd from passing
-  submissions), each with the catcher and a jump link to the submitted
-  screenshot. Ties go to the first submission — ranked by the message's
+  sent images; **Stop** cleanly halts the watcher. The panel is paginated
+  (Prev/Next/Refresh like `/status`): a **Records** page shows a live
+  leaderboard of the three heaviest catches recorded per species
+  (weight/points OCR'd from passing submissions), each with the catcher and
+  a jump link to the submitted screenshot. A **Leaderboards** button opens a
+  separate paginated panel listing every recorded catch ordered by largest
+  weight, with the OCR'd catch quality (e.g. *Large*, *Adorned*) shown next
+  to each weight. Ties go to the first submission — ranked by the message's
   post time, so the first member to reach a weight keeps the higher rank.
   Catches live in the analytics SQLite DB (`fish_catches`) and
   are anonymised by the on-leave data purge. State persists to `.env`

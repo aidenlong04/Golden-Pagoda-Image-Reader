@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import io
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -23,6 +24,11 @@ from fishwatch import (
     evaluate_submission,
     find_fish,
     problem_messages,
+)
+
+# Matches common emoji Unicode ranges — used to assert error messages are emoji-free.
+_EMOJI_RE = re.compile(
+    r"[\U0001F000-\U0001FFFF\u2600-\u27BF\u2B00-\u2BFF\u274C\u2705]"
 )
 
 
@@ -161,12 +167,17 @@ def test_problem_messages_cover_all_problems():
     v = evaluate_submission("Mawfish", codeword="cerebral", expected_fish="Norg")
     msgs = problem_messages(v, codeword_set=True, expected_fish="Norg")
     joined = " ".join(msgs)
-    assert "codeword is required" in joined
+    assert "codeword missing" in joined
     assert "Norg" in joined and "Mawfish" in joined
 
     v2 = evaluate_submission("", codeword="", expected_fish=None)
     msgs2 = problem_messages(v2, codeword_set=False, expected_fish=None)
-    assert any("retry with a new" in m for m in msgs2)
+    assert any("Retry" in m for m in msgs2)
+
+    # No emoji characters in any error message.
+    all_msgs = msgs + msgs2
+    for m in all_msgs:
+        assert not _EMOJI_RE.search(m), f"Emoji found in message: {m!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +311,7 @@ def test_process_watch_submission_fail_then_pass(monkeypatch):
     assert bot._watch_error_replies[7] == [9001]
     msg.add_reaction.assert_awaited_with("\u274C")
     body = posted[0][1][0]["components"][0]["content"]
-    assert "retry" in body
+    assert "Retry" in body
 
     # 2) Wrong fish + codeword present.
     ocr_text["value"] = "Mawfish\nLarge\nchat: cerebral"
@@ -350,6 +361,7 @@ def test_watch_components_and_state(monkeypatch):
     ids = [b["custom_id"] for b in rows[1]["components"]]
     assert ids == [
         "watch:start", "watch:stop", "watch:codeword", "watch:admins",
+        "watch:leaderboard",
     ]
     nav_ids = [b["custom_id"] for b in rows[2]["components"]]
     assert nav_ids == [
@@ -357,6 +369,8 @@ def test_watch_components_and_state(monkeypatch):
     ]
     body = comps[1]["components"][0]["content"]
     assert "cerebral" in body and "Norg" in body and "<#555>" in body
+    # The fish reference table was removed from the Watch page.
+    assert "Mortus Lungfish" not in body
 
 
 # ---------------------------------------------------------------------------
@@ -439,3 +453,89 @@ def test_watch_records_page_lists_top_catches():
     assert "https://discord.com/channels/99/555/44" in body
     # Fish with no recorded catches are omitted.
     assert "Mawfish" not in body
+
+
+# ---------------------------------------------------------------------------
+# Catch quality + Leaderboards panel
+# ---------------------------------------------------------------------------
+
+def test_extract_quality():
+    assert fishwatch.extract_quality("N o r g\nLarge\n24.35 kg") == "Large"
+    assert fishwatch.extract_quality("Scrubber\nADORNED\n6 points") == "Adorned"
+    assert fishwatch.extract_quality("Norg 24 kg") is None
+    assert fishwatch.extract_quality("") is None
+    # Embedded matches are rejected (whole word only).
+    assert fishwatch.extract_quality("enlarged basically") is None
+
+
+def test_evaluate_submission_carries_quality():
+    v = evaluate_submission(
+        "Norg\nLarge\n39.9 kg\nchat: cerebral",
+        codeword="cerebral", expected_fish="Norg",
+    )
+    assert v.ok and v.quality == "Large"
+    v2 = evaluate_submission(
+        "Norg\n39.9 kg\nchat: cerebral",
+        codeword="cerebral", expected_fish="Norg",
+    )
+    assert v2.ok and v2.quality is None
+
+
+def test_watch_leaderboard_empty():
+    import bot
+
+    comps = bot._watch_leaderboard_components(1, 0, [], 0)
+    assert "Leaderboards" in comps[0]["content"]
+    body = comps[1]["components"][0]["content"]
+    assert "No catches recorded yet" in body
+    nav = comps[1]["components"][-1]["components"]
+    assert [b["custom_id"] for b in nav] == [
+        "watch:lb:-1", "watch:noop", "watch:lb:1", "watch:lb:0",
+    ]
+    # Single (empty) page: both Prev and Next disabled.
+    assert nav[0]["disabled"] and nav[2]["disabled"]
+
+
+def test_watch_leaderboard_lists_largest_with_quality():
+    import bot
+
+    rows = [
+        {"fish_name": "Norg", "weight": 39.9, "unit": "kg",
+         "quality": "Large", "user_id": 7, "channel_id": 555,
+         "message_id": 44, "caught_ts": 1},
+        {"fish_name": "Longwinder", "weight": 14.0, "unit": "points",
+         "quality": "Adorned", "user_id": None, "channel_id": 555,
+         "message_id": 45, "caught_ts": 2},
+        {"fish_name": "Mawfish", "weight": 12.0, "unit": "kg",
+         "quality": None, "user_id": 8, "channel_id": 555,
+         "message_id": 46, "caught_ts": 3},
+    ]
+    comps = bot._watch_leaderboard_components(99, 0, rows, 3)
+    body = comps[1]["components"][0]["content"]
+    # Quality renders next to the weight; no quality means no parens.
+    assert "**39.9 kg** (Large)" in body
+    assert "**14 points** (Adorned)" in body
+    assert "**12 kg** \u2014" in body
+    assert "<@7>" in body and "former member" in body
+    assert "https://discord.com/channels/99/555/44" in body
+    assert "**1.**" in body and "**3.**" in body
+
+
+def test_watch_leaderboard_pagination_ranks_and_nav():
+    import bot
+
+    rows = [
+        {"fish_name": "Norg", "weight": 20.0, "unit": "kg",
+         "quality": "Medium", "user_id": 7, "channel_id": 555,
+         "message_id": 50, "caught_ts": 1},
+    ]
+    # Page 1 of a 11-catch board: ranks continue from the previous page.
+    comps = bot._watch_leaderboard_components(99, 1, rows, 11)
+    body = comps[1]["components"][0]["content"]
+    assert "**11.**" in body
+    nav = comps[1]["components"][-1]["components"]
+    assert [b["custom_id"] for b in nav] == [
+        "watch:lb:0", "watch:noop", "watch:lb:2", "watch:lb:1",
+    ]
+    assert not nav[0]["disabled"] and nav[2]["disabled"]
+    assert nav[1]["label"] == "2/2"

@@ -6622,17 +6622,6 @@ def _persist_watch_state() -> None:
         _update_env_value(key, value)
 
 
-def _watch_fish_reference_lines() -> str:
-    parts: list[str] = []
-    for planet in fishwatch.PLANETS:
-        fishes = " \u00B7 ".join(
-            f"{f.name} ({f.quality})"
-            for f in fishwatch.FISH if f.planet == planet
-        )
-        parts.append(f"-# **{planet}:** {fishes}")
-    return "\n".join(parts)
-
-
 # (page key, title) for the paginated /watch panel — page bodies are built
 # inline in _watch_components (they need the watch state / leaderboard).
 _WATCH_PAGES: list[tuple[str, str]] = [
@@ -6690,12 +6679,77 @@ def _watch_records_body(guild_id: int, top: dict[str, list[dict]]) -> str:
                 lines.append(
                     f"-# {_WATCH_MEDALS[rank]} "
                     f"**{_format_catch_value(row['weight'], row['unit'])}**"
-                    f" \u2014 {who} \u00B7 [view]({url})"
+                    + (f" ({row['quality']})" if row.get("quality") else "")
+                    + f" \u2014 {who} \u00B7 [view]({url})"
                 )
         if lines:
             parts.append(f"### {planet}")
             parts.extend(lines)
     return "\n".join(parts)
+
+
+# Catches per page of the Leaderboards panel (largest weight first).
+_WATCH_LB_PAGE_SIZE = 10
+
+
+def _watch_leaderboard_components(
+    guild_id: int, page: int, rows: list[dict], total: int
+) -> list[dict]:
+    """The Leaderboards panel: one paginated V2 message listing every
+    recorded catch ordered by largest weight, with the catch quality
+    (Large / Adorned / …) next to the weight."""
+    pages = max(1, -(-total // _WATCH_LB_PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    if not rows:
+        body = (
+            "*No catches recorded yet — passing submissions with a readable "
+            "weight land here automatically.*"
+        )
+    else:
+        lines: list[str] = [
+            "-# Largest recorded catches, heaviest first. "
+            "Links jump to the submitted screenshot."
+        ]
+        for i, row in enumerate(rows):
+            rank = page * _WATCH_LB_PAGE_SIZE + i + 1
+            medal = (
+                f"{_WATCH_MEDALS[rank - 1]} " if rank <= len(_WATCH_MEDALS)
+                else ""
+            )
+            quality = f" ({row['quality']})" if row.get("quality") else ""
+            who = (
+                f"<@{row['user_id']}>" if row.get("user_id")
+                else "*former member*"
+            )
+            url = (
+                f"https://discord.com/channels/{guild_id}/"
+                f"{row['channel_id']}/{row['message_id']}"
+            )
+            lines.append(
+                f"-# **{rank}.** {medal}**{row['fish_name']}** \u2014 "
+                f"**{_format_catch_value(row['weight'], row['unit'])}**"
+                f"{quality} \u2014 {who} \u00B7 [view]({url})"
+            )
+        body = "\n".join(lines)
+    nav_row = _pagination_nav_row(
+        pages, page,
+        prev_id=f"watch:lb:{page - 1}",
+        noop_id="watch:noop",
+        next_id=f"watch:lb:{page + 1}",
+        refresh_id=f"watch:lb:{page}",
+    )
+    return [
+        {"type": 10,
+         "content": "### \U0001F3C6  Fish Watch \u2014 Leaderboards"},
+        {
+            "type": 17,
+            "accent_color": ACCENT_PASS,
+            "components": [
+                {"type": 10, "content": body},
+                nav_row,
+            ],
+        },
+    ]
 
 
 def _watch_components(
@@ -6750,8 +6804,7 @@ def _watch_components(
         f"**Codeword:** {codeword_line}\n"
         f"-# > A new codeword only applies to newly sent images.\n"
         f"**Watch admins:** {admins_line}\n"
-        f"**Current fish:** {fish_line}\n\n"
-        f"{_watch_fish_reference_lines()}"
+        f"**Current fish:** {fish_line}"
     )
     button_row = {
         "type": 1,
@@ -6765,6 +6818,8 @@ def _watch_components(
              "custom_id": "watch:codeword"},
             {"type": 2, "style": 1, "label": "Set admin",
              "custom_id": "watch:admins"},
+            {"type": 2, "style": 2, "label": "Leaderboards",
+             "custom_id": "watch:leaderboard"},
         ],
     }
     return [
@@ -6898,6 +6953,34 @@ async def _handle_watch_interaction(
                 _watch_components(page, guild_id=guild.id, top=top),
             )
         return
+    if action == "leaderboard" or action.startswith("lb:"):
+        # "leaderboard" (panel button) opens a NEW ephemeral message;
+        # "lb:<page>" (its nav row) updates that message in place.
+        page = 0
+        if action.startswith("lb:"):
+            try:
+                page = max(0, int(action.split(":", 1)[1]))
+            except ValueError:
+                page = 0
+        rows, total = await asyncio.to_thread(
+            analytics.fish_catch_leaderboard, guild.id,
+            offset=page * _WATCH_LB_PAGE_SIZE, limit=_WATCH_LB_PAGE_SIZE,
+        )
+        if not rows and total and page > 0:
+            # Page past the end (catches purged since render): show last.
+            page = max(0, -(-total // _WATCH_LB_PAGE_SIZE) - 1)
+            rows, total = await asyncio.to_thread(
+                analytics.fish_catch_leaderboard, guild.id,
+                offset=page * _WATCH_LB_PAGE_SIZE,
+                limit=_WATCH_LB_PAGE_SIZE,
+            )
+        with contextlib.suppress(Exception):
+            await _interaction_callback(
+                interaction,
+                4 if action == "leaderboard" else 7,
+                _watch_leaderboard_components(guild.id, page, rows, total),
+            )
+        return
     if action == "codeword":
         with contextlib.suppress(discord.HTTPException):
             await interaction.response.send_modal(_WatchCodewordModal())
@@ -7015,6 +7098,7 @@ async def _process_watch_submission(
                 fish=verdict.fish or "",
                 weight=verdict.weight,
                 unit=verdict.unit or "kg",
+                quality=verdict.quality,
                 caught_ts=int(created.timestamp()) if created else None,
             )
         logger.info(
@@ -7027,7 +7111,7 @@ async def _process_watch_submission(
     lines = fishwatch.problem_messages(
         verdict, codeword_set=bool(codeword), expected_fish=expected_fish
     )
-    body = f"<@{user_id}>\n" + "\n".join(f"\u274C {line}" for line in lines)
+    body = f"<@{user_id}>\n" + "\n\n".join(lines)
     reply_id = await _post_channel_v2(
         channel_id,
         [{"type": 17, "accent_color": ACCENT_FAIL,
