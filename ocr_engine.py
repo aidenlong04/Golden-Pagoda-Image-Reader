@@ -264,13 +264,15 @@ def _ocr_via_api(
 
 def _ocr_via_ollama(
     image_bytes: bytes,
+    prompt: str | None = None,
 ) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]]:
     """Transcribe a screenshot with a local Ollama vision model.
 
     Returns ``(text, [])`` — Ollama yields plain text with no per-word bounding
     boxes, so the words list is always empty (the title-bar Tesseract
     supplement still runs afterward to recover the PlayerName#NNN box when a
-    local Tesseract is available).
+    local Tesseract is available). ``prompt`` overrides the default
+    profile-screenshot prompt (e.g. the fish-watch prompt).
     """
     if not OLLAMA_OCR_MODEL:
         raise RuntimeError("OLLAMA_OCR_MODEL not configured")
@@ -279,7 +281,7 @@ def _ocr_via_ollama(
         f"{OLLAMA_URL}/api/generate",
         json={
             "model": OLLAMA_OCR_MODEL,
-            "prompt": _OLLAMA_OCR_PROMPT,
+            "prompt": prompt or _OLLAMA_OCR_PROMPT,
             "images": [b64],
             "stream": False,
             "options": {"temperature": 0},
@@ -355,6 +357,48 @@ def _ocr(
     text, words, engine = result
     text, words = _supplement_title_bar_ocr(image_bytes, text, words)
     result = (text, words, engine)
+    _cache_put(key, result)
+    return result
+
+
+def _ocr_with_prompt(
+    image_bytes: bytes, filename: str, content_type: str, prompt: str
+) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]], str]:
+    """OCR with a task-specific vision prompt (e.g. fishing screenshots).
+
+    Prefers the local Ollama vision model driven by ``prompt``; on failure or
+    when Ollama isn't configured, falls through to the standard ``_ocr``
+    pipeline (OCR.space → Tesseract), whose plain transcript still carries
+    the fish name / chat codeword text. Cached under a key that mixes the
+    prompt hash into the image hash so prompt changes never collide with the
+    profile-OCR cache entries for the same bytes.
+    """
+    key = _cache_key(hashlib.sha256(prompt.encode("utf-8")).digest() + image_bytes)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    if OLLAMA_OCR_MODEL:
+        try:
+            text, words = _ocr_via_ollama(image_bytes, prompt=prompt)
+            if text:
+                result = (text, words, "ollama")
+                _cache_put(key, result)
+                return result
+            logger.warning(
+                "Ollama prompt-OCR (%s) returned empty text; falling back",
+                OLLAMA_OCR_MODEL,
+            )
+        except Exception as ollama_err:
+            logger.warning(
+                "Ollama prompt-OCR (%s) failed (%s); falling back",
+                OLLAMA_OCR_MODEL,
+                ollama_err.__class__.__name__,
+            )
+    result = (
+        _ocr_uncached(image_bytes, filename, content_type)
+        if OLLAMA_OCR_MODEL
+        else _ocr(image_bytes, filename, content_type)
+    )
     _cache_put(key, result)
     return result
 

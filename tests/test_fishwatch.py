@@ -1,0 +1,342 @@
+"""Tests for fishwatch.py — the /watch fish-submission rules."""
+from __future__ import annotations
+
+import os
+
+import pytest
+
+import fishwatch
+from fishwatch import (
+    FISH,
+    FISH_BY_KEY,
+    PROBLEM_CODEWORD,
+    PROBLEM_UNREADABLE,
+    PROBLEM_WRONG_FISH,
+    WatchState,
+    build_watch_prompt,
+    canonical_fish,
+    evaluate_submission,
+    find_fish,
+    problem_messages,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fish reference data
+# ---------------------------------------------------------------------------
+
+def test_fish_roster_matches_spec():
+    by_planet = {
+        "Earth": {"Mortus Lungfish", "Mawfish", "Sharrac", "Norg"},
+        "Venus": {"Scrubber", "Brickie", "Longwinder", "Tromyzon"},
+        "Deimos": {"Amniophysi", "Cryptosuctus", "Duroid", "Aquapulmo"},
+    }
+    for planet, names in by_planet.items():
+        assert {f.name for f in FISH if f.planet == planet} == names
+    assert len(FISH) == 12
+
+
+def test_fish_have_quality_and_rarity():
+    for fish in FISH:
+        assert fish.quality.endswith(("kg", "points"))
+        assert fish.rarity in {"Common", "Uncommon", "Rare"}
+
+
+def test_norg_weight_from_item_pull():
+    assert FISH_BY_KEY["norg"].quality == "40 kg"
+    assert FISH_BY_KEY["mawfish"].quality == "30 kg"
+    assert FISH_BY_KEY["longwinder"].quality == "16 points"
+
+
+# ---------------------------------------------------------------------------
+# Fish name matching
+# ---------------------------------------------------------------------------
+
+def test_find_fish_case_insensitive():
+    assert find_fish("next fish is norg") == "Norg"
+    assert find_fish("MAWFISH please") == "Mawfish"
+
+
+def test_find_fish_letter_spaced_title():
+    # Warframe renders the caught-fish header letter-spaced.
+    assert find_fish("N o r g\nLarge\n39.9 kg") == "Norg"
+
+
+def test_find_fish_multi_word():
+    assert find_fish("go catch a mortus lungfish now") == "Mortus Lungfish"
+
+
+def test_find_fish_rejects_embedded():
+    assert find_fish("snorgle") is None
+    assert find_fish("") is None
+    assert find_fish("no fish here") is None
+
+
+def test_find_fish_returns_earliest_match():
+    assert find_fish("Sharrac beats Norg") == "Sharrac"
+
+
+def test_canonical_fish():
+    assert canonical_fish("norg") == "Norg"
+    assert canonical_fish(" TROMYZON ") == "Tromyzon"
+    assert canonical_fish("boot") is None
+
+
+# ---------------------------------------------------------------------------
+# Submission evaluation
+# ---------------------------------------------------------------------------
+
+GOOD_TEXT = (
+    "N o r g\nLarge\n39.9 kg\nThis fish inhabits the shallows\n"
+    "[14:03] Donut-Prime: cerebral\nSEND MESSAGE TO SQUAD"
+)
+
+
+def test_evaluate_pass():
+    v = evaluate_submission(GOOD_TEXT, codeword="cerebral", expected_fish="Norg")
+    assert v.ok and not v.problems and v.fish == "Norg"
+
+
+def test_evaluate_unreadable_empty():
+    v = evaluate_submission("", codeword="cerebral", expected_fish="Norg")
+    assert not v.ok and v.problems == (PROBLEM_UNREADABLE,)
+
+
+def test_evaluate_unreadable_no_fish():
+    v = evaluate_submission(
+        "blurry nonsense text", codeword="cerebral", expected_fish="Norg"
+    )
+    assert not v.ok and v.problems == (PROBLEM_UNREADABLE,)
+
+
+def test_evaluate_missing_codeword():
+    text = "N o r g\nLarge\n39.9 kg"
+    v = evaluate_submission(text, codeword="cerebral", expected_fish="Norg")
+    assert not v.ok and v.problems == (PROBLEM_CODEWORD,)
+
+
+def test_evaluate_wrong_codeword():
+    text = "Norg\n[14:03] Donut-Prime: cerebrum"
+    v = evaluate_submission(text, codeword="cerebral", expected_fish="Norg")
+    assert not v.ok and PROBLEM_CODEWORD in v.problems
+
+
+def test_evaluate_codeword_case_insensitive():
+    text = "Norg\nchat: CEREBRAL"
+    v = evaluate_submission(text, codeword="cerebral", expected_fish="Norg")
+    assert v.ok
+
+
+def test_evaluate_no_codeword_configured():
+    v = evaluate_submission("Norg 39.9 kg", codeword="", expected_fish="Norg")
+    assert v.ok
+
+
+def test_evaluate_wrong_fish():
+    text = "Mawfish\nMedium\nchat: cerebral"
+    v = evaluate_submission(text, codeword="cerebral", expected_fish="Norg")
+    assert not v.ok
+    assert v.problems == (PROBLEM_WRONG_FISH,)
+    assert v.fish == "Mawfish"
+
+
+def test_evaluate_wrong_fish_and_missing_codeword():
+    v = evaluate_submission("Mawfish", codeword="cerebral", expected_fish="Norg")
+    assert set(v.problems) == {PROBLEM_CODEWORD, PROBLEM_WRONG_FISH}
+
+
+def test_evaluate_no_expected_fish_accepts_any():
+    v = evaluate_submission(
+        "Tromyzon\nchat: cerebral", codeword="cerebral", expected_fish=None
+    )
+    assert v.ok and v.fish == "Tromyzon"
+
+
+def test_problem_messages_cover_all_problems():
+    v = evaluate_submission("Mawfish", codeword="cerebral", expected_fish="Norg")
+    msgs = problem_messages(v, codeword_set=True, expected_fish="Norg")
+    joined = " ".join(msgs)
+    assert "codeword is required" in joined
+    assert "Norg" in joined and "Mawfish" in joined
+
+    v2 = evaluate_submission("", codeword="", expected_fish=None)
+    msgs2 = problem_messages(v2, codeword_set=False, expected_fish=None)
+    assert any("retry with a new" in m for m in msgs2)
+
+
+# ---------------------------------------------------------------------------
+# Watch state env round-trip
+# ---------------------------------------------------------------------------
+
+def test_watch_state_from_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(fishwatch.ENV_ENABLED, "1")
+    monkeypatch.setenv(fishwatch.ENV_CHANNEL, "12345")
+    monkeypatch.setenv(fishwatch.ENV_CODEWORD, "cerebral")
+    monkeypatch.setenv(fishwatch.ENV_ADMIN_IDS, "1,2,3")
+    monkeypatch.setenv(fishwatch.ENV_FISH, "norg")
+    state = WatchState.from_env()
+    assert state.enabled and state.channel_id == 12345
+    assert state.codeword == "cerebral"
+    assert state.admin_ids == {1, 2, 3}
+    assert state.current_fish == "Norg"
+
+
+def test_watch_state_from_env_defaults(monkeypatch: pytest.MonkeyPatch):
+    for key in (
+        fishwatch.ENV_ENABLED, fishwatch.ENV_CHANNEL, fishwatch.ENV_CODEWORD,
+        fishwatch.ENV_ADMIN_IDS, fishwatch.ENV_FISH,
+    ):
+        monkeypatch.delenv(key, raising=False)
+    state = WatchState.from_env()
+    assert not state.enabled
+    assert state.channel_id == 0
+    assert state.codeword == ""
+    assert state.admin_ids == set()
+    assert state.current_fish is None
+
+
+def test_watch_state_env_items_round_trip():
+    state = WatchState(
+        enabled=True, channel_id=99, codeword="w",
+        admin_ids={5, 2}, current_fish="Norg",
+    )
+    items = dict(state.env_items())
+    assert items[fishwatch.ENV_ENABLED] == "1"
+    assert items[fishwatch.ENV_CHANNEL] == "99"
+    assert items[fishwatch.ENV_CODEWORD] == "w"
+    assert items[fishwatch.ENV_ADMIN_IDS] == "2,5"
+    assert items[fishwatch.ENV_FISH] == "Norg"
+
+
+# ---------------------------------------------------------------------------
+# Vision prompt
+# ---------------------------------------------------------------------------
+
+def test_watch_prompt_lists_every_fish():
+    prompt = build_watch_prompt()
+    for fish in FISH:
+        assert fish.name in prompt
+    assert "green" in prompt
+    assert "chat" in prompt
+
+
+# ---------------------------------------------------------------------------
+# bot.py watcher integration (stubbed Discord I/O)
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+from unittest.mock import AsyncMock  # noqa: E402
+
+# A 1x1 PNG so validate_image_bytes passes.
+import io  # noqa: E402
+
+from PIL import Image  # noqa: E402
+
+
+def _png_1px() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (1, 1)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+_PNG_1PX = _png_1px()
+
+
+def _fake_message(*, author_id=7, channel_id=555, message_id=42):
+    return SimpleNamespace(
+        id=message_id,
+        author=SimpleNamespace(id=author_id, bot=False),
+        channel=SimpleNamespace(id=channel_id),
+        add_reaction=AsyncMock(),
+    )
+
+
+def _fake_attachment(data: bytes):
+    return SimpleNamespace(
+        filename="fish.png",
+        content_type="image/png",
+        read=AsyncMock(return_value=data),
+    )
+
+
+def test_process_watch_submission_fail_then_pass(monkeypatch):
+    import bot
+
+    posted: list[tuple[int, list]] = []
+    deleted: list[int] = []
+
+    async def fake_post(channel_id, components, **kw):
+        posted.append((channel_id, components))
+        return 9000 + len(posted)
+
+    async def fake_delete(channel_id, message_id):
+        deleted.append(message_id)
+
+    ocr_text = {"value": "blurry nonsense"}
+
+    async def fake_run_heavy(func, *args, **kwargs):
+        return ocr_text["value"], [], "test"
+
+    monkeypatch.setattr(bot, "_post_channel_v2", fake_post)
+    monkeypatch.setattr(bot, "_delete_message", fake_delete)
+    monkeypatch.setattr(bot, "_run_heavy", fake_run_heavy)
+    monkeypatch.setattr(bot, "_watch_error_replies", {})
+    monkeypatch.setattr(bot._WATCH_STATE, "enabled", True)
+
+    msg = _fake_message()
+    att = _fake_attachment(_PNG_1PX)
+
+    # 1) Unreadable submission -> ❌ react + error reply tracked.
+    asyncio.run(bot._process_watch_submission(
+        msg, att, codeword="cerebral", expected_fish="Norg",
+    ))
+    assert len(posted) == 1
+    assert bot._watch_error_replies[7] == [9001]
+    msg.add_reaction.assert_awaited_with("\u274C")
+    body = posted[0][1][0]["components"][0]["content"]
+    assert "retry" in body
+
+    # 2) Wrong fish + codeword present.
+    ocr_text["value"] = "Mawfish\nLarge\nchat: cerebral"
+    msg2 = _fake_message(message_id=43)
+    asyncio.run(bot._process_watch_submission(
+        msg2, att, codeword="cerebral", expected_fish="Norg",
+    ))
+    # The previous error reply was deleted, a new one tracked.
+    assert deleted == [9001]
+    assert bot._watch_error_replies[7] == [9002]
+    body2 = posted[1][1][0]["components"][0]["content"]
+    assert "Mawfish" in body2 and "Norg" in body2
+
+    # 3) Corrected image passes: old error reply deleted, ✅ react, none tracked.
+    ocr_text["value"] = "N o r g\nLarge\n39.9 kg\n[14:03] Donut-Prime: cerebral"
+    msg3 = _fake_message(message_id=44)
+    asyncio.run(bot._process_watch_submission(
+        msg3, att, codeword="cerebral", expected_fish="Norg",
+    ))
+    assert deleted == [9001, 9002]
+    assert 7 not in bot._watch_error_replies
+    msg3.add_reaction.assert_awaited_with("\u2705")
+    assert len(posted) == 2  # no new error reply
+
+
+def test_watch_components_and_state(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(
+        bot, "_WATCH_STATE",
+        fishwatch.WatchState(
+            enabled=True, channel_id=555, codeword="cerebral",
+            admin_ids={1}, current_fish="Norg",
+        ),
+    )
+    comps = bot._watch_components()
+    assert comps[0]["content"].endswith("Fish Watch")
+    row = comps[1]["components"][-1]["components"]
+    ids = [b["custom_id"] for b in row]
+    assert ids[:4] == [
+        "watch:start", "watch:stop", "watch:codeword", "watch:admins",
+    ]
+    body = comps[1]["components"][0]["content"]
+    assert "cerebral" in body and "Norg" in body and "<#555>" in body
