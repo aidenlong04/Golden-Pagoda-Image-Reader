@@ -387,13 +387,18 @@ async def _discord_call_with_retry(coro_factory, /, *, label: str = "discord cal
         max_delay=_DISCORD_RETRY_MAX_DELAY,
     )
 
+def _write_health_signal() -> None:
+    with open(HEALTH_PATH, "w") as fh:
+        fh.write(str(int(time.time())))
+
+
 async def _health_task() -> None:
     # Liveness signal: touch HEALTH_PATH every HEALTH_INTERVAL seconds. The
-    # watchdog treats a stale (>90s) file as unhealthy.
+    # watchdog treats a stale (>90s) file as unhealthy. The write runs in a
+    # worker thread so a slow disk can never stall the event loop.
     while True:
         try:
-            with open(HEALTH_PATH, "w") as fh:
-                fh.write(str(int(time.time())))
+            await asyncio.to_thread(_write_health_signal)
         except OSError:
             logger.exception("health write failed")
         await asyncio.sleep(HEALTH_INTERVAL)
@@ -2112,16 +2117,20 @@ async def on_member_join(member: discord.Member) -> None:
         return
     # Debounce: skip if another welcome was posted in this guild within the
     # last _JOIN_DEBOUNCE_SECONDS to prevent a raid from hammering the channel.
+    # Reserve the slot *before* sleeping: concurrent joins each claim the next
+    # free window, so a burst staggers one prompt per debounce interval
+    # instead of every waiter waking together and posting at once.
     guild_id = member.guild.id
     now = time.monotonic()
     last = _JOIN_LAST_POST.get(guild_id, 0.0)
-    if now - last < _JOIN_DEBOUNCE_SECONDS:
+    scheduled = max(now, last + _JOIN_DEBOUNCE_SECONDS) if last else now
+    _JOIN_LAST_POST[guild_id] = scheduled
+    if scheduled > now:
         logger.debug(
             "onboarding: debouncing join for %s in guild %s (%.1fs since last)",
             member.id, guild_id, now - last,
         )
-        await asyncio.sleep(max(0.0, _JOIN_DEBOUNCE_SECONDS - (now - last)))
-    _JOIN_LAST_POST[guild_id] = time.monotonic()
+        await asyncio.sleep(scheduled - now)
     _spawn_bg_task(_post_onboarding_welcome(member))
 
 
@@ -3195,13 +3204,15 @@ async def _edit_or_create_member_record(
                 mastery_rank=mastery_rank,
                 summary_lines=summary_lines,
             )
-        # Keep the per-member lock map bounded: drop the lock now that it is
-        # released, unless another writer already holds or awaits it.
-        prune_lock_if_unused(_RECORD_WRITE_LOCKS, member.id)
     except Exception:
         logger.exception(
             "records: edit_or_create failed for %s", member.id
         )
+    finally:
+        # Keep the per-member lock map bounded: drop the lock now that it is
+        # released — even when the write failed — unless another writer
+        # already holds or awaits it.
+        prune_lock_if_unused(_RECORD_WRITE_LOCKS, member.id)
 
 
 def _member_record_jump_urls(guild_id: int, user_id: int) -> list[str]:

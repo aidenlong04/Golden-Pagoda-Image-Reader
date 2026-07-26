@@ -1595,3 +1595,57 @@ class AliasSelectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             member.edit.call_args.kwargs["nick"], "x" * 32
         )
+
+
+class JoinDebounceTests(unittest.IsolatedAsyncioTestCase):
+    """Concurrent joins must stagger their welcome posts, not fire together.
+
+    Regression guard for the debounce race: before the slot was reserved
+    prior to sleeping, every concurrent ``on_member_join`` read the same
+    ``_JOIN_LAST_POST`` timestamp, slept the same duration, and posted at
+    once — defeating the raid debounce.
+    """
+
+    async def asyncSetUp(self):
+        import bot as bot_module
+        self.bot = bot_module
+        self.bot._JOIN_LAST_POST.clear()
+
+    async def asyncTearDown(self):
+        self.bot._JOIN_LAST_POST.clear()
+
+    def _member(self, uid: int) -> MagicMock:
+        member = MagicMock()
+        member.id = uid
+        member.guild = MagicMock()
+        member.guild.id = 7
+        return member
+
+    async def test_concurrent_joins_reserve_staggered_slots(self):
+        bot = self.bot
+        sleeps: list[float] = []
+
+        def fake_spawn(coro, **kwargs):
+            coro.close()
+
+        async def fake_post(member):
+            return None
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+
+        with patch.object(bot, "_spawn_bg_task", side_effect=fake_spawn), \
+                patch.object(bot, "_post_onboarding_welcome", fake_post), \
+                patch.object(bot.asyncio, "sleep", fake_sleep):
+            await asyncio.gather(
+                bot.on_member_join(self._member(1)),
+                bot.on_member_join(self._member(2)),
+                bot.on_member_join(self._member(3)),
+            )
+
+        # Each join after the first must have reserved a distinct, later slot.
+        self.assertEqual(len(sleeps), 2)
+        self.assertNotEqual(sleeps[0], sleeps[1])
+        self.assertAlmostEqual(
+            abs(sleeps[1] - sleeps[0]), bot._JOIN_DEBOUNCE_SECONDS, delta=0.5
+        )
