@@ -95,6 +95,42 @@ def find_fish(text: str) -> str | None:
     return best[1] if best else None
 
 
+# ---------------------------------------------------------------------------
+# Known session codewords
+# ---------------------------------------------------------------------------
+
+# The roster of codeword phrases admins rotate between. An admin typing one
+# of these in the watched channel sets it as the session codeword, detected
+# the same way fish declarations are (whole-phrase, case-insensitive,
+# letter-spacing tolerant).
+CODEWORDS: tuple[str, ...] = (
+    "Pepperoni Shockalaka Dinglehopper",
+    "DYWATTA Citrus Onion",
+    "Capybara Pinocchio Skibbibidy",
+)
+
+_CODEWORD_PATTERNS: dict[str, re.Pattern[str]] = {
+    c: _fish_pattern(c) for c in CODEWORDS
+}
+
+
+def find_codeword(text: str) -> str | None:
+    """Return the first known codeword phrase found in ``text``.
+
+    Same detection rules as :func:`find_fish`: case-insensitive whole-word
+    match tolerating letter-spaced rendering. Returns None when no known
+    codeword appears.
+    """
+    if not text:
+        return None
+    best: tuple[int, str] | None = None
+    for phrase, pattern in _CODEWORD_PATTERNS.items():
+        m = pattern.search(text)
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), phrase)
+    return best[1] if best else None
+
+
 def canonical_fish(name: str) -> str | None:
     """Resolve a raw fish name (any case) to its canonical form, or None."""
     fish = FISH_BY_KEY.get((name or "").strip().casefold())
@@ -272,11 +308,9 @@ def _contains_codeword(text: str, codeword: str) -> bool:
     codeword = normalize_codeword(codeword)
     if not codeword:
         return True
-    pattern = re.compile(
-        r"(?<![A-Za-z0-9])" + re.escape(codeword) + r"(?![A-Za-z0-9])",
-        re.IGNORECASE,
-    )
-    return bool(pattern.search(text))
+    # Same matcher the fish detector uses: whole-phrase, case-insensitive,
+    # variable whitespace between words, letter-spaced rendering tolerated.
+    return bool(_fish_pattern(codeword).search(text))
 
 
 def evaluate_submission(
