@@ -6851,8 +6851,8 @@ def _watch_components(
         f"-# > Only the codeword a watch admin activated in the watched "
         f"channel is shown. A watch admin sets it by typing `codeword: "
         f"<word>` in the watched channel, or by typing one of the Set "
-        f"codewords roster entries \u2014 like naming a fish, even while the watch is "
-        f"stopped.\n"
+        f"codewords roster entries \u2014 like naming a fish, even while the "
+        f"watch is stopped.\n"
         f"**Watch admins:** {admins_line}\n"
         f"**Current fish:** {fish_line}"
     )

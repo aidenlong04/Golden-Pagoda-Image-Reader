@@ -200,13 +200,13 @@ def parse_codeword_declaration(
     m = _CODEWORD_DECL_RE.match(text)
     if not m:
         return None
-    phrase = normalize_codeword(m.group("phrase"))
+    content = normalize_codeword(m.group("phrase"))
     # Drop a leading separator that leaked past the optional matcher (e.g.
     # "codeword:" captures ":") and reject a phrase with no real content.
-    phrase = phrase.lstrip(":=-\u2014\u2013 \t").strip()
-    if not any(ch.isalnum() for ch in phrase):
+    content = content.lstrip(":=-\u2014\u2013 \t").strip()
+    if not any(ch.isalnum() for ch in content):
         return None
-    return find_codeword(phrase, codewords)
+    return find_codeword(content, codewords)
 
 
 def canonical_fish(name: str) -> str | None:
@@ -332,11 +332,12 @@ class WatchState:
     def from_env(cls) -> "WatchState":
         fish = canonical_fish(os.getenv(ENV_FISH, ""))
         raw_codeword = os.getenv(ENV_CODEWORD)
+        normalized_codeword = normalize_codeword(raw_codeword)
         codeword = _canonical_codeword(raw_codeword) or ""
-        if normalize_codeword(raw_codeword) and not codeword:
+        if normalized_codeword and not codeword:
             logger.info(
                 "watch: ignoring unknown configured codeword %r",
-                normalize_codeword(raw_codeword),
+                normalized_codeword,
             )
         codewords = parse_codewords(os.getenv(ENV_CODEWORDS))
         # The active codeword must stay in the roster, otherwise a watch admin
