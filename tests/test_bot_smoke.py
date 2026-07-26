@@ -1058,12 +1058,12 @@ class WatchAdminCodewordTests(unittest.TestCase):
          admin_ids, self.state.current_fish) = self.orig
         self.state.admin_ids = admin_ids
 
-    def _run_message(self, content):
+    def _run_message(self, content, channel=None):
         import asyncio
         message = Mock()
         message.author = Mock(bot=False, id=5)
         message.guild = Mock()
-        message.channel = Mock(id=7)
+        message.channel = channel or SimpleNamespace(id=7, parent_id=None)
         message.attachments = []
         message.content = content
         message.add_reaction = AsyncMock()
@@ -1077,6 +1077,14 @@ class WatchAdminCodewordTests(unittest.TestCase):
 
     def test_admin_message_sets_codeword(self):
         message = self._run_message("codeword is dywatta citrus onion")
+        self.assertEqual(self.state.codeword, "DYWATTA Citrus Onion")
+        message.add_reaction.assert_awaited_once()
+
+    def test_admin_message_in_thread_of_watched_channel_sets_codeword(self):
+        thread = SimpleNamespace(id=99, parent_id=7)
+        message = self._run_message(
+            "codeword is dywatta citrus onion", channel=thread
+        )
         self.assertEqual(self.state.codeword, "DYWATTA Citrus Onion")
         message.add_reaction.assert_awaited_once()
 
