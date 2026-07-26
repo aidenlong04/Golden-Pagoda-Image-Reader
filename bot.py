@@ -6863,7 +6863,7 @@ def _watch_components(
              "disabled": bool(running) or not state.channel_id},
             {"type": 2, "style": 4, "label": "Stop",
              "custom_id": "watch:stop", "disabled": not running},
-            {"type": 2, "style": 1, "label": "Set codeword",
+            {"type": 2, "style": 1, "label": "Set session codeword",
              "custom_id": "watch:codeword"},
             {"type": 2, "style": 1, "label": "Set admin",
              "custom_id": "watch:admins"},
@@ -7228,6 +7228,9 @@ async def on_message(message: discord.Message) -> None:
     if message.author.id in state.admin_ids and not message.attachments:
         content = message.content or ""
         changed = False
+        # Fish and codeword are separate declarations: a single admin
+        # message sets ONE of them, never both. A named fish wins; only a
+        # message that names no fish is considered for a codeword.
         fish = fishwatch.find_fish(content)
         if fish:
             state.current_fish = fish
@@ -7235,14 +7238,15 @@ async def on_message(message: discord.Message) -> None:
             logger.info(
                 "watch: admin %s set fish to %s", message.author.id, fish
             )
-        codeword = fishwatch.find_codeword(content)
-        if codeword:
-            state.codeword = codeword
-            changed = True
-            logger.info(
-                "watch: admin %s set codeword to %s",
-                message.author.id, codeword,
-            )
+        else:
+            codeword = fishwatch.find_codeword(content)
+            if codeword:
+                state.codeword = codeword
+                changed = True
+                logger.info(
+                    "watch: admin %s set codeword to %s",
+                    message.author.id, codeword,
+                )
         if changed:
             await asyncio.to_thread(_persist_watch_state)
             # The 🎣 reaction is the only acknowledgment — no confirmation

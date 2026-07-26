@@ -1090,9 +1090,11 @@ class WatchAdminCodewordTests(unittest.TestCase):
         self.post_v2.assert_not_awaited()
 
     def test_no_confirmation_for_fish_and_codeword_together(self):
+        # A message naming a fish sets only the fish — the codeword is
+        # ignored even if the message also contains a codeword phrase.
         message = self._run_message("Norg — capybara pinocchio skibbibidy")
         self.assertEqual(self.state.current_fish, "Norg")
-        self.assertEqual(self.state.codeword, "Capybara Pinocchio Skibbibidy")
+        self.assertEqual(self.state.codeword, "")
         message.add_reaction.assert_awaited_once()
         self.post_v2.assert_not_awaited()
 
@@ -1104,12 +1106,16 @@ class WatchAdminCodewordTests(unittest.TestCase):
         self.assertEqual(self.state.codeword, "DYWATTA Citrus Onion")
         message.add_reaction.assert_awaited_once()
 
-    def test_admin_message_sets_fish_and_codeword_together(self):
-        self._run_message("Norg — capybara pinocchio skibbibidy")
+    def test_admin_fish_message_does_not_set_codeword(self):
+        # Fish and codeword are separate declarations: a message naming a
+        # fish never sets the codeword, and vice versa. They require two
+        # separate admin messages.
+        self._run_message("Norg")
         self.assertEqual(self.state.current_fish, "Norg")
-        self.assertEqual(
-            self.state.codeword, "Capybara Pinocchio Skibbibidy"
-        )
+        self.assertEqual(self.state.codeword, "")
+        self._run_message("capybara pinocchio skibbibidy")
+        self.assertEqual(self.state.codeword, "Capybara Pinocchio Skibbibidy")
+        self.assertEqual(self.state.current_fish, "Norg")
 
     def test_admin_message_sets_codeword_while_watch_stopped(self):
         # Admin declarations are configuration — they apply even when the
