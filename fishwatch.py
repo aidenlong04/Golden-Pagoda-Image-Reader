@@ -117,13 +117,16 @@ CODEWORDS: tuple[str, ...] = (
     "Pinocchio",
     "Skibbibidy",
 )
-_CODEWORDS_BY_KEY: dict[str, str] = {w.casefold(): w for w in CODEWORDS}
+_CANONICAL_CODEWORDS: dict[str, str] = {w.casefold(): w for w in CODEWORDS}
 
 _CODEWORD_PATTERN_CACHE: dict[str, re.Pattern[str]] = {}
 
 
 def _canonical_codeword(raw: str | None) -> str | None:
-    return _CODEWORDS_BY_KEY.get(normalize_codeword(raw).casefold())
+    word = normalize_codeword(raw)
+    if not word:
+        return None
+    return _CANONICAL_CODEWORDS.get(word.casefold())
 
 
 def _codeword_pattern(word: str) -> re.Pattern[str]:
