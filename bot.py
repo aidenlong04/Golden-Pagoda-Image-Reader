@@ -6850,7 +6850,8 @@ def _watch_components(
         f"**Codeword:** {codeword_line}\n"
         f"-# > A new codeword only applies to newly sent images. A watch "
         f"admin typing a known codeword phrase in the watched channel "
-        f"sets it, like naming a fish.\n"
+        f"sets it, like naming a fish \u2014 even while the watch is "
+        f"stopped.\n"
         f"**Watch admins:** {admins_line}\n"
         f"**Current fish:** {fish_line}"
     )
@@ -7216,12 +7217,14 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot or message.guild is None:
         return
     state = _WATCH_STATE
-    if not state.enabled or not _watch_channel_matches(message.channel):
+    if not _watch_channel_matches(message.channel):
         return
     # A watch admin naming a fish (no screenshot) sets the fish being
     # watched; every later submission must show that fish until the admin
     # names a new one. Naming a known codeword phrase works the same way,
-    # setting the session codeword.
+    # setting the session codeword. Admin declarations are configuration,
+    # so they apply even while the watch is stopped (e.g. announcing the
+    # next session's codeword before pressing Start).
     if message.author.id in state.admin_ids and not message.attachments:
         content = message.content or ""
         changed = False
@@ -7248,7 +7251,7 @@ async def on_message(message: discord.Message) -> None:
                 await message.add_reaction("\U0001F3A3")
         return
     attachment = _first_image_attachment(message)
-    if attachment is None:
+    if attachment is None or not state.enabled:
         return
     # Snapshot codeword + fish at receipt: a codeword set after this message
     # was sent must not apply to it.
