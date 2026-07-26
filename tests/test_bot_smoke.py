@@ -1058,10 +1058,10 @@ class WatchAdminCodewordTests(unittest.TestCase):
          admin_ids, self.state.current_fish) = self.orig
         self.state.admin_ids = admin_ids
 
-    def _run_message(self, content, channel=None):
+    def _run_message(self, content, channel=None, author_id=5):
         import asyncio
         message = Mock()
-        message.author = Mock(bot=False, id=5)
+        message.author = Mock(bot=False, id=author_id)
         message.guild = Mock()
         message.channel = channel or SimpleNamespace(id=7, parent_id=None)
         message.attachments = []
@@ -1079,28 +1079,22 @@ class WatchAdminCodewordTests(unittest.TestCase):
             self.b._post_channel_v2 = orig_post
         return message
 
-    def _confirmation_text(self):
-        self.post_v2.assert_awaited_once()
-        components = self.post_v2.await_args.args[1]
-        return components[0]["components"][0]["content"]
-
     def test_admin_message_sets_codeword(self):
         message = self._run_message("codeword is dywatta citrus onion")
         self.assertEqual(self.state.codeword, "DYWATTA Citrus Onion")
         message.add_reaction.assert_awaited_once()
 
-    def test_confirmation_shows_new_codeword(self):
+    def test_no_confirmation_message_posted(self):
+        # The 🎣 reaction is the only acknowledgment — nothing is sent.
         self._run_message("codeword is dywatta citrus onion")
-        text = self._confirmation_text()
-        self.assertIn("`DYWATTA Citrus Onion`", text)
-        self.assertNotIn("Current fish", text)
+        self.post_v2.assert_not_awaited()
 
-    def test_confirmation_shows_fish_and_codeword_together(self):
-        self._run_message("Norg — capybara pinocchio skibbibidy")
-        text = self._confirmation_text()
-        self.assertIn("**Norg**", text)
-        self.assertIn("Earth", text)  # fish detail line from FISH data
-        self.assertIn("`Capybara Pinocchio Skibbibidy`", text)
+    def test_no_confirmation_for_fish_and_codeword_together(self):
+        message = self._run_message("Norg — capybara pinocchio skibbibidy")
+        self.assertEqual(self.state.current_fish, "Norg")
+        self.assertEqual(self.state.codeword, "Capybara Pinocchio Skibbibidy")
+        message.add_reaction.assert_awaited_once()
+        self.post_v2.assert_not_awaited()
 
     def test_admin_message_in_thread_of_watched_channel_sets_codeword(self):
         thread = SimpleNamespace(id=99, parent_id=7)
@@ -1116,6 +1110,25 @@ class WatchAdminCodewordTests(unittest.TestCase):
         self.assertEqual(
             self.state.codeword, "Capybara Pinocchio Skibbibidy"
         )
+
+    def test_admin_message_sets_codeword_while_watch_stopped(self):
+        # Admin declarations are configuration — they apply even when the
+        # watch is stopped (e.g. announcing the codeword before Start).
+        self.state.enabled = False
+        message = self._run_message("codeword is dywatta citrus onion")
+        self.assertEqual(self.state.codeword, "DYWATTA Citrus Onion")
+        message.add_reaction.assert_awaited_once()
+
+    def test_admin_message_sets_fish_while_watch_stopped(self):
+        self.state.enabled = False
+        self._run_message("Norg")
+        self.assertEqual(self.state.current_fish, "Norg")
+
+    def test_non_admin_message_while_stopped_changes_nothing(self):
+        self.state.enabled = False
+        message = self._run_message("dywatta citrus onion", author_id=6)
+        self.assertEqual(self.state.codeword, "")
+        message.add_reaction.assert_not_awaited()
 
     def test_admin_message_without_known_phrases_changes_nothing(self):
         message = self._run_message("hello team")

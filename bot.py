@@ -6850,7 +6850,8 @@ def _watch_components(
         f"**Codeword:** {codeword_line}\n"
         f"-# > A new codeword only applies to newly sent images. A watch "
         f"admin typing a known codeword phrase in the watched channel "
-        f"sets it, like naming a fish.\n"
+        f"sets it, like naming a fish \u2014 even while the watch is "
+        f"stopped.\n"
         f"**Watch admins:** {admins_line}\n"
         f"**Current fish:** {fish_line}"
     )
@@ -7198,35 +7199,6 @@ async def _process_watch_submission(
         )
 
 
-async def _post_watch_update_confirmation(
-    channel_id: int, *, fish: str | None, codeword: str | None
-) -> None:
-    """Visibly confirm what an admin's message just assigned — the newly
-    read codeword and/or the fish now being watched — so it's clear the
-    change actually took. Auto-deletes after REPLY_TTL_SECONDS to keep
-    the watched channel clean."""
-    lines = ["\U0001F3A3 **Watch updated**"]
-    if fish:
-        info = fishwatch.FISH_BY_KEY.get(fish.casefold())
-        detail = (
-            f" \u2014 {info.planet}, max {info.quality}, {info.rarity}"
-            if info else ""
-        )
-        lines.append(f"**Current fish:** **{fish}**{detail}")
-    if codeword:
-        lines.append(f"**Codeword:** `{codeword}`")
-    reply_id = await _post_channel_v2(
-        channel_id,
-        [{"type": 17, "accent_color": ACCENT_PASS,
-          "components": [{"type": 10, "content": "\n".join(lines)}]}],
-    )
-    if reply_id and REPLY_TTL_SECONDS > 0:
-        async def _cleanup() -> None:
-            await asyncio.sleep(REPLY_TTL_SECONDS)
-            await _delete_message(channel_id, reply_id)
-        _spawn_bg_task(_cleanup())
-
-
 def _watch_channel_matches(channel: object) -> bool:
     """True when *channel* is the watched channel, or a thread/forum post
     whose parent is the watched channel. Watching a forum channel watches
@@ -7245,12 +7217,14 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot or message.guild is None:
         return
     state = _WATCH_STATE
-    if not state.enabled or not _watch_channel_matches(message.channel):
+    if not _watch_channel_matches(message.channel):
         return
     # A watch admin naming a fish (no screenshot) sets the fish being
     # watched; every later submission must show that fish until the admin
     # names a new one. Naming a known codeword phrase works the same way,
-    # setting the session codeword.
+    # setting the session codeword. Admin declarations are configuration,
+    # so they apply even while the watch is stopped (e.g. announcing the
+    # next session's codeword before pressing Start).
     if message.author.id in state.admin_ids and not message.attachments:
         content = message.content or ""
         changed = False
@@ -7271,14 +7245,13 @@ async def on_message(message: discord.Message) -> None:
             )
         if changed:
             await asyncio.to_thread(_persist_watch_state)
+            # The 🎣 reaction is the only acknowledgment — no confirmation
+            # message is posted in the channel.
             with contextlib.suppress(discord.HTTPException):
                 await message.add_reaction("\U0001F3A3")
-            await _post_watch_update_confirmation(
-                message.channel.id, fish=fish, codeword=codeword
-            )
         return
     attachment = _first_image_attachment(message)
-    if attachment is None:
+    if attachment is None or not state.enabled:
         return
     # Snapshot codeword + fish at receipt: a codeword set after this message
     # was sent must not apply to it.
