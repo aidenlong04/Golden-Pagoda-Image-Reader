@@ -7242,9 +7242,8 @@ async def on_message(message: discord.Message) -> None:
     if message.author.id in state.admin_ids and not message.attachments:
         content = message.content or ""
         changed = False
-        # Fish and codeword are separate declarations: a single admin
-        # message sets ONE of them, never both. A named fish wins; only a
-        # message that names no fish is considered for a codeword.
+        # Fish and codeword are detected independently, so a single admin
+        # message can name a fish AND carry a codeword and set both at once.
         fish = fishwatch.find_fish(content)
         if fish:
             state.current_fish = fish
@@ -7252,33 +7251,32 @@ async def on_message(message: discord.Message) -> None:
             logger.info(
                 "watch: admin %s set fish to %s", message.author.id, fish
             )
+        # A roster phrase (bare, canonical casing) activates that codeword.
+        codeword = fishwatch.find_codeword(content, state.codewords)
+        if codeword:
+            state.codeword = codeword
+            changed = True
+            logger.info(
+                "watch: admin %s set codeword to %s",
+                message.author.id, codeword,
+            )
         else:
-            # A roster phrase (bare, canonical casing) activates that codeword.
-            codeword = fishwatch.find_codeword(content, state.codewords)
-            if codeword:
-                state.codeword = codeword
+            # Otherwise an explicit "codeword: <phrase>" declaration sets
+            # ANY codeword — even one not in the roster — so a watch admin
+            # can announce a fresh codeword straight from chat. It's also
+            # remembered in the roster for future bare activation.
+            declared = fishwatch.parse_codeword_declaration(content)
+            if declared:
+                state.codeword = declared
+                if declared.casefold() not in {
+                    c.casefold() for c in state.codewords
+                }:
+                    state.codewords.append(declared)
                 changed = True
                 logger.info(
-                    "watch: admin %s set codeword to %s",
-                    message.author.id, codeword,
+                    "watch: admin %s declared codeword %s",
+                    message.author.id, declared,
                 )
-            else:
-                # Otherwise an explicit "codeword: <phrase>" declaration sets
-                # ANY codeword — even one not in the roster — so a watch admin
-                # can announce a fresh codeword straight from chat. It's also
-                # remembered in the roster for future bare activation.
-                declared = fishwatch.parse_codeword_declaration(content)
-                if declared:
-                    state.codeword = declared
-                    if declared.casefold() not in {
-                        c.casefold() for c in state.codewords
-                    }:
-                        state.codewords.append(declared)
-                    changed = True
-                    logger.info(
-                        "watch: admin %s declared codeword %s",
-                        message.author.id, declared,
-                    )
         if changed:
             await asyncio.to_thread(_persist_watch_state)
             # The 🎣 reaction is the only acknowledgment — no confirmation
