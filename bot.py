@@ -387,13 +387,18 @@ async def _discord_call_with_retry(coro_factory, /, *, label: str = "discord cal
         max_delay=_DISCORD_RETRY_MAX_DELAY,
     )
 
+def _write_health_signal() -> None:
+    with open(HEALTH_PATH, "w") as fh:
+        fh.write(str(int(time.time())))
+
+
 async def _health_task() -> None:
     # Liveness signal: touch HEALTH_PATH every HEALTH_INTERVAL seconds. The
-    # watchdog treats a stale (>90s) file as unhealthy.
+    # watchdog treats a stale (>90s) file as unhealthy. The write runs in a
+    # worker thread so a slow disk can never stall the event loop.
     while True:
         try:
-            with open(HEALTH_PATH, "w") as fh:
-                fh.write(str(int(time.time())))
+            await asyncio.to_thread(_write_health_signal)
         except OSError:
             logger.exception("health write failed")
         await asyncio.sleep(HEALTH_INTERVAL)
@@ -2112,16 +2117,20 @@ async def on_member_join(member: discord.Member) -> None:
         return
     # Debounce: skip if another welcome was posted in this guild within the
     # last _JOIN_DEBOUNCE_SECONDS to prevent a raid from hammering the channel.
+    # Reserve the slot *before* sleeping: concurrent joins each claim the next
+    # free window, so a burst staggers one prompt per debounce interval
+    # instead of every waiter waking together and posting at once.
     guild_id = member.guild.id
     now = time.monotonic()
     last = _JOIN_LAST_POST.get(guild_id, 0.0)
-    if now - last < _JOIN_DEBOUNCE_SECONDS:
+    scheduled = max(now, last + _JOIN_DEBOUNCE_SECONDS) if last else now
+    _JOIN_LAST_POST[guild_id] = scheduled
+    if scheduled > now:
         logger.debug(
             "onboarding: debouncing join for %s in guild %s (%.1fs since last)",
             member.id, guild_id, now - last,
         )
-        await asyncio.sleep(max(0.0, _JOIN_DEBOUNCE_SECONDS - (now - last)))
-    _JOIN_LAST_POST[guild_id] = time.monotonic()
+        await asyncio.sleep(scheduled - now)
     _spawn_bg_task(_post_onboarding_welcome(member))
 
 
@@ -3195,13 +3204,15 @@ async def _edit_or_create_member_record(
                 mastery_rank=mastery_rank,
                 summary_lines=summary_lines,
             )
-        # Keep the per-member lock map bounded: drop the lock now that it is
-        # released, unless another writer already holds or awaits it.
-        prune_lock_if_unused(_RECORD_WRITE_LOCKS, member.id)
     except Exception:
         logger.exception(
             "records: edit_or_create failed for %s", member.id
         )
+    finally:
+        # Keep the per-member lock map bounded: drop the lock now that it is
+        # released — even when the write failed — unless another writer
+        # already holds or awaits it.
+        prune_lock_if_unused(_RECORD_WRITE_LOCKS, member.id)
 
 
 def _member_record_jump_urls(guild_id: int, user_id: int) -> list[str]:
@@ -6732,7 +6743,11 @@ def _watch_components(
     channel_line = (
         f"<#{state.channel_id}>" if state.channel_id else "*not set*"
     )
-    codeword_line = f"`{state.codeword}`" if state.codeword else "*not set*"
+    codeword_line = f"`{state.codeword}`" if state.codeword else "*not detected*"
+    codewords_line = (
+        ", ".join(f"`{w}`" for w in state.codewords)
+        if state.codewords else "*not set*"
+    )
     admins_line = (
         " ".join(f"<@{uid}>" for uid in sorted(state.admin_ids))
         if state.admin_ids else "*not set*"
@@ -6747,8 +6762,11 @@ def _watch_components(
     body = (
         f"{status_line}\n"
         f"**Channel:** {channel_line}\n"
-        f"**Codeword:** {codeword_line}\n"
-        f"-# > A new codeword only applies to newly sent images.\n"
+        f"**Codewords:** {codewords_line}\n"
+        f"**Detected codeword:** {codeword_line}\n"
+        f"-# > A watch admin typing a known codeword in the watched channel "
+        f"sets it, like naming a fish \u2014 even while the watch is "
+        f"stopped. A new codeword only applies to newly sent images.\n"
         f"**Watch admins:** {admins_line}\n"
         f"**Current fish:** {fish_line}\n\n"
         f"{_watch_fish_reference_lines()}"
@@ -6761,7 +6779,7 @@ def _watch_components(
              "disabled": bool(running) or not state.channel_id},
             {"type": 2, "style": 4, "label": "Stop",
              "custom_id": "watch:stop", "disabled": not running},
-            {"type": 2, "style": 1, "label": "Set codeword",
+            {"type": 2, "style": 1, "label": "Codewords",
              "custom_id": "watch:codeword"},
             {"type": 2, "style": 1, "label": "Set admin",
              "custom_id": "watch:admins"},
@@ -6782,24 +6800,28 @@ def _watch_components(
 
 
 class _WatchCodewordModal(_GPModal):
-    """Set the fish-watch codeword. The new codeword only applies to images
-    sent after it is saved — in-flight submissions keep the codeword that
-    was active when they were posted."""
+    """Set the known codeword list. A watch admin typing one of these words
+    in the watched channel makes it the detected codeword; a new codeword
+    only applies to images sent after it is detected."""
 
     def __init__(self) -> None:
-        super().__init__(title="watch \u2014 set codeword", timeout=600)
+        super().__init__(title="watch \u2014 codewords", timeout=600)
         self.add_item(discord.ui.TextDisplay(
-            "The word members must have highlighted in green in their "
-            "chat box. Applies to newly sent images only."
+            "The words a watch admin can set as the codeword by typing "
+            "one in the watched channel. The detected codeword must be "
+            "highlighted in green in members' chat boxes."
         ))
         self.codeword_input = discord.ui.TextInput(
-            default=_WATCH_STATE.codeword or None,
+            default=", ".join(_WATCH_STATE.codewords) or None,
             required=False,
-            max_length=50,
+            max_length=400,
         )
         self.add_item(discord.ui.Label(
-            text="codeword",
-            description="Leave blank to disable the codeword check.",
+            text="codewords",
+            description=(
+                "Comma-separated list. Leave blank to disable the "
+                "codeword check."
+            ),
             component=self.codeword_input,
         ))
 
@@ -6814,7 +6836,13 @@ class _WatchCodewordModal(_GPModal):
                     "Operator, you can't use this.", ephemeral=True
                 )
             return
-        _WATCH_STATE.codeword = (self.codeword_input.value or "").strip()
+        _WATCH_STATE.codewords = fishwatch.parse_codewords(
+            self.codeword_input.value or ""
+        )
+        # Drop the detected codeword when it is no longer a known word.
+        known = {w.casefold() for w in _WATCH_STATE.codewords}
+        if _WATCH_STATE.codeword and _WATCH_STATE.codeword.casefold() not in known:
+            _WATCH_STATE.codeword = ""
         await asyncio.to_thread(_persist_watch_state)
         await _interaction_callback(interaction, 7, _watch_components())
 
@@ -7046,21 +7074,33 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot or message.guild is None:
         return
     state = _WATCH_STATE
-    if not state.enabled or message.channel.id != state.channel_id:
+    if message.channel.id != state.channel_id:
         return
-    # A watch admin naming a fish (no screenshot) sets the fish being
-    # watched; every later submission must show that fish until the admin
-    # names a new one.
+    # A watch admin naming a fish or typing a known codeword (no
+    # screenshot) sets the fish being watched / the detected codeword —
+    # even while the watch is stopped. Every later submission must show
+    # that fish and codeword until the admin declares new ones.
     if message.author.id in state.admin_ids and not message.attachments:
-        fish = fishwatch.find_fish(message.content or "")
+        content = message.content or ""
+        fish = fishwatch.find_fish(content)
+        codeword = fishwatch.find_codeword(content, state.codewords)
         if fish:
             state.current_fish = fish
-            await asyncio.to_thread(_persist_watch_state)
-            with contextlib.suppress(discord.HTTPException):
-                await message.add_reaction("\U0001F3A3")
             logger.info(
                 "watch: admin %s set fish to %s", message.author.id, fish
             )
+        if codeword:
+            state.codeword = codeword
+            logger.info(
+                "watch: admin %s set codeword to %s",
+                message.author.id, codeword,
+            )
+        if fish or codeword:
+            await asyncio.to_thread(_persist_watch_state)
+            with contextlib.suppress(discord.HTTPException):
+                await message.add_reaction("\U0001F3A3")
+        return
+    if not state.enabled:
         return
     attachment = _first_image_attachment(message)
     if attachment is None:

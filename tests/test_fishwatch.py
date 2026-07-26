@@ -21,7 +21,9 @@ from fishwatch import (
     build_watch_prompt,
     canonical_fish,
     evaluate_submission,
+    find_codeword,
     find_fish,
+    parse_codewords,
     problem_messages,
 )
 
@@ -170,6 +172,35 @@ def test_problem_messages_cover_all_problems():
 
 
 # ---------------------------------------------------------------------------
+# Codeword list parsing + detection
+# ---------------------------------------------------------------------------
+
+def test_parse_codewords_splits_and_dedupes():
+    assert parse_codewords("cerebral, tidal wave,  ,Cerebral,norg bait") == [
+        "cerebral", "tidal wave", "norg bait"
+    ]
+    assert parse_codewords("") == []
+    assert parse_codewords(None) == []
+
+
+def test_find_codeword_whole_word_case_insensitive():
+    words = ["cerebral", "tidal wave"]
+    assert find_codeword("today's word is CEREBRAL ok", words) == "cerebral"
+    assert find_codeword("a Tidal  Wave comes", words) == "tidal wave"
+    # Substrings don't match.
+    assert find_codeword("cerebrally speaking", words) is None
+    assert find_codeword("nothing here", words) is None
+    assert find_codeword("cerebral", []) is None
+    assert find_codeword("", words) is None
+
+
+def test_find_codeword_earliest_match_wins():
+    assert find_codeword(
+        "tidal wave then cerebral", ["cerebral", "tidal wave"]
+    ) == "tidal wave"
+
+
+# ---------------------------------------------------------------------------
 # Watch state env round-trip
 # ---------------------------------------------------------------------------
 
@@ -177,11 +208,13 @@ def test_watch_state_from_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv(fishwatch.ENV_ENABLED, "1")
     monkeypatch.setenv(fishwatch.ENV_CHANNEL, "12345")
     monkeypatch.setenv(fishwatch.ENV_CODEWORD, "cerebral")
+    monkeypatch.setenv(fishwatch.ENV_CODEWORDS, "cerebral, tidal wave")
     monkeypatch.setenv(fishwatch.ENV_ADMIN_IDS, "1,2,3")
     monkeypatch.setenv(fishwatch.ENV_FISH, "norg")
     state = WatchState.from_env()
     assert state.enabled and state.channel_id == 12345
     assert state.codeword == "cerebral"
+    assert state.codewords == ["cerebral", "tidal wave"]
     assert state.admin_ids == {1, 2, 3}
     assert state.current_fish == "Norg"
 
@@ -189,13 +222,14 @@ def test_watch_state_from_env(monkeypatch: pytest.MonkeyPatch):
 def test_watch_state_from_env_defaults(monkeypatch: pytest.MonkeyPatch):
     for key in (
         fishwatch.ENV_ENABLED, fishwatch.ENV_CHANNEL, fishwatch.ENV_CODEWORD,
-        fishwatch.ENV_ADMIN_IDS, fishwatch.ENV_FISH,
+        fishwatch.ENV_CODEWORDS, fishwatch.ENV_ADMIN_IDS, fishwatch.ENV_FISH,
     ):
         monkeypatch.delenv(key, raising=False)
     state = WatchState.from_env()
     assert not state.enabled
     assert state.channel_id == 0
     assert state.codeword == ""
+    assert state.codewords == []
     assert state.admin_ids == set()
     assert state.current_fish is None
 
@@ -203,12 +237,14 @@ def test_watch_state_from_env_defaults(monkeypatch: pytest.MonkeyPatch):
 def test_watch_state_env_items_round_trip():
     state = WatchState(
         enabled=True, channel_id=99, codeword="w",
+        codewords=["w", "tidal wave"],
         admin_ids={5, 2}, current_fish="Norg",
     )
     items = dict(state.env_items())
     assert items[fishwatch.ENV_ENABLED] == "1"
     assert items[fishwatch.ENV_CHANNEL] == "99"
     assert items[fishwatch.ENV_CODEWORD] == "w"
+    assert items[fishwatch.ENV_CODEWORDS] == "w, tidal wave"
     assert items[fishwatch.ENV_ADMIN_IDS] == "2,5"
     assert items[fishwatch.ENV_FISH] == "Norg"
 
@@ -341,22 +377,76 @@ def test_watch_components_and_state(monkeypatch):
         bot, "_WATCH_STATE",
         fishwatch.WatchState(
             enabled=True, channel_id=555, codeword="cerebral",
+            codewords=["cerebral", "tidal wave"],
             admin_ids={1}, current_fish="Norg",
         ),
     )
     comps = bot._watch_components()
     assert "Fish Watch" in comps[0]["content"]
     rows = comps[1]["components"]
-    ids = [b["custom_id"] for b in rows[1]["components"]]
+    buttons = rows[1]["components"]
+    ids = [b["custom_id"] for b in buttons]
     assert ids == [
         "watch:start", "watch:stop", "watch:codeword", "watch:admins",
     ]
+    labels = {b["custom_id"]: b["label"] for b in buttons}
+    assert labels["watch:codeword"] == "Codewords"
     nav_ids = [b["custom_id"] for b in rows[2]["components"]]
     assert nav_ids == [
         "watch:page:-1", "watch:noop", "watch:page:1", "watch:page:0",
     ]
     body = comps[1]["components"][0]["content"]
     assert "cerebral" in body and "Norg" in body and "<#555>" in body
+    assert "**Codewords:**" in body and "tidal wave" in body
+    assert "**Detected codeword:** `cerebral`" in body
+
+
+def test_watch_panel_codeword_not_detected(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(
+        bot, "_WATCH_STATE",
+        fishwatch.WatchState(
+            enabled=False, channel_id=555, codeword="",
+            codewords=["cerebral"], admin_ids={1},
+        ),
+    )
+    body = bot._watch_components()[1]["components"][0]["content"]
+    assert "**Detected codeword:** *not detected*" in body
+
+
+def test_admin_message_sets_codeword_even_while_stopped(monkeypatch):
+    import bot
+
+    state = fishwatch.WatchState(
+        enabled=False, channel_id=555, codeword="",
+        codewords=["cerebral", "tidal wave"], admin_ids={1},
+    )
+    monkeypatch.setattr(bot, "_WATCH_STATE", state)
+    monkeypatch.setattr(bot, "_persist_watch_state", lambda: None)
+
+    msg = _fake_message(author_id=1)
+    msg.attachments = []
+    msg.content = "today's word is Tidal Wave, folks"
+    asyncio.run(bot.on_message(msg))
+    assert state.codeword == "tidal wave"
+    msg.add_reaction.assert_awaited_with("\U0001F3A3")
+
+    # A non-admin's message never sets the codeword (and, with the watch
+    # stopped, isn't processed as a submission either).
+    msg2 = _fake_message(author_id=9)
+    msg2.attachments = []
+    msg2.content = "cerebral"
+    asyncio.run(bot.on_message(msg2))
+    assert state.codeword == "tidal wave"
+
+    # An unknown word doesn't change anything.
+    msg3 = _fake_message(author_id=1)
+    msg3.attachments = []
+    msg3.content = "just chatting"
+    asyncio.run(bot.on_message(msg3))
+    assert state.codeword == "tidal wave"
+    msg3.add_reaction.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

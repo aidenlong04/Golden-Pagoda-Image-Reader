@@ -648,6 +648,8 @@ def _paste_emoji_icon(
     """
     if not emoji_bytes:
         return False
+    src = None
+    box = None
     try:
         src = Image.open(io.BytesIO(emoji_bytes))
         src.load()
@@ -658,14 +660,17 @@ def _paste_emoji_icon(
             src, ((icon_px - src.width) // 2, (icon_px - src.height) // 2)
         )
         canvas.alpha_composite(box, (x, cy - icon_px // 2))
-        box.close()
-        src.close()
         return True
     except Exception:
         logger.warning(
             "progress: emoji decode failed for %r", label, exc_info=True
         )
         return False
+    finally:
+        if box is not None:
+            box.close()
+        if src is not None:
+            src.close()
 
 
 def _render_profile_card_png(

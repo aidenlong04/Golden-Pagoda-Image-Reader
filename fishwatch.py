@@ -95,6 +95,38 @@ def find_fish(text: str) -> str | None:
     return best[1] if best else None
 
 
+def parse_codewords(raw: str) -> list[str]:
+    """Split a comma-separated codeword list into cleaned, deduped words.
+
+    Order is preserved; duplicates (case-insensitive) and blanks dropped.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in (raw or "").split(","):
+        word = part.strip()
+        key = word.casefold()
+        if word and key not in seen:
+            seen.add(key)
+            out.append(word)
+    return out
+
+
+def find_codeword(text: str, codewords: list[str]) -> str | None:
+    """Return the first known codeword found in ``text``, or None.
+
+    Case-insensitive whole-word match against the configured codeword
+    list, mirroring :func:`find_fish` — earliest match position wins.
+    """
+    if not text or not codewords:
+        return None
+    best: tuple[int, str] | None = None
+    for word in codewords:
+        m = _fish_pattern(word).search(text)
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), word)
+    return best[1] if best else None
+
+
 def canonical_fish(name: str) -> str | None:
     """Resolve a raw fish name (any case) to its canonical form, or None."""
     fish = FISH_BY_KEY.get((name or "").strip().casefold())
@@ -174,17 +206,24 @@ def build_watch_prompt() -> str:
 ENV_ENABLED = "FISH_WATCH_ENABLED"
 ENV_CHANNEL = "FISH_WATCH_CHANNEL_ID"
 ENV_CODEWORD = "FISH_WATCH_CODEWORD"
+ENV_CODEWORDS = "FISH_WATCH_CODEWORDS"
 ENV_ADMIN_IDS = "FISH_WATCH_ADMIN_IDS"
 ENV_FISH = "FISH_WATCH_FISH"
 
 
 @dataclass
 class WatchState:
-    """Mutable in-memory watch config, mirrored to .env on every change."""
+    """Mutable in-memory watch config, mirrored to .env on every change.
+
+    ``codewords`` is the known codeword list (set via the /watch Codewords
+    modal); ``codeword`` is the currently detected one, set when a watch
+    admin types a known codeword in the watched channel.
+    """
 
     enabled: bool = False
     channel_id: int = 0
     codeword: str = ""
+    codewords: list[str] = field(default_factory=list)
     admin_ids: set[int] = field(default_factory=set)
     current_fish: str | None = None
 
@@ -195,6 +234,7 @@ class WatchState:
             enabled=_int_env(ENV_ENABLED) == 1,
             channel_id=_int_env(ENV_CHANNEL),
             codeword=(os.getenv(ENV_CODEWORD) or "").strip(),
+            codewords=parse_codewords(os.getenv(ENV_CODEWORDS) or ""),
             admin_ids=set(_csv_ids(ENV_ADMIN_IDS)),
             current_fish=fish,
         )
@@ -205,6 +245,7 @@ class WatchState:
             (ENV_ENABLED, "1" if self.enabled else "0"),
             (ENV_CHANNEL, str(self.channel_id) if self.channel_id else ""),
             (ENV_CODEWORD, self.codeword),
+            (ENV_CODEWORDS, ", ".join(self.codewords)),
             (ENV_ADMIN_IDS, ",".join(str(i) for i in sorted(self.admin_ids))),
             (ENV_FISH, self.current_fish or ""),
         ]
