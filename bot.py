@@ -6830,7 +6830,7 @@ class _WatchCodewordModal(_GPModal):
         )
         # Drop the detected codeword when it is no longer a known word.
         known = {w.casefold() for w in _WATCH_STATE.codewords}
-        if _WATCH_STATE.codeword.casefold() not in known:
+        if _WATCH_STATE.codeword and _WATCH_STATE.codeword.casefold() not in known:
             _WATCH_STATE.codeword = ""
         await asyncio.to_thread(_persist_watch_state)
         await _interaction_callback(interaction, 7, _watch_components())
