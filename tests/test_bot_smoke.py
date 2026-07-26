@@ -9,6 +9,7 @@ signature-drift bugs at test time instead of runtime.
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import discord
@@ -993,6 +994,45 @@ class WatchDeletedSubmissionTests(unittest.TestCase):
         self.b._untrack_watch_error_reply(5, 9002)
         self.assertNotIn(5, self.b._watch_error_replies)
         self.assertEqual(self.b._watch_submission_replies, {})
+
+
+class WatchChannelMatchTests(unittest.TestCase):
+    """Thread/forum-aware detection of the watched channel."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+        self.state = self.b._WATCH_STATE
+        self.orig_channel_id = self.state.channel_id
+        self.state.channel_id = 7
+
+    def tearDown(self):
+        self.state.channel_id = self.orig_channel_id
+
+    def test_matches_watched_channel_itself(self):
+        channel = SimpleNamespace(id=7, parent_id=None)
+        self.assertTrue(self.b._watch_channel_matches(channel))
+
+    def test_matches_thread_under_watched_channel(self):
+        thread = SimpleNamespace(id=99, parent_id=7)
+        self.assertTrue(self.b._watch_channel_matches(thread))
+
+    def test_matches_forum_post_under_watched_forum(self):
+        post = SimpleNamespace(id=123, parent_id=7)
+        self.assertTrue(self.b._watch_channel_matches(post))
+
+    def test_rejects_unrelated_channel(self):
+        channel = SimpleNamespace(id=8, parent_id=None)
+        self.assertFalse(self.b._watch_channel_matches(channel))
+
+    def test_rejects_thread_under_other_channel(self):
+        thread = SimpleNamespace(id=99, parent_id=8)
+        self.assertFalse(self.b._watch_channel_matches(thread))
+
+    def test_rejects_everything_when_no_channel_set(self):
+        self.state.channel_id = 0
+        channel = SimpleNamespace(id=0, parent_id=None)
+        self.assertFalse(self.b._watch_channel_matches(channel))
 
 
 class WatchAdminCodewordTests(unittest.TestCase):

@@ -7068,12 +7068,20 @@ async def _handle_watch_interaction(
     ),
 )
 @app_commands.describe(
-    channel="The channel to watch (defaults to the current channel).",
+    channel=(
+        "The channel, thread or forum to watch (defaults to the current "
+        "channel)."
+    ),
 )
 @app_commands.default_permissions(manage_guild=True)
 async def watch_cmd(
     interaction: discord.Interaction,
-    channel: discord.TextChannel | None = None,
+    channel: (
+        discord.TextChannel
+        | discord.Thread
+        | discord.ForumChannel
+        | None
+    ) = None,
 ) -> None:
     user = interaction.user
     if interaction.guild is None or not (
@@ -7190,12 +7198,25 @@ async def _process_watch_submission(
         )
 
 
+def _watch_channel_matches(channel: object) -> bool:
+    """True when *channel* is the watched channel, or a thread/forum post
+    whose parent is the watched channel. Watching a forum channel watches
+    every post (thread) under it; watching a text channel also covers its
+    threads."""
+    watched = _WATCH_STATE.channel_id
+    if not watched:
+        return False
+    if getattr(channel, "id", None) == watched:
+        return True
+    return getattr(channel, "parent_id", None) == watched
+
+
 @client.event
 async def on_message(message: discord.Message) -> None:
     if message.author.bot or message.guild is None:
         return
     state = _WATCH_STATE
-    if not state.enabled or message.channel.id != state.channel_id:
+    if not state.enabled or not _watch_channel_matches(message.channel):
         return
     # A watch admin naming a fish (no screenshot) sets the fish being
     # watched; every later submission must show that fish until the admin
