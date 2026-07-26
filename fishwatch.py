@@ -155,8 +155,10 @@ def find_codeword(
 # "set codeword banana bread". The trailing phrase becomes the active codeword.
 # Requiring the keyword prefix keeps ordinary admin chatter from being mistaken
 # for a codeword (unlike fish, codewords have no fixed vocabulary to match on).
+# The optional lead-in (the / today's / new / set...) is a single, non-
+# overlapping group to avoid catastrophic regex backtracking.
 _CODEWORD_DECL_RE = re.compile(
-    r"^\s*(?:the\s+|today'?s\s+|todays\s+|new\s+|set(?:ting|s)?\s+)*"
+    r"^\s*(?:(?:the|today'?s|new|set(?:ting|s)?)\s+)?"
     r"code\s*words?\b\s*"
     r"(?:is|are|=|:|-|\u2014|\u2013)?\s*"
     r"(?P<phrase>.+?)\s*$",
