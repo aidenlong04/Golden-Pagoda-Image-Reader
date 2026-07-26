@@ -13,12 +13,15 @@ some Cambion Drift fish carry a maximum quality in points.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Iterable
 
 from config import _csv_ids, _int_env
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Fish reference data (source: aidenlong04/warframe-item-pull docs/items/fish.md)
@@ -328,7 +331,13 @@ class WatchState:
     @classmethod
     def from_env(cls) -> "WatchState":
         fish = canonical_fish(os.getenv(ENV_FISH, ""))
-        codeword = _canonical_codeword(os.getenv(ENV_CODEWORD)) or ""
+        raw_codeword = os.getenv(ENV_CODEWORD)
+        codeword = _canonical_codeword(raw_codeword) or ""
+        if normalize_codeword(raw_codeword) and not codeword:
+            logger.info(
+                "watch: ignoring unknown configured codeword %r",
+                normalize_codeword(raw_codeword),
+            )
         codewords = parse_codewords(os.getenv(ENV_CODEWORDS))
         # The active codeword must stay in the roster, otherwise a watch admin
         # re-typing it in the watched channel is never recognised (find_codeword
@@ -415,15 +424,25 @@ def parse_codewords(raw: str | None) -> list[str]:
         return []
     out: list[str] = []
     seen: set[str] = set()
+    rejected: set[str] = set()
     for chunk in _CODEWORD_SPLIT_RE.split(raw):
-        word = _canonical_codeword(chunk)
+        candidate = normalize_codeword(chunk)
+        if not candidate:
+            continue
+        word = _canonical_codeword(candidate)
         if not word:
+            rejected.add(candidate)
             continue
         key = word.casefold()
         if key in seen:
             continue
         seen.add(key)
         out.append(word)
+    if rejected:
+        logger.info(
+            "watch: ignored unknown codewords: %s",
+            ", ".join(sorted(rejected)),
+        )
     return out
 
 
