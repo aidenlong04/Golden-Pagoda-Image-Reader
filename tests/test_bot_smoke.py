@@ -1068,17 +1068,39 @@ class WatchAdminCodewordTests(unittest.TestCase):
         message.content = content
         message.add_reaction = AsyncMock()
         orig_persist = self.b._persist_watch_state
+        orig_post = self.b._post_channel_v2
         self.b._persist_watch_state = lambda: None
+        self.post_v2 = AsyncMock(return_value=None)
+        self.b._post_channel_v2 = self.post_v2
         try:
             asyncio.run(self.b.on_message(message))
         finally:
             self.b._persist_watch_state = orig_persist
+            self.b._post_channel_v2 = orig_post
         return message
+
+    def _confirmation_text(self):
+        self.post_v2.assert_awaited_once()
+        components = self.post_v2.await_args.args[1]
+        return components[0]["components"][0]["content"]
 
     def test_admin_message_sets_codeword(self):
         message = self._run_message("codeword is dywatta citrus onion")
         self.assertEqual(self.state.codeword, "DYWATTA Citrus Onion")
         message.add_reaction.assert_awaited_once()
+
+    def test_confirmation_shows_new_codeword(self):
+        self._run_message("codeword is dywatta citrus onion")
+        text = self._confirmation_text()
+        self.assertIn("`DYWATTA Citrus Onion`", text)
+        self.assertNotIn("Current fish", text)
+
+    def test_confirmation_shows_fish_and_codeword_together(self):
+        self._run_message("Norg — capybara pinocchio skibbibidy")
+        text = self._confirmation_text()
+        self.assertIn("**Norg**", text)
+        self.assertIn("Earth", text)  # fish detail line from FISH data
+        self.assertIn("`Capybara Pinocchio Skibbibidy`", text)
 
     def test_admin_message_in_thread_of_watched_channel_sets_codeword(self):
         thread = SimpleNamespace(id=99, parent_id=7)
@@ -1100,6 +1122,7 @@ class WatchAdminCodewordTests(unittest.TestCase):
         self.assertEqual(self.state.codeword, "")
         self.assertIsNone(self.state.current_fish)
         message.add_reaction.assert_not_awaited()
+        self.post_v2.assert_not_awaited()
 
 
 class CardTextHelperTests(unittest.TestCase):
