@@ -125,7 +125,7 @@ _CANONICAL_CODEWORDS: dict[str, str] = {w.casefold(): w for w in CODEWORDS}
 _CODEWORD_PATTERN_CACHE: dict[str, re.Pattern[str]] = {}
 
 
-def _canonical_codeword(raw: str | None) -> str | None:
+def _resolve_canonical_codeword(raw: str | None) -> str | None:
     word = normalize_codeword(raw)
     if not word:
         return None
@@ -157,7 +157,7 @@ def find_codeword(
     roster = CODEWORDS if codewords is None else codewords
     best: tuple[int, str] | None = None
     for word in roster:
-        word = _canonical_codeword(word)
+        word = _resolve_canonical_codeword(word)
         if not word:
             continue
         m = _codeword_pattern(word).search(text)
@@ -333,9 +333,9 @@ class WatchState:
         fish = canonical_fish(os.getenv(ENV_FISH, ""))
         raw_codeword = os.getenv(ENV_CODEWORD)
         normalized_codeword = normalize_codeword(raw_codeword)
-        codeword = _canonical_codeword(raw_codeword) or ""
+        codeword = _resolve_canonical_codeword(raw_codeword) or ""
         if normalized_codeword and not codeword:
-            logger.info(
+            logger.warning(
                 "watch: ignoring unknown configured codeword %r",
                 normalized_codeword,
             )
@@ -430,7 +430,7 @@ def parse_codewords(raw: str | None) -> list[str]:
         candidate = normalize_codeword(chunk)
         if not candidate:
             continue
-        word = _canonical_codeword(candidate)
+        word = _resolve_canonical_codeword(candidate)
         if not word:
             rejected.add(candidate)
             continue
@@ -440,7 +440,7 @@ def parse_codewords(raw: str | None) -> list[str]:
         seen.add(key)
         out.append(word)
     if rejected:
-        logger.info(
+        logger.warning(
             "watch: ignored unknown codewords: %s",
             ", ".join(sorted(rejected)),
         )
@@ -448,7 +448,7 @@ def parse_codewords(raw: str | None) -> list[str]:
 
 
 def _contains_codeword(text: str, codeword: str) -> bool:
-    codeword = _canonical_codeword(codeword) or ""
+    codeword = _resolve_canonical_codeword(codeword) or ""
     if not codeword:
         return True
     # Same matcher the fish detector uses: whole-word, case-insensitive,
