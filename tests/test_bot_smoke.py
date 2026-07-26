@@ -1082,7 +1082,9 @@ class WatchAdminCodewordTests(unittest.TestCase):
     def _confirmation_text(self):
         self.post_v2.assert_awaited_once()
         components = self.post_v2.await_args.args[1]
-        return components[0]["components"][0]["content"]
+        # Sent as a bare text component (no accent-colored container).
+        self.assertEqual(components[0]["type"], 10)
+        return components[0]["content"]
 
     def test_admin_message_sets_codeword(self):
         message = self._run_message("codeword is dywatta citrus onion")

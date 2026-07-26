@@ -7204,7 +7204,8 @@ async def _post_watch_update_confirmation(
     """Visibly confirm what an admin's message just assigned — the newly
     read codeword and/or the fish now being watched — so it's clear the
     change actually took. Auto-deletes after REPLY_TTL_SECONDS to keep
-    the watched channel clean."""
+    the watched channel clean. Sent as bare text (no accent-colored
+    container) so it doesn't read as an embed."""
     lines = ["\U0001F3A3 **Watch updated**"]
     if fish:
         info = fishwatch.FISH_BY_KEY.get(fish.casefold())
@@ -7217,8 +7218,7 @@ async def _post_watch_update_confirmation(
         lines.append(f"**Codeword:** `{codeword}`")
     reply_id = await _post_channel_v2(
         channel_id,
-        [{"type": 17, "accent_color": ACCENT_PASS,
-          "components": [{"type": 10, "content": "\n".join(lines)}]}],
+        [{"type": 10, "content": "\n".join(lines)}],
     )
     if reply_id and REPLY_TTL_SECONDS > 0:
         async def _cleanup() -> None:
