@@ -6847,11 +6847,11 @@ def _watch_components(
     body = (
         f"{status_line}\n"
         f"**Channel:** {channel_line}\n"
-        f"**Codeword:** {codeword_line}\n"
-        f"-# > A new codeword only applies to newly sent images. A watch "
-        f"admin typing a known codeword phrase in the watched channel "
-        f"sets it, like naming a fish \u2014 even while the watch is "
-        f"stopped.\n"
+        f"**Active codeword:** {codeword_line}\n"
+        f"-# > Only the codeword a watch admin activated in the watched "
+        f"channel is shown. Configure the roster of allowed codewords with "
+        f"Set codewords; a watch admin typing one activates it, like naming "
+        f"a fish \u2014 even while the watch is stopped.\n"
         f"**Watch admins:** {admins_line}\n"
         f"**Current fish:** {fish_line}"
     )
@@ -6863,7 +6863,7 @@ def _watch_components(
              "disabled": bool(running) or not state.channel_id},
             {"type": 2, "style": 4, "label": "Stop",
              "custom_id": "watch:stop", "disabled": not running},
-            {"type": 2, "style": 1, "label": "Set session codeword",
+            {"type": 2, "style": 1, "label": "Set codewords",
              "custom_id": "watch:codeword"},
             {"type": 2, "style": 1, "label": "Set admin",
              "custom_id": "watch:admins"},
@@ -6886,24 +6886,28 @@ def _watch_components(
 
 
 class _WatchCodewordModal(_GPModal):
-    """Set the fish-watch codeword. The new codeword only applies to images
-    sent after it is saved — in-flight submissions keep the codeword that
-    was active when they were posted."""
+    """Set the fish-watch codeword roster — the phrases a watch admin can
+    activate by typing one in the watched channel. Editing the roster only
+    changes which phrases are *allowed*; the active codeword shown on the panel
+    is whichever one a watch admin most recently declared."""
 
     def __init__(self) -> None:
-        super().__init__(title="watch \u2014 set codeword", timeout=600)
+        super().__init__(title="watch \u2014 set codewords", timeout=600)
         self.add_item(discord.ui.TextDisplay(
-            "The word members must have visible in their chat box. "
-            "Applies to newly sent images only."
+            "The phrases a watch admin may activate, one per line. A watch "
+            "admin typing one in the watched channel makes it the active "
+            "codeword members must have visible in their chat box."
         ))
         self.codeword_input = discord.ui.TextInput(
-            default=_WATCH_STATE.codeword or None,
+            default="\n".join(_WATCH_STATE.codewords) or None,
             required=False,
-            max_length=50,
+            style=discord.TextStyle.paragraph,
+            max_length=500,
         )
         self.add_item(discord.ui.Label(
-            text="codeword",
-            description="Leave blank to disable the codeword check.",
+            text="codewords",
+            description="One per line. Leave blank to disable the codeword "
+                        "check.",
             component=self.codeword_input,
         ))
 
@@ -6918,9 +6922,17 @@ class _WatchCodewordModal(_GPModal):
                     "Operator, you can't use this.", ephemeral=True
                 )
             return
-        _WATCH_STATE.codeword = fishwatch.normalize_codeword(
+        _WATCH_STATE.codewords = fishwatch.parse_codewords(
             self.codeword_input.value
         )
+        # Drop the active codeword if it's no longer in the roster so the panel
+        # never shows a phrase members can no longer be judged against.
+        active = _WATCH_STATE.codeword
+        if active and not any(
+            active.casefold() == c.casefold()
+            for c in _WATCH_STATE.codewords
+        ):
+            _WATCH_STATE.codeword = ""
         await asyncio.to_thread(_persist_watch_state)
         await _interaction_callback(interaction, 7, _watch_components())
 
@@ -7239,7 +7251,7 @@ async def on_message(message: discord.Message) -> None:
                 "watch: admin %s set fish to %s", message.author.id, fish
             )
         else:
-            codeword = fishwatch.find_codeword(content)
+            codeword = fishwatch.find_codeword(content, state.codewords)
             if codeword:
                 state.codeword = codeword
                 changed = True

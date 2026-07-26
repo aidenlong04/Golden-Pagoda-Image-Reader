@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
+from typing import Iterable
 
 from config import _csv_ids, _int_env
 
@@ -99,33 +100,50 @@ def find_fish(text: str) -> str | None:
 # Known session codewords
 # ---------------------------------------------------------------------------
 
-# The roster of codeword phrases admins rotate between. An admin typing one
-# of these in the watched channel sets it as the session codeword, detected
-# the same way fish declarations are (whole-phrase, case-insensitive,
-# letter-spacing tolerant).
+# The default roster of codeword phrases admins rotate between, used when no
+# custom roster is configured via the /watch modal (``FISH_WATCH_CODEWORDS`` /
+# WatchState.codewords). An admin typing one of the configured phrases in the
+# watched channel sets it as the active session codeword, detected the same way
+# fish declarations are (whole-phrase, case-insensitive, letter-spacing
+# tolerant).
 CODEWORDS: tuple[str, ...] = (
     "Pepperoni Shockalaka Dinglehopper",
     "DYWATTA Citrus Onion",
     "Capybara Pinocchio Skibbibidy",
 )
 
-_CODEWORD_PATTERNS: dict[str, re.Pattern[str]] = {
-    c: _fish_pattern(c) for c in CODEWORDS
-}
+_CODEWORD_PATTERN_CACHE: dict[str, re.Pattern[str]] = {}
 
 
-def find_codeword(text: str) -> str | None:
-    """Return the first known codeword phrase found in ``text``.
+def _codeword_pattern(phrase: str) -> re.Pattern[str]:
+    """Memoized fish-style matcher for a single codeword phrase."""
+    pattern = _CODEWORD_PATTERN_CACHE.get(phrase)
+    if pattern is None:
+        pattern = _fish_pattern(phrase)
+        _CODEWORD_PATTERN_CACHE[phrase] = pattern
+    return pattern
 
-    Same detection rules as :func:`find_fish`: case-insensitive whole-word
-    match tolerating letter-spaced rendering. Returns None when no known
-    codeword appears.
+
+def find_codeword(
+    text: str, codewords: "Iterable[str] | None" = None
+) -> str | None:
+    """Return the first configured codeword phrase found in ``text``.
+
+    ``codewords`` is the roster of allowed phrases (the /watch modal roster,
+    normally :attr:`WatchState.codewords`); it defaults to the built-in
+    :data:`CODEWORDS` when not supplied. Same detection rules as
+    :func:`find_fish`: case-insensitive whole-word match tolerating
+    letter-spaced rendering. Returns None when no configured codeword appears.
     """
     if not text:
         return None
+    roster = CODEWORDS if codewords is None else codewords
     best: tuple[int, str] | None = None
-    for phrase, pattern in _CODEWORD_PATTERNS.items():
-        m = pattern.search(text)
+    for phrase in roster:
+        phrase = normalize_codeword(phrase)
+        if not phrase:
+            continue
+        m = _codeword_pattern(phrase).search(text)
         if m and (best is None or m.start() < best[0]):
             best = (m.start(), phrase)
     return best[1] if best else None
@@ -231,6 +249,7 @@ def build_watch_prompt() -> str:
 ENV_ENABLED = "FISH_WATCH_ENABLED"
 ENV_CHANNEL = "FISH_WATCH_CHANNEL_ID"
 ENV_CODEWORD = "FISH_WATCH_CODEWORD"
+ENV_CODEWORDS = "FISH_WATCH_CODEWORDS"
 ENV_ADMIN_IDS = "FISH_WATCH_ADMIN_IDS"
 ENV_FISH = "FISH_WATCH_FISH"
 
@@ -244,16 +263,22 @@ class WatchState:
     codeword: str = ""
     admin_ids: set[int] = field(default_factory=set)
     current_fish: str | None = None
+    # The roster of allowed codeword phrases (set via the /watch modal). A
+    # watch admin typing one in the watched channel promotes it to the active
+    # ``codeword``. Defaults to the built-in CODEWORDS when none configured.
+    codewords: list[str] = field(default_factory=lambda: list(CODEWORDS))
 
     @classmethod
     def from_env(cls) -> "WatchState":
         fish = canonical_fish(os.getenv(ENV_FISH, ""))
+        codewords = parse_codewords(os.getenv(ENV_CODEWORDS)) or list(CODEWORDS)
         return cls(
             enabled=_int_env(ENV_ENABLED) == 1,
             channel_id=_int_env(ENV_CHANNEL),
             codeword=normalize_codeword(os.getenv(ENV_CODEWORD)),
             admin_ids=set(_csv_ids(ENV_ADMIN_IDS)),
             current_fish=fish,
+            codewords=codewords,
         )
 
     def env_items(self) -> list[tuple[str, str]]:
@@ -262,6 +287,7 @@ class WatchState:
             (ENV_ENABLED, "1" if self.enabled else "0"),
             (ENV_CHANNEL, str(self.channel_id) if self.channel_id else ""),
             (ENV_CODEWORD, self.codeword),
+            (ENV_CODEWORDS, ",".join(self.codewords)),
             (ENV_ADMIN_IDS, ",".join(str(i) for i in sorted(self.admin_ids))),
             (ENV_FISH, self.current_fish or ""),
         ]
@@ -302,6 +328,34 @@ _CODEWORD_JUNK_RE = re.compile(r"[`\"'\u200b\u200c\u200d\u2060\ufeff]")
 def normalize_codeword(raw: str | None) -> str:
     """Sanitize a configured codeword (modal input / .env value)."""
     return _CODEWORD_JUNK_RE.sub("", raw or "").strip()
+
+
+# Codeword rosters are entered one-per-line in the /watch modal and persisted
+# comma-joined to .env; accept both separators when parsing back.
+_CODEWORD_SPLIT_RE = re.compile(r"[,\n\r]+")
+
+
+def parse_codewords(raw: str | None) -> list[str]:
+    """Parse a roster of codewords from modal / .env input.
+
+    Splits on commas and newlines, sanitizes each phrase via
+    :func:`normalize_codeword`, drops blanks, and de-duplicates
+    case-insensitively while preserving first-seen order.
+    """
+    if not raw:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for chunk in _CODEWORD_SPLIT_RE.split(raw):
+        phrase = normalize_codeword(chunk)
+        if not phrase:
+            continue
+        key = phrase.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(phrase)
+    return out
 
 
 def _contains_codeword(text: str, codeword: str) -> bool:

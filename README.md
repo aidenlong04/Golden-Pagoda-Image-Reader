@@ -146,7 +146,10 @@ full env reference.
   session and the analytics SQLite WAL state. Requires **Manage Server**.
 - `/watch [channel]` — watch a channel's fishing-screenshot submissions.
   Opens an ephemeral panel (styled like `/status`) with **Start**, **Stop**,
-  **Set codeword** and **Set admin** buttons. While watching, every image
+  **Set codewords** and **Set admin** buttons. **Set codewords** takes a
+  roster of allowed codeword phrases (one per line); a watch admin typing one
+  of them in the watched channel activates it, and only that active codeword is
+  shown on the panel. While watching, every image
   posted in the channel is OCR'd (fish-tuned Ollama vision prompt, with the
   usual OCR.space/Tesseract fallbacks) and checked: illegible/bad-quality
   screenshots get an ❌ react + a retry request; a missing or wrong codeword

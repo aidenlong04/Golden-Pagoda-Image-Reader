@@ -136,6 +136,30 @@ def test_find_codeword_returns_earliest_match():
     assert find_codeword(text) == "Capybara Pinocchio Skibbibidy"
 
 
+def test_find_codeword_uses_supplied_roster():
+    # A custom roster (the /watch modal roster) overrides the built-in list.
+    assert find_codeword("chat: banana bread", ["banana bread"]) == "banana bread"
+    # A built-in default phrase is not matched when it's not in the roster.
+    assert find_codeword("dywatta citrus onion", ["banana bread"]) is None
+
+
+def test_find_codeword_empty_roster_matches_nothing():
+    assert find_codeword("dywatta citrus onion", []) is None
+
+
+def test_parse_codewords_splits_and_dedupes():
+    raw = "Alpha One\nBeta Two, Alpha One\n\n`Gamma Three`"
+    assert fishwatch.parse_codewords(raw) == [
+        "Alpha One", "Beta Two", "Gamma Three",
+    ]
+
+
+def test_parse_codewords_blank():
+    assert fishwatch.parse_codewords("") == []
+    assert fishwatch.parse_codewords(None) == []
+    assert fishwatch.parse_codewords("  ,\n , ") == []
+
+
 def test_evaluate_multiword_codeword_variable_spacing():
     # Multi-word codewords match with OCR-mangled whitespace, like fish.
     text = "Norg\nchat: dywatta   citrus\nonion"
@@ -270,13 +294,23 @@ def test_watch_state_from_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv(fishwatch.ENV_ENABLED, "1")
     monkeypatch.setenv(fishwatch.ENV_CHANNEL, "12345")
     monkeypatch.setenv(fishwatch.ENV_CODEWORD, "cerebral")
+    monkeypatch.setenv(fishwatch.ENV_CODEWORDS, "cerebral,limbic")
     monkeypatch.setenv(fishwatch.ENV_ADMIN_IDS, "1,2,3")
     monkeypatch.setenv(fishwatch.ENV_FISH, "norg")
     state = WatchState.from_env()
     assert state.enabled and state.channel_id == 12345
     assert state.codeword == "cerebral"
+    assert state.codewords == ["cerebral", "limbic"]
     assert state.admin_ids == {1, 2, 3}
     assert state.current_fish == "Norg"
+
+
+def test_watch_state_from_env_codewords_default(monkeypatch: pytest.MonkeyPatch):
+    # An unset (or blank) roster falls back to the built-in CODEWORDS.
+    monkeypatch.delenv(fishwatch.ENV_CODEWORDS, raising=False)
+    assert WatchState.from_env().codewords == list(fishwatch.CODEWORDS)
+    monkeypatch.setenv(fishwatch.ENV_CODEWORDS, "")
+    assert WatchState.from_env().codewords == list(fishwatch.CODEWORDS)
 
 
 def test_watch_state_from_env_defaults(monkeypatch: pytest.MonkeyPatch):
@@ -297,11 +331,13 @@ def test_watch_state_env_items_round_trip():
     state = WatchState(
         enabled=True, channel_id=99, codeword="w",
         admin_ids={5, 2}, current_fish="Norg",
+        codewords=["w", "x y"],
     )
     items = dict(state.env_items())
     assert items[fishwatch.ENV_ENABLED] == "1"
     assert items[fishwatch.ENV_CHANNEL] == "99"
     assert items[fishwatch.ENV_CODEWORD] == "w"
+    assert items[fishwatch.ENV_CODEWORDS] == "w,x y"
     assert items[fishwatch.ENV_ADMIN_IDS] == "2,5"
     assert items[fishwatch.ENV_FISH] == "Norg"
 
@@ -451,6 +487,8 @@ def test_watch_components_and_state(monkeypatch):
     ]
     body = comps[1]["components"][0]["content"]
     assert "cerebral" in body and "Norg" in body and "<#555>" in body
+    # Only the active codeword is shown on the panel.
+    assert "Active codeword" in body
     # The fish reference table was removed from the Watch page.
     assert "Mortus Lungfish" not in body
 
