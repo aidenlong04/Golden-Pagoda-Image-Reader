@@ -148,7 +148,9 @@ full env reference.
   Opens an ephemeral panel (styled like `/status`) with **Start**, **Stop**,
   **Set codewords** and **Set admin** buttons. **Set codewords** takes a
   roster of allowed codeword phrases (one per line); a watch admin typing one
-  of them in the watched channel activates it, and only that active codeword is
+  of them in the watched channel activates it. A watch admin can also declare
+  a brand-new codeword straight from chat by typing `codeword: <phrase>` (any
+  phrase works and is remembered in the roster). Only that active codeword is
   shown on the panel. While watching, every image
   posted in the channel is OCR'd (fish-tuned Ollama vision prompt, with the
   usual OCR.space/Tesseract fallbacks) and checked: illegible/bad-quality

@@ -149,6 +149,45 @@ def find_codeword(
     return best[1] if best else None
 
 
+# A watch admin can declare a brand-new codeword straight from chat (not just
+# the pre-registered roster) by leading the message with a "codeword" keyword,
+# e.g. "codeword: banana bread", "the codeword is banana bread",
+# "set codeword banana bread". The trailing phrase becomes the active codeword.
+# Requiring the keyword prefix keeps ordinary admin chatter from being mistaken
+# for a codeword (unlike fish, codewords have no fixed vocabulary to match on).
+_CODEWORD_DECL_RE = re.compile(
+    r"^\s*(?:the\s+|today'?s\s+|todays\s+|new\s+|set(?:ting|s)?\s+)*"
+    r"code\s*words?\b\s*"
+    r"(?:is|are|=|:|-|\u2014|\u2013)?\s*"
+    r"(?P<phrase>.+?)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def parse_codeword_declaration(text: str | None) -> str | None:
+    """Extract an explicitly declared codeword phrase from an admin message.
+
+    Recognises a message that leads with a ``codeword`` keyword (optionally
+    prefixed with ``the`` / ``today's`` / ``set`` / ``new`` and followed by
+    ``is`` / ``are`` / ``:`` / ``=`` / a dash) and returns the trailing phrase,
+    sanitized via :func:`normalize_codeword`. Returns ``None`` when the message
+    isn't a codeword declaration or carries no phrase. Lets a watch admin set
+    *any* codeword from chat without pre-registering it in the roster.
+    """
+    if not text:
+        return None
+    m = _CODEWORD_DECL_RE.match(text)
+    if not m:
+        return None
+    phrase = normalize_codeword(m.group("phrase"))
+    # Drop a leading separator that leaked past the optional matcher (e.g.
+    # "codeword:" captures ":") and reject a phrase with no real content.
+    phrase = phrase.lstrip(":=-\u2014\u2013 \t").strip()
+    if not any(ch.isalnum() for ch in phrase):
+        return None
+    return phrase
+
+
 def canonical_fish(name: str) -> str | None:
     """Resolve a raw fish name (any case) to its canonical form, or None."""
     fish = FISH_BY_KEY.get((name or "").strip().casefold())

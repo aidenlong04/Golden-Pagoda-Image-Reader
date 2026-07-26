@@ -147,6 +147,40 @@ def test_find_codeword_empty_roster_matches_nothing():
     assert find_codeword("dywatta citrus onion", []) is None
 
 
+def test_parse_codeword_declaration_extracts_phrase():
+    # A watch admin can declare ANY codeword from chat with a keyword prefix.
+    assert fishwatch.parse_codeword_declaration(
+        "codeword: banana bread"
+    ) == "banana bread"
+    assert fishwatch.parse_codeword_declaration(
+        "the codeword is banana bread"
+    ) == "banana bread"
+    assert fishwatch.parse_codeword_declaration(
+        "codeword banana bread"
+    ) == "banana bread"
+    assert fishwatch.parse_codeword_declaration(
+        "set codeword banana bread"
+    ) == "banana bread"
+    assert fishwatch.parse_codeword_declaration(
+        "today's codeword is banana bread"
+    ) == "banana bread"
+    # "code word" (spaced) and markdown backticks are tolerated / stripped.
+    assert fishwatch.parse_codeword_declaration(
+        "code word: `secret sauce`"
+    ) == "secret sauce"
+
+
+def test_parse_codeword_declaration_rejects_non_declarations():
+    # Ordinary admin chatter must not be mistaken for a codeword.
+    assert fishwatch.parse_codeword_declaration("gg everyone") is None
+    assert fishwatch.parse_codeword_declaration("hello team") is None
+    # A bare "codeword" keyword with no phrase carries nothing.
+    assert fishwatch.parse_codeword_declaration("codeword") is None
+    assert fishwatch.parse_codeword_declaration("codeword:") is None
+    assert fishwatch.parse_codeword_declaration("") is None
+    assert fishwatch.parse_codeword_declaration(None) is None
+
+
 def test_parse_codewords_splits_and_dedupes():
     raw = "Alpha One\nBeta Two, Alpha One\n\n`Gamma Three`"
     assert fishwatch.parse_codewords(raw) == [
