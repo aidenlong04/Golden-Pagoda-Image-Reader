@@ -7198,35 +7198,6 @@ async def _process_watch_submission(
         )
 
 
-async def _post_watch_update_confirmation(
-    channel_id: int, *, fish: str | None, codeword: str | None
-) -> None:
-    """Visibly confirm what an admin's message just assigned — the newly
-    read codeword and/or the fish now being watched — so it's clear the
-    change actually took. Auto-deletes after REPLY_TTL_SECONDS to keep
-    the watched channel clean. Sent as bare text (no accent-colored
-    container) so it doesn't read as an embed."""
-    lines = ["\U0001F3A3 **Watch updated**"]
-    if fish:
-        info = fishwatch.FISH_BY_KEY.get(fish.casefold())
-        detail = (
-            f" \u2014 {info.planet}, max {info.quality}, {info.rarity}"
-            if info else ""
-        )
-        lines.append(f"**Current fish:** **{fish}**{detail}")
-    if codeword:
-        lines.append(f"**Codeword:** `{codeword}`")
-    reply_id = await _post_channel_v2(
-        channel_id,
-        [{"type": 10, "content": "\n".join(lines)}],
-    )
-    if reply_id and REPLY_TTL_SECONDS > 0:
-        async def _cleanup() -> None:
-            await asyncio.sleep(REPLY_TTL_SECONDS)
-            await _delete_message(channel_id, reply_id)
-        _spawn_bg_task(_cleanup())
-
-
 def _watch_channel_matches(channel: object) -> bool:
     """True when *channel* is the watched channel, or a thread/forum post
     whose parent is the watched channel. Watching a forum channel watches
@@ -7271,11 +7242,10 @@ async def on_message(message: discord.Message) -> None:
             )
         if changed:
             await asyncio.to_thread(_persist_watch_state)
+            # The 🎣 reaction is the only acknowledgment — no confirmation
+            # message is posted in the channel.
             with contextlib.suppress(discord.HTTPException):
                 await message.add_reaction("\U0001F3A3")
-            await _post_watch_update_confirmation(
-                message.channel.id, fish=fish, codeword=codeword
-            )
         return
     attachment = _first_image_attachment(message)
     if attachment is None:

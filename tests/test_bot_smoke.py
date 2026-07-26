@@ -1079,30 +1079,22 @@ class WatchAdminCodewordTests(unittest.TestCase):
             self.b._post_channel_v2 = orig_post
         return message
 
-    def _confirmation_text(self):
-        self.post_v2.assert_awaited_once()
-        components = self.post_v2.await_args.args[1]
-        # Sent as a bare text component (no accent-colored container).
-        self.assertEqual(components[0]["type"], 10)
-        return components[0]["content"]
-
     def test_admin_message_sets_codeword(self):
         message = self._run_message("codeword is dywatta citrus onion")
         self.assertEqual(self.state.codeword, "DYWATTA Citrus Onion")
         message.add_reaction.assert_awaited_once()
 
-    def test_confirmation_shows_new_codeword(self):
+    def test_no_confirmation_message_posted(self):
+        # The 🎣 reaction is the only acknowledgment — nothing is sent.
         self._run_message("codeword is dywatta citrus onion")
-        text = self._confirmation_text()
-        self.assertIn("`DYWATTA Citrus Onion`", text)
-        self.assertNotIn("Current fish", text)
+        self.post_v2.assert_not_awaited()
 
-    def test_confirmation_shows_fish_and_codeword_together(self):
-        self._run_message("Norg — capybara pinocchio skibbibidy")
-        text = self._confirmation_text()
-        self.assertIn("**Norg**", text)
-        self.assertIn("Earth", text)  # fish detail line from FISH data
-        self.assertIn("`Capybara Pinocchio Skibbibidy`", text)
+    def test_no_confirmation_for_fish_and_codeword_together(self):
+        message = self._run_message("Norg — capybara pinocchio skibbibidy")
+        self.assertEqual(self.state.current_fish, "Norg")
+        self.assertEqual(self.state.codeword, "Capybara Pinocchio Skibbibidy")
+        message.add_reaction.assert_awaited_once()
+        self.post_v2.assert_not_awaited()
 
     def test_admin_message_in_thread_of_watched_channel_sets_codeword(self):
         thread = SimpleNamespace(id=99, parent_id=7)
