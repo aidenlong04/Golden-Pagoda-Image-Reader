@@ -1089,12 +1089,12 @@ class WatchAdminCodewordTests(unittest.TestCase):
         self._run_message("codeword is dywatta citrus onion")
         self.post_v2.assert_not_awaited()
 
-    def test_no_confirmation_for_fish_and_codeword_together(self):
-        # A message naming a fish sets only the fish — the codeword is
-        # ignored even if the message also contains a codeword phrase.
+    def test_fish_and_codeword_together_set_both(self):
+        # A single admin message naming a fish AND a codeword phrase sets
+        # both at once; only the 🎣 reaction acknowledges (no post).
         message = self._run_message("Norg — capybara pinocchio skibbibidy")
         self.assertEqual(self.state.current_fish, "Norg")
-        self.assertEqual(self.state.codeword, "")
+        self.assertEqual(self.state.codeword, "Capybara Pinocchio Skibbibidy")
         message.add_reaction.assert_awaited_once()
         self.post_v2.assert_not_awaited()
 
@@ -1107,9 +1107,9 @@ class WatchAdminCodewordTests(unittest.TestCase):
         message.add_reaction.assert_awaited_once()
 
     def test_admin_fish_message_does_not_set_codeword(self):
-        # Fish and codeword are separate declarations: a message naming a
-        # fish never sets the codeword, and vice versa. They require two
-        # separate admin messages.
+        # Fish and codeword are detected independently: a message naming only
+        # a fish leaves the codeword untouched, and one naming only a codeword
+        # leaves the fish untouched.
         self._run_message("Norg")
         self.assertEqual(self.state.current_fish, "Norg")
         self.assertEqual(self.state.codeword, "")
