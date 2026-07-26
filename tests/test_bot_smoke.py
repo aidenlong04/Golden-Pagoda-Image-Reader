@@ -1080,18 +1080,18 @@ class WatchAdminCodewordTests(unittest.TestCase):
         return message
 
     def test_admin_message_sets_codeword(self):
-        message = self._run_message("codeword is dywatta citrus onion")
-        self.assertEqual(self.state.codeword, "DYWATTA Citrus Onion")
+        message = self._run_message("codeword is dywatta")
+        self.assertEqual(self.state.codeword, "DYWATTA")
         message.add_reaction.assert_awaited_once()
 
     def test_no_confirmation_message_posted(self):
         # The 🎣 reaction is the only acknowledgment — nothing is sent.
-        self._run_message("codeword is dywatta citrus onion")
+        self._run_message("codeword is dywatta")
         self.post_v2.assert_not_awaited()
 
     def test_no_confirmation_for_fish_and_codeword_together(self):
         # A message naming a fish sets only the fish — the codeword is
-        # ignored even if the message also contains a codeword phrase.
+        # ignored even if the message also contains a codeword word.
         message = self._run_message("Norg — capybara pinocchio skibbibidy")
         self.assertEqual(self.state.current_fish, "Norg")
         self.assertEqual(self.state.codeword, "")
@@ -1101,9 +1101,9 @@ class WatchAdminCodewordTests(unittest.TestCase):
     def test_admin_message_in_thread_of_watched_channel_sets_codeword(self):
         thread = SimpleNamespace(id=99, parent_id=7)
         message = self._run_message(
-            "codeword is dywatta citrus onion", channel=thread
+            "codeword is dywatta", channel=thread
         )
-        self.assertEqual(self.state.codeword, "DYWATTA Citrus Onion")
+        self.assertEqual(self.state.codeword, "DYWATTA")
         message.add_reaction.assert_awaited_once()
 
     def test_admin_fish_message_does_not_set_codeword(self):
@@ -1113,16 +1113,16 @@ class WatchAdminCodewordTests(unittest.TestCase):
         self._run_message("Norg")
         self.assertEqual(self.state.current_fish, "Norg")
         self.assertEqual(self.state.codeword, "")
-        self._run_message("capybara pinocchio skibbibidy")
-        self.assertEqual(self.state.codeword, "Capybara Pinocchio Skibbibidy")
+        self._run_message("capybara")
+        self.assertEqual(self.state.codeword, "Capybara")
         self.assertEqual(self.state.current_fish, "Norg")
 
     def test_admin_message_sets_codeword_while_watch_stopped(self):
         # Admin declarations are configuration — they apply even when the
         # watch is stopped (e.g. announcing the codeword before Start).
         self.state.enabled = False
-        message = self._run_message("codeword is dywatta citrus onion")
-        self.assertEqual(self.state.codeword, "DYWATTA Citrus Onion")
+        message = self._run_message("codeword is dywatta")
+        self.assertEqual(self.state.codeword, "DYWATTA")
         message.add_reaction.assert_awaited_once()
 
     def test_admin_message_sets_fish_while_watch_stopped(self):
@@ -1132,11 +1132,11 @@ class WatchAdminCodewordTests(unittest.TestCase):
 
     def test_non_admin_message_while_stopped_changes_nothing(self):
         self.state.enabled = False
-        message = self._run_message("dywatta citrus onion", author_id=6)
+        message = self._run_message("dywatta", author_id=6)
         self.assertEqual(self.state.codeword, "")
         message.add_reaction.assert_not_awaited()
 
-    def test_admin_message_without_known_phrases_changes_nothing(self):
+    def test_admin_message_without_known_codewords_changes_nothing(self):
         message = self._run_message("hello team")
         self.assertEqual(self.state.codeword, "")
         self.assertIsNone(self.state.current_fish)
@@ -1146,49 +1146,50 @@ class WatchAdminCodewordTests(unittest.TestCase):
     def test_admin_message_uses_configured_roster(self):
         # Detection scans the configured roster, not just the built-in list.
         orig_codewords = list(self.state.codewords)
-        self.state.codewords = ["Banana Bread Supreme"]
+        self.state.codewords = ["Onion"]
         try:
-            # A built-in default phrase, typed bare (no keyword), no longer
+            # A built-in default word, typed bare (no keyword), no longer
             # matches once it's removed from the roster.
-            msg = self._run_message("dywatta citrus onion")
+            msg = self._run_message("dywatta")
             self.assertEqual(self.state.codeword, "")
             msg.add_reaction.assert_not_awaited()
-            # The configured phrase does match.
-            msg2 = self._run_message("today: banana bread supreme")
-            self.assertEqual(self.state.codeword, "Banana Bread Supreme")
+            # The configured codeword does match.
+            msg2 = self._run_message("today: onion")
+            self.assertEqual(self.state.codeword, "Onion")
             msg2.add_reaction.assert_awaited_once()
         finally:
             self.state.codewords = orig_codewords
 
-    def test_admin_declares_new_codeword_from_chat(self):
-        # A "codeword: <phrase>" declaration sets ANY codeword, even one not in
-        # the roster, and remembers it in the roster.
+    def test_admin_declaration_uses_only_configured_codewords(self):
         orig_codewords = list(self.state.codewords)
-        self.state.codewords = ["Banana Bread Supreme"]
+        self.state.codewords = ["Onion"]
         try:
             msg = self._run_message("codeword: fresh new phrase")
-            self.assertEqual(self.state.codeword, "fresh new phrase")
-            self.assertIn("fresh new phrase", self.state.codewords)
-            msg.add_reaction.assert_awaited_once()
+            self.assertEqual(self.state.codeword, "")
+            self.assertEqual(self.state.codewords, ["Onion"])
+            msg.add_reaction.assert_not_awaited()
+            msg2 = self._run_message("codeword: fresh onion phrase")
+            self.assertEqual(self.state.codeword, "Onion")
+            self.assertEqual(self.state.codewords, ["Onion"])
+            msg2.add_reaction.assert_awaited_once()
         finally:
             self.state.codewords = orig_codewords
 
-    def test_admin_declared_codeword_not_duplicated_in_roster(self):
+    def test_admin_declared_codeword_does_not_mutate_roster(self):
         orig_codewords = list(self.state.codewords)
-        self.state.codewords = ["fresh new phrase"]
+        self.state.codewords = ["Citrus", "Onion"]
         try:
-            self._run_message("codeword: fresh new phrase")
-            self.assertEqual(self.state.codeword, "fresh new phrase")
-            self.assertEqual(
-                self.state.codewords.count("fresh new phrase"), 1
-            )
+            msg = self._run_message("codeword: citrus")
+            self.assertEqual(self.state.codeword, "Citrus")
+            self.assertEqual(self.state.codewords, ["Citrus", "Onion"])
+            msg.add_reaction.assert_awaited_once()
         finally:
             self.state.codewords = orig_codewords
 
     def test_admin_chatter_without_keyword_is_not_a_codeword(self):
         # Ordinary admin chatter (no roster match, no keyword) sets nothing.
         orig_codewords = list(self.state.codewords)
-        self.state.codewords = ["Banana Bread Supreme"]
+        self.state.codewords = ["Onion"]
         try:
             msg = self._run_message("gg everyone nice session")
             self.assertEqual(self.state.codeword, "")
@@ -2040,4 +2041,3 @@ class ClanEmojiResolveTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -100,61 +100,72 @@ def find_fish(text: str) -> str | None:
 # Known session codewords
 # ---------------------------------------------------------------------------
 
-# The default roster of codeword phrases admins rotate between, used when no
-# custom roster is configured via the /watch modal (``FISH_WATCH_CODEWORDS`` /
-# WatchState.codewords). An admin typing one of the configured phrases in the
-# watched channel sets it as the active session codeword, detected the same way
-# fish declarations are (whole-phrase, case-insensitive, letter-spacing
-# tolerant).
+# The default roster of individual code words admins rotate between, used when
+# no custom roster is configured via the /watch modal
+# (``FISH_WATCH_CODEWORDS`` / WatchState.codewords). An admin typing one of the
+# configured words in the watched channel sets it as the active session
+# codeword, detected the same way fish declarations are (whole-word,
+# case-insensitive, letter-spacing tolerant).
 CODEWORDS: tuple[str, ...] = (
-    "Pepperoni Shockalaka Dinglehopper",
-    "DYWATTA Citrus Onion",
-    "Capybara Pinocchio Skibbibidy",
+    "Pepperoni",
+    "Shockalaka",
+    "Dinglehopper",
+    "DYWATTA",
+    "Citrus",
+    "Onion",
+    "Capybara",
+    "Pinocchio",
+    "Skibbibidy",
 )
+_CODEWORDS_BY_KEY: dict[str, str] = {w.casefold(): w for w in CODEWORDS}
 
 _CODEWORD_PATTERN_CACHE: dict[str, re.Pattern[str]] = {}
 
 
-def _codeword_pattern(phrase: str) -> re.Pattern[str]:
-    """Memoized fish-style matcher for a single codeword phrase."""
-    pattern = _CODEWORD_PATTERN_CACHE.get(phrase)
+def _canonical_codeword(raw: str | None) -> str | None:
+    return _CODEWORDS_BY_KEY.get(normalize_codeword(raw).casefold())
+
+
+def _codeword_pattern(word: str) -> re.Pattern[str]:
+    """Memoized fish-style matcher for one code word."""
+    pattern = _CODEWORD_PATTERN_CACHE.get(word)
     if pattern is None:
-        pattern = _fish_pattern(phrase)
-        _CODEWORD_PATTERN_CACHE[phrase] = pattern
+        pattern = _fish_pattern(word)
+        _CODEWORD_PATTERN_CACHE[word] = pattern
     return pattern
 
 
 def find_codeword(
     text: str, codewords: "Iterable[str] | None" = None
 ) -> str | None:
-    """Return the first configured codeword phrase found in ``text``.
+    """Return the first configured code word found in ``text``.
 
-    ``codewords`` is the roster of allowed phrases (the /watch modal roster,
+    ``codewords`` is the roster of allowed words (the /watch modal roster,
     normally :attr:`WatchState.codewords`); it defaults to the built-in
     :data:`CODEWORDS` when not supplied. Same detection rules as
     :func:`find_fish`: case-insensitive whole-word match tolerating
-    letter-spaced rendering. Returns None when no configured codeword appears.
+    letter-spaced rendering. Returns None when no configured code word appears.
     """
     if not text:
         return None
     roster = CODEWORDS if codewords is None else codewords
     best: tuple[int, str] | None = None
-    for phrase in roster:
-        phrase = normalize_codeword(phrase)
-        if not phrase:
+    for word in roster:
+        word = _canonical_codeword(word)
+        if not word:
             continue
-        m = _codeword_pattern(phrase).search(text)
+        m = _codeword_pattern(word).search(text)
         if m and (best is None or m.start() < best[0]):
-            best = (m.start(), phrase)
+            best = (m.start(), word)
     return best[1] if best else None
 
 
-# A watch admin can declare a brand-new codeword straight from chat (not just
-# the pre-registered roster) by leading the message with a "codeword" keyword,
-# e.g. "codeword: banana bread", "the codeword is banana bread",
-# "set codeword banana bread". The trailing phrase becomes the active codeword.
+# A watch admin can declare a codeword from chat by leading the message with a
+# "codeword" keyword, e.g. "codeword: pepperoni", "the codeword is dywatta",
+# "set codeword onion". The trailing text is scanned for the first configured
+# code word.
 # Requiring the keyword prefix keeps ordinary admin chatter from being mistaken
-# for a codeword (unlike fish, codewords have no fixed vocabulary to match on).
+# for a codeword.
 # The optional lead-in (the / today's / new / set...) is a single, non-
 # overlapping group to avoid catastrophic regex backtracking.
 _CODEWORD_DECL_RE = re.compile(
@@ -166,15 +177,17 @@ _CODEWORD_DECL_RE = re.compile(
 )
 
 
-def parse_codeword_declaration(text: str | None) -> str | None:
-    """Extract an explicitly declared codeword phrase from an admin message.
+def parse_codeword_declaration(
+    text: str | None, codewords: "Iterable[str] | None" = None
+) -> str | None:
+    """Extract an explicitly declared code word from an admin message.
 
     Recognises a message that leads with a ``codeword`` keyword (optionally
     prefixed with ``the`` / ``today's`` / ``set`` / ``new`` and followed by
-    ``is`` / ``are`` / ``:`` / ``=`` / a dash) and returns the trailing phrase,
-    sanitized via :func:`normalize_codeword`. Returns ``None`` when the message
-    isn't a codeword declaration or carries no phrase. Lets a watch admin set
-    *any* codeword from chat without pre-registering it in the roster.
+    ``is`` / ``are`` / ``:`` / ``=`` / a dash) and returns the first allowed
+    code word from the trailing text. Returns ``None`` when the message isn't a
+    codeword declaration, carries no content, or doesn't include a configured
+    code word.
     """
     if not text:
         return None
@@ -187,7 +200,7 @@ def parse_codeword_declaration(text: str | None) -> str | None:
     phrase = phrase.lstrip(":=-\u2014\u2013 \t").strip()
     if not any(ch.isalnum() for ch in phrase):
         return None
-    return phrase
+    return find_codeword(phrase, codewords)
 
 
 def canonical_fish(name: str) -> str | None:
@@ -304,7 +317,7 @@ class WatchState:
     codeword: str = ""
     admin_ids: set[int] = field(default_factory=set)
     current_fish: str | None = None
-    # The roster of allowed codeword phrases (set via the /watch modal). A
+    # The roster of allowed code words (set via the /watch modal). A
     # watch admin typing one in the watched channel promotes it to the active
     # ``codeword``. Defaults to the built-in CODEWORDS when none configured.
     codewords: list[str] = field(default_factory=lambda: list(CODEWORDS))
@@ -312,7 +325,7 @@ class WatchState:
     @classmethod
     def from_env(cls) -> "WatchState":
         fish = canonical_fish(os.getenv(ENV_FISH, ""))
-        codeword = normalize_codeword(os.getenv(ENV_CODEWORD))
+        codeword = _canonical_codeword(os.getenv(ENV_CODEWORD)) or ""
         codewords = parse_codewords(os.getenv(ENV_CODEWORDS))
         # The active codeword must stay in the roster, otherwise a watch admin
         # re-typing it in the watched channel is never recognised (find_codeword
@@ -391,32 +404,32 @@ _CODEWORD_SPLIT_RE = re.compile(r"[,\n\r]+")
 def parse_codewords(raw: str | None) -> list[str]:
     """Parse a roster of codewords from modal / .env input.
 
-    Splits on commas and newlines, sanitizes each phrase via
-    :func:`normalize_codeword`, drops blanks, and de-duplicates
-    case-insensitively while preserving first-seen order.
+    Splits on commas and newlines, sanitizes each item via
+    :func:`normalize_codeword`, keeps only known built-in code words, and
+    de-duplicates case-insensitively while preserving first-seen order.
     """
     if not raw:
         return []
     out: list[str] = []
     seen: set[str] = set()
     for chunk in _CODEWORD_SPLIT_RE.split(raw):
-        phrase = normalize_codeword(chunk)
-        if not phrase:
+        word = _canonical_codeword(chunk)
+        if not word:
             continue
-        key = phrase.casefold()
+        key = word.casefold()
         if key in seen:
             continue
         seen.add(key)
-        out.append(phrase)
+        out.append(word)
     return out
 
 
 def _contains_codeword(text: str, codeword: str) -> bool:
-    codeword = normalize_codeword(codeword)
+    codeword = _canonical_codeword(codeword) or ""
     if not codeword:
         return True
-    # Same matcher the fish detector uses: whole-phrase, case-insensitive,
-    # variable whitespace between words, letter-spaced rendering tolerated.
+    # Same matcher the fish detector uses: whole-word, case-insensitive,
+    # letter-spaced rendering tolerated.
     return bool(_fish_pattern(codeword).search(text))
 
 

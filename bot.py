@@ -6850,9 +6850,8 @@ def _watch_components(
         f"**Active codeword:** {codeword_line}\n"
         f"-# > Only the codeword a watch admin activated in the watched "
         f"channel is shown. A watch admin sets it by typing `codeword: "
-        f"<phrase>` in the watched channel (any phrase works, and is "
-        f"remembered), or by typing one of the Set codewords roster "
-        f"phrases \u2014 like naming a fish, even while the watch is "
+        f"<word>` in the watched channel, or by typing one of the Set "
+        f"codewords roster words \u2014 like naming a fish, even while the watch is "
         f"stopped.\n"
         f"**Watch admins:** {admins_line}\n"
         f"**Current fish:** {fish_line}"
@@ -6888,15 +6887,15 @@ def _watch_components(
 
 
 class _WatchCodewordModal(_GPModal):
-    """Set the fish-watch codeword roster — the phrases a watch admin can
+    """Set the fish-watch codeword roster — the words a watch admin can
     activate by typing one in the watched channel. Editing the roster only
-    changes which phrases are *allowed*; the active codeword shown on the panel
+    changes which words are *allowed*; the active codeword shown on the panel
     is whichever one a watch admin most recently declared."""
 
     def __init__(self) -> None:
         super().__init__(title="watch \u2014 set codewords", timeout=600)
         self.add_item(discord.ui.TextDisplay(
-            "The phrases a watch admin may activate, one per line. A watch "
+            "The code words a watch admin may activate, one per line. A watch "
             "admin typing one in the watched channel makes it the active "
             "codeword members must have visible in their chat box."
         ))
@@ -6928,7 +6927,7 @@ class _WatchCodewordModal(_GPModal):
             self.codeword_input.value
         )
         # Drop the active codeword if it's no longer in the roster so the panel
-        # never shows a phrase members can no longer be judged against.
+        # never shows a word members can no longer be judged against.
         active = _WATCH_STATE.codeword
         if active and not any(
             active.casefold() == c.casefold()
@@ -7235,7 +7234,7 @@ async def on_message(message: discord.Message) -> None:
         return
     # A watch admin naming a fish (no screenshot) sets the fish being
     # watched; every later submission must show that fish until the admin
-    # names a new one. Naming a known codeword phrase works the same way,
+    # names a new one. Naming a known codeword works the same way,
     # setting the session codeword. Admin declarations are configuration,
     # so they apply even while the watch is stopped (e.g. announcing the
     # next session's codeword before pressing Start).
@@ -7253,7 +7252,7 @@ async def on_message(message: discord.Message) -> None:
                 "watch: admin %s set fish to %s", message.author.id, fish
             )
         else:
-            # A roster phrase (bare, canonical casing) activates that codeword.
+            # A roster code word (bare, canonical casing) activates that codeword.
             codeword = fishwatch.find_codeword(content, state.codewords)
             if codeword:
                 state.codeword = codeword
@@ -7263,17 +7262,13 @@ async def on_message(message: discord.Message) -> None:
                     message.author.id, codeword,
                 )
             else:
-                # Otherwise an explicit "codeword: <phrase>" declaration sets
-                # ANY codeword — even one not in the roster — so a watch admin
-                # can announce a fresh codeword straight from chat. It's also
-                # remembered in the roster for future bare activation.
-                declared = fishwatch.parse_codeword_declaration(content)
+                # Otherwise an explicit "codeword: <word>" declaration sets the
+                # first configured code word present in the declaration text.
+                declared = fishwatch.parse_codeword_declaration(
+                    content, state.codewords
+                )
                 if declared:
                     state.codeword = declared
-                    if declared.casefold() not in {
-                        c.casefold() for c in state.codewords
-                    }:
-                        state.codewords.append(declared)
                     changed = True
                     logger.info(
                         "watch: admin %s declared codeword %s",

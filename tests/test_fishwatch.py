@@ -100,74 +100,70 @@ def test_canonical_fish():
 
 def test_codeword_roster():
     assert fishwatch.CODEWORDS == (
-        "Pepperoni Shockalaka Dinglehopper",
-        "DYWATTA Citrus Onion",
-        "Capybara Pinocchio Skibbibidy",
+        "Pepperoni",
+        "Shockalaka",
+        "Dinglehopper",
+        "DYWATTA",
+        "Citrus",
+        "Onion",
+        "Capybara",
+        "Pinocchio",
+        "Skibbibidy",
     )
 
 
 def test_find_codeword_case_insensitive():
-    assert (
-        find_codeword("today: dywatta citrus onion please")
-        == "DYWATTA Citrus Onion"
-    )
-    assert (
-        find_codeword("PEPPERONI SHOCKALAKA DINGLEHOPPER")
-        == "Pepperoni Shockalaka Dinglehopper"
-    )
+    assert find_codeword("today: dywatta please") == "DYWATTA"
+    assert find_codeword("PEPPERONI now") == "Pepperoni"
 
 
 def test_find_codeword_letter_spaced():
-    assert (
-        find_codeword("D Y W A T T A C i t r u s O n i o n")
-        == "DYWATTA Citrus Onion"
-    )
+    assert find_codeword("D Y W A T T A") == "DYWATTA"
 
 
 def test_find_codeword_rejects_partial_and_embedded():
-    assert find_codeword("capybara pinocchio") is None
-    assert find_codeword("xcapybara pinocchio skibbibidy") is None
+    assert find_codeword("capybara pinocchio") == "Capybara"
+    assert find_codeword("xcapybara") is None
     assert find_codeword("") is None
     assert find_codeword("no codeword here") is None
 
 
 def test_find_codeword_returns_earliest_match():
-    text = "Capybara Pinocchio Skibbibidy then DYWATTA Citrus Onion"
-    assert find_codeword(text) == "Capybara Pinocchio Skibbibidy"
+    text = "Pinocchio then DYWATTA"
+    assert find_codeword(text) == "Pinocchio"
 
 
 def test_find_codeword_uses_supplied_roster():
     # A custom roster (the /watch modal roster) overrides the built-in list.
-    assert find_codeword("chat: banana bread", ["banana bread"]) == "banana bread"
-    # A built-in default phrase is not matched when it's not in the roster.
+    assert find_codeword("chat: citrus", ["citrus"]) == "Citrus"
+    # Entries outside the built-in word set are ignored.
     assert find_codeword("dywatta citrus onion", ["banana bread"]) is None
 
 
 def test_find_codeword_empty_roster_matches_nothing():
-    assert find_codeword("dywatta citrus onion", []) is None
+    assert find_codeword("dywatta", []) is None
 
 
-def test_parse_codeword_declaration_extracts_phrase():
-    # A watch admin can declare ANY codeword from chat with a keyword prefix.
+def test_parse_codeword_declaration_extracts_codeword():
     assert fishwatch.parse_codeword_declaration(
-        "codeword: banana bread"
-    ) == "banana bread"
+        "codeword: banana pepperoni bread"
+    ) == "Pepperoni"
     assert fishwatch.parse_codeword_declaration(
-        "the codeword is banana bread"
-    ) == "banana bread"
+        "the codeword is dywatta"
+    ) == "DYWATTA"
     assert fishwatch.parse_codeword_declaration(
-        "codeword banana bread"
-    ) == "banana bread"
+        "codeword capybara pinocchio"
+    ) == "Capybara"
     assert fishwatch.parse_codeword_declaration(
-        "set codeword banana bread"
-    ) == "banana bread"
+        "set codeword skibbibidy"
+    ) == "Skibbibidy"
     assert fishwatch.parse_codeword_declaration(
-        "today's codeword is banana bread"
-    ) == "banana bread"
+        "today's codeword is citrus"
+    ) == "Citrus"
     # "code word" (spaced) and markdown backticks are tolerated / stripped.
     assert fishwatch.parse_codeword_declaration(
-        "code word: `secret sauce`"
-    ) == "secret sauce"
+        "code word: `onion`"
+    ) == "Onion"
 
 
 def test_parse_codeword_declaration_rejects_non_declarations():
@@ -177,14 +173,15 @@ def test_parse_codeword_declaration_rejects_non_declarations():
     # A bare "codeword" keyword with no phrase carries nothing.
     assert fishwatch.parse_codeword_declaration("codeword") is None
     assert fishwatch.parse_codeword_declaration("codeword:") is None
+    assert fishwatch.parse_codeword_declaration("codeword: banana bread") is None
     assert fishwatch.parse_codeword_declaration("") is None
     assert fishwatch.parse_codeword_declaration(None) is None
 
 
-def test_parse_codewords_splits_and_dedupes():
-    raw = "Alpha One\nBeta Two, Alpha One\n\n`Gamma Three`"
+def test_parse_codewords_splits_dedupes_and_filters():
+    raw = "Pepperoni\nbanana bread, pepperoni\n\n`Onion`\nDYWATTA"
     assert fishwatch.parse_codewords(raw) == [
-        "Alpha One", "Beta Two", "Gamma Three",
+        "Pepperoni", "Onion", "DYWATTA",
     ]
 
 
@@ -194,11 +191,10 @@ def test_parse_codewords_blank():
     assert fishwatch.parse_codewords("  ,\n , ") == []
 
 
-def test_evaluate_multiword_codeword_variable_spacing():
-    # Multi-word codewords match with OCR-mangled whitespace, like fish.
-    text = "Norg\nchat: dywatta   citrus\nonion"
+def test_evaluate_single_word_codeword_variable_spacing():
+    text = "Norg\nchat: d y w a t t a"
     v = evaluate_submission(
-        text, codeword="DYWATTA Citrus Onion", expected_fish="Norg"
+        text, codeword="DYWATTA", expected_fish="Norg"
     )
     assert v.ok
 
@@ -327,14 +323,14 @@ def test_problem_messages_cover_all_problems():
 def test_watch_state_from_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv(fishwatch.ENV_ENABLED, "1")
     monkeypatch.setenv(fishwatch.ENV_CHANNEL, "12345")
-    monkeypatch.setenv(fishwatch.ENV_CODEWORD, "cerebral")
-    monkeypatch.setenv(fishwatch.ENV_CODEWORDS, "cerebral,limbic")
+    monkeypatch.setenv(fishwatch.ENV_CODEWORD, "onion")
+    monkeypatch.setenv(fishwatch.ENV_CODEWORDS, "onion,banana bread,citrus")
     monkeypatch.setenv(fishwatch.ENV_ADMIN_IDS, "1,2,3")
     monkeypatch.setenv(fishwatch.ENV_FISH, "norg")
     state = WatchState.from_env()
     assert state.enabled and state.channel_id == 12345
-    assert state.codeword == "cerebral"
-    assert state.codewords == ["cerebral", "limbic"]
+    assert state.codeword == "Onion"
+    assert state.codewords == ["Onion", "Citrus"]
     assert state.admin_ids == {1, 2, 3}
     assert state.current_fish == "Norg"
 
@@ -354,12 +350,12 @@ def test_watch_state_from_env_seeds_roster_from_legacy_codeword(
     # A legacy single-codeword install (FISH_WATCH_CODEWORD set, roster unset)
     # must seed the roster from that codeword so an admin re-typing it in chat
     # is still recognised (find_codeword only scans the roster).
-    monkeypatch.setenv(fishwatch.ENV_CODEWORD, "cerebral")
+    monkeypatch.setenv(fishwatch.ENV_CODEWORD, "onion")
     monkeypatch.delenv(fishwatch.ENV_CODEWORDS, raising=False)
     state = WatchState.from_env()
-    assert state.codeword == "cerebral"
-    assert state.codewords == ["cerebral"]
-    assert fishwatch.find_codeword("cerebral", state.codewords) == "cerebral"
+    assert state.codeword == "Onion"
+    assert state.codewords == ["Onion"]
+    assert fishwatch.find_codeword("onion", state.codewords) == "Onion"
 
 
 def test_watch_state_from_env_keeps_active_codeword_in_roster(
@@ -367,12 +363,12 @@ def test_watch_state_from_env_keeps_active_codeword_in_roster(
 ):
     # An active codeword missing from the configured roster is added back so it
     # stays selectable/typable by a watch admin.
-    monkeypatch.setenv(fishwatch.ENV_CODEWORD, "cerebral")
-    monkeypatch.setenv(fishwatch.ENV_CODEWORDS, "limbic,cortex")
+    monkeypatch.setenv(fishwatch.ENV_CODEWORD, "onion")
+    monkeypatch.setenv(fishwatch.ENV_CODEWORDS, "citrus,pepperoni")
     state = WatchState.from_env()
-    assert state.codeword == "cerebral"
-    assert state.codewords == ["cerebral", "limbic", "cortex"]
-    assert fishwatch.find_codeword("cerebral", state.codewords) == "cerebral"
+    assert state.codeword == "Onion"
+    assert state.codewords == ["Onion", "Citrus", "Pepperoni"]
+    assert fishwatch.find_codeword("onion", state.codewords) == "Onion"
 
 
 def test_watch_state_from_env_defaults(monkeypatch: pytest.MonkeyPatch):
@@ -391,15 +387,15 @@ def test_watch_state_from_env_defaults(monkeypatch: pytest.MonkeyPatch):
 
 def test_watch_state_env_items_round_trip():
     state = WatchState(
-        enabled=True, channel_id=99, codeword="w",
+        enabled=True, channel_id=99, codeword="Onion",
         admin_ids={5, 2}, current_fish="Norg",
-        codewords=["w", "x y"],
+        codewords=["Onion", "Citrus"],
     )
     items = dict(state.env_items())
     assert items[fishwatch.ENV_ENABLED] == "1"
     assert items[fishwatch.ENV_CHANNEL] == "99"
-    assert items[fishwatch.ENV_CODEWORD] == "w"
-    assert items[fishwatch.ENV_CODEWORDS] == "w,x y"
+    assert items[fishwatch.ENV_CODEWORD] == "Onion"
+    assert items[fishwatch.ENV_CODEWORDS] == "Onion,Citrus"
     assert items[fishwatch.ENV_ADMIN_IDS] == "2,5"
     assert items[fishwatch.ENV_FISH] == "Norg"
 
