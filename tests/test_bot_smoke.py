@@ -1143,6 +1143,22 @@ class WatchAdminCodewordTests(unittest.TestCase):
         message.add_reaction.assert_not_awaited()
         self.post_v2.assert_not_awaited()
 
+    def test_admin_message_uses_configured_roster(self):
+        # Detection scans the configured roster, not just the built-in list.
+        orig_codewords = list(self.state.codewords)
+        self.state.codewords = ["Banana Bread Supreme"]
+        try:
+            # A built-in default phrase no longer matches once removed.
+            msg = self._run_message("codeword is dywatta citrus onion")
+            self.assertEqual(self.state.codeword, "")
+            msg.add_reaction.assert_not_awaited()
+            # The configured phrase does match.
+            msg2 = self._run_message("today: banana bread supreme")
+            self.assertEqual(self.state.codeword, "Banana Bread Supreme")
+            msg2.add_reaction.assert_awaited_once()
+        finally:
+            self.state.codewords = orig_codewords
+
 
 class CardTextHelperTests(unittest.TestCase):
     """Tests for the shared card-text helpers."""
