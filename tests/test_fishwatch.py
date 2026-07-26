@@ -228,13 +228,13 @@ def test_evaluate_unreadable_no_fish():
 
 def test_evaluate_missing_codeword():
     text = "N o r g\nLarge\n39.9 kg"
-    v = evaluate_submission(text, codeword="cerebral", expected_fish="Norg")
+    v = evaluate_submission(text, codeword="Pepperoni", expected_fish="Norg")
     assert not v.ok and v.problems == (PROBLEM_CODEWORD,)
 
 
 def test_evaluate_wrong_codeword():
     text = "Norg\n[14:03] Donut-Prime: cerebrum"
-    v = evaluate_submission(text, codeword="cerebral", expected_fish="Norg")
+    v = evaluate_submission(text, codeword="Pepperoni", expected_fish="Norg")
     assert not v.ok and PROBLEM_CODEWORD in v.problems
 
 
@@ -287,7 +287,7 @@ def test_evaluate_wrong_fish():
 
 
 def test_evaluate_wrong_fish_and_missing_codeword():
-    v = evaluate_submission("Mawfish", codeword="cerebral", expected_fish="Norg")
+    v = evaluate_submission("Mawfish", codeword="Pepperoni", expected_fish="Norg")
     assert set(v.problems) == {PROBLEM_CODEWORD, PROBLEM_WRONG_FISH}
 
 
@@ -299,10 +299,10 @@ def test_evaluate_no_expected_fish_accepts_any():
 
 
 def test_problem_messages_cover_all_problems():
-    v = evaluate_submission("Mawfish", codeword="cerebral", expected_fish="Norg")
-    msgs = problem_messages(v, codeword="cerebral", expected_fish="Norg")
+    v = evaluate_submission("Mawfish", codeword="Pepperoni", expected_fish="Norg")
+    msgs = problem_messages(v, codeword="Pepperoni", expected_fish="Norg")
     joined = " ".join(msgs)
-    assert "codeword `cerebral` is not in your screenshot" in joined
+    assert "codeword `Pepperoni` is not in your screenshot" in joined
     assert "but the current fish is `Norg`" in joined
     assert "You submitted `Mawfish`" in joined
 
