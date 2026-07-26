@@ -9,7 +9,7 @@ signature-drift bugs at test time instead of runtime.
 from __future__ import annotations
 
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import discord
 
@@ -928,6 +928,130 @@ class WatchPendingDeleteTests(unittest.TestCase):
             self.b._watch_pending_deletes.pop(42, None)
         self.assertEqual(calls, [(7, 42)])
         self.assertNotIn(42, self.b._watch_pending_deletes)
+
+
+class WatchDeletedSubmissionTests(unittest.TestCase):
+    """Deleting a rejected submission also deletes its error reply."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+
+    def tearDown(self):
+        self.b._watch_submission_replies.clear()
+        self.b._watch_error_replies.clear()
+        self.b._watch_pending_deletes.clear()
+
+    def test_raw_delete_removes_tracked_error_reply(self):
+        import asyncio
+        calls = []
+
+        async def fake_delete(cid, mid):
+            calls.append((cid, mid))
+
+        orig_delete = self.b._delete_message
+        self.b._delete_message = fake_delete
+        try:
+            self.b._watch_submission_replies[42] = (5, 9001)
+            self.b._watch_error_replies[5] = [9001]
+            pending = Mock()
+            self.b._watch_pending_deletes[42] = pending
+            payload = Mock(message_id=42, channel_id=7)
+            asyncio.run(self.b.on_raw_message_delete(payload))
+        finally:
+            self.b._delete_message = orig_delete
+        self.assertEqual(calls, [(7, 9001)])
+        self.assertNotIn(42, self.b._watch_submission_replies)
+        self.assertNotIn(5, self.b._watch_error_replies)
+        self.assertNotIn(42, self.b._watch_pending_deletes)
+        pending.cancel.assert_called_once()
+
+    def test_raw_delete_ignores_untracked_message(self):
+        import asyncio
+        calls = []
+
+        async def fake_delete(cid, mid):
+            calls.append((cid, mid))
+
+        orig_delete = self.b._delete_message
+        self.b._delete_message = fake_delete
+        try:
+            payload = Mock(message_id=999, channel_id=7)
+            asyncio.run(self.b.on_raw_message_delete(payload))
+        finally:
+            self.b._delete_message = orig_delete
+        self.assertEqual(calls, [])
+
+    def test_untrack_watch_error_reply_prunes_both_maps(self):
+        self.b._watch_error_replies[5] = [9001, 9002]
+        self.b._watch_submission_replies[42] = (5, 9001)
+        self.b._watch_submission_replies[43] = (5, 9002)
+        self.b._untrack_watch_error_reply(5, 9001)
+        self.assertEqual(self.b._watch_error_replies[5], [9002])
+        self.assertNotIn(42, self.b._watch_submission_replies)
+        self.assertIn(43, self.b._watch_submission_replies)
+        self.b._untrack_watch_error_reply(5, 9002)
+        self.assertNotIn(5, self.b._watch_error_replies)
+        self.assertEqual(self.b._watch_submission_replies, {})
+
+
+class WatchAdminCodewordTests(unittest.TestCase):
+    """An admin naming a known codeword sets it, like naming a fish."""
+
+    def setUp(self):
+        import bot as bot_module
+        self.b = bot_module
+        self.state = self.b._WATCH_STATE
+        self.orig = (
+            self.state.enabled, self.state.channel_id,
+            self.state.codeword, set(self.state.admin_ids),
+            self.state.current_fish,
+        )
+        self.state.enabled = True
+        self.state.channel_id = 7
+        self.state.codeword = ""
+        self.state.admin_ids = {5}
+        self.state.current_fish = None
+
+    def tearDown(self):
+        (self.state.enabled, self.state.channel_id, self.state.codeword,
+         admin_ids, self.state.current_fish) = self.orig
+        self.state.admin_ids = admin_ids
+
+    def _run_message(self, content):
+        import asyncio
+        message = Mock()
+        message.author = Mock(bot=False, id=5)
+        message.guild = Mock()
+        message.channel = Mock(id=7)
+        message.attachments = []
+        message.content = content
+        message.add_reaction = AsyncMock()
+        orig_persist = self.b._persist_watch_state
+        self.b._persist_watch_state = lambda: None
+        try:
+            asyncio.run(self.b.on_message(message))
+        finally:
+            self.b._persist_watch_state = orig_persist
+        return message
+
+    def test_admin_message_sets_codeword(self):
+        message = self._run_message("codeword is dywatta citrus onion")
+        self.assertEqual(self.state.codeword, "DYWATTA Citrus Onion")
+        message.add_reaction.assert_awaited_once()
+
+    def test_admin_message_sets_fish_and_codeword_together(self):
+        self._run_message("Norg — capybara pinocchio skibbibidy")
+        self.assertEqual(self.state.current_fish, "Norg")
+        self.assertEqual(
+            self.state.codeword, "Capybara Pinocchio Skibbibidy"
+        )
+
+    def test_admin_message_without_known_phrases_changes_nothing(self):
+        message = self._run_message("hello team")
+        self.assertEqual(self.state.codeword, "")
+        self.assertIsNone(self.state.current_fish)
+        message.add_reaction.assert_not_awaited()
 
 
 class CardTextHelperTests(unittest.TestCase):

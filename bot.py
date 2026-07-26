@@ -1605,6 +1605,9 @@ async def on_member_remove(member: discord.Member) -> None:
     # Drop any tracked fish-watch error replies for the member — their
     # next-submission cleanup can never fire once they've left.
     _watch_error_replies.pop(member.id, None)
+    for msg_id, (uid, _rid) in list(_watch_submission_replies.items()):
+        if uid == member.id:
+            _watch_submission_replies.pop(msg_id, None)
     _spawn_bg_task(
         _clear_member_data_on_leave(guild.id, member.id, str(label))
     )
@@ -6622,6 +6625,23 @@ _WATCH_REJECT_DELETE_SECONDS = 300
 # member's message ID so Stop can cancel them cleanly.
 _watch_pending_deletes: dict[int, asyncio.Task] = {}
 
+# Error reply per rejected submission: submission message ID →
+# (submitter user ID, bot error-reply message ID). When the original post
+# is deleted, the error reply that pointed at it is deleted too.
+_watch_submission_replies: dict[int, tuple[int, int]] = {}
+
+
+def _untrack_watch_error_reply(user_id: int, reply_id: int) -> None:
+    """Drop one error reply from the per-user + per-submission tracking."""
+    replies = _watch_error_replies.get(user_id)
+    if replies and reply_id in replies:
+        replies.remove(reply_id)
+        if not replies:
+            _watch_error_replies.pop(user_id, None)
+    for msg_id, (_uid, rid) in list(_watch_submission_replies.items()):
+        if rid == reply_id:
+            _watch_submission_replies.pop(msg_id, None)
+
 
 def _cancel_watch_pending_deletes() -> None:
     """Cancel every scheduled rejected-post delete (watch stopped)."""
@@ -6828,7 +6848,9 @@ def _watch_components(
         f"{status_line}\n"
         f"**Channel:** {channel_line}\n"
         f"**Codeword:** {codeword_line}\n"
-        f"-# > A new codeword only applies to newly sent images.\n"
+        f"-# > A new codeword only applies to newly sent images. A watch "
+        f"admin typing a known codeword phrase in the watched channel "
+        f"sets it, like naming a fish.\n"
         f"**Watch admins:** {admins_line}\n"
         f"**Current fish:** {fish_line}"
     )
@@ -7030,6 +7052,7 @@ async def _handle_watch_interaction(
         # deletes so no stale deletes fire later.
         _WATCH_STATE.enabled = False
         _watch_error_replies.clear()
+        _watch_submission_replies.clear()
         _cancel_watch_pending_deletes()
         await asyncio.to_thread(_persist_watch_state)
         logger.info("watch: stopped by %s", user.id)
@@ -7107,6 +7130,7 @@ async def _process_watch_submission(
     user_id = message.author.id
     channel_id = message.channel.id
     for old_id in _watch_error_replies.pop(user_id, []):
+        _untrack_watch_error_reply(user_id, old_id)
         await _delete_message(channel_id, old_id)
     if verdict.ok:
         with contextlib.suppress(discord.HTTPException):
@@ -7153,6 +7177,9 @@ async def _process_watch_submission(
         # same member must all stay tracked so the next attempt cleans up
         # every outstanding error reply.
         _watch_error_replies.setdefault(user_id, []).append(reply_id)
+        # Tie the error reply to the submission it points at, so deleting
+        # the original post also removes the now-orphaned error reply.
+        _watch_submission_replies[message.id] = (user_id, reply_id)
     if _WATCH_STATE.enabled:
         # The rejected screenshot needs a resubmission — remove the
         # member's post after the grace window so it doesn't linger.
@@ -7170,17 +7197,30 @@ async def on_message(message: discord.Message) -> None:
         return
     # A watch admin naming a fish (no screenshot) sets the fish being
     # watched; every later submission must show that fish until the admin
-    # names a new one.
+    # names a new one. Naming a known codeword phrase works the same way,
+    # setting the session codeword.
     if message.author.id in state.admin_ids and not message.attachments:
-        fish = fishwatch.find_fish(message.content or "")
+        content = message.content or ""
+        changed = False
+        fish = fishwatch.find_fish(content)
         if fish:
             state.current_fish = fish
-            await asyncio.to_thread(_persist_watch_state)
-            with contextlib.suppress(discord.HTTPException):
-                await message.add_reaction("\U0001F3A3")
+            changed = True
             logger.info(
                 "watch: admin %s set fish to %s", message.author.id, fish
             )
+        codeword = fishwatch.find_codeword(content)
+        if codeword:
+            state.codeword = codeword
+            changed = True
+            logger.info(
+                "watch: admin %s set codeword to %s",
+                message.author.id, codeword,
+            )
+        if changed:
+            await asyncio.to_thread(_persist_watch_state)
+            with contextlib.suppress(discord.HTTPException):
+                await message.add_reaction("\U0001F3A3")
         return
     attachment = _first_image_attachment(message)
     if attachment is None:
@@ -7192,6 +7232,24 @@ async def on_message(message: discord.Message) -> None:
         codeword=state.codeword,
         expected_fish=state.current_fish,
     ))
+
+
+@client.event
+async def on_raw_message_delete(
+    payload: discord.RawMessageDeleteEvent,
+) -> None:
+    # When a rejected watch submission is deleted (by the poster, a mod, or
+    # the grace-window auto-delete), the bot error reply that pointed at it
+    # is orphaned — delete it too.
+    entry = _watch_submission_replies.pop(payload.message_id, None)
+    if entry is None:
+        return
+    user_id, reply_id = entry
+    pending = _watch_pending_deletes.pop(payload.message_id, None)
+    if pending is not None:
+        pending.cancel()
+    _untrack_watch_error_reply(user_id, reply_id)
+    await _delete_message(payload.channel_id, reply_id)
 
 
 async def _handle_status_interaction(

@@ -22,6 +22,7 @@ from fishwatch import (
     build_watch_prompt,
     canonical_fish,
     evaluate_submission,
+    find_codeword,
     find_fish,
     problem_messages,
 )
@@ -91,6 +92,57 @@ def test_canonical_fish():
     assert canonical_fish("norg") == "Norg"
     assert canonical_fish(" TROMYZON ") == "Tromyzon"
     assert canonical_fish("boot") is None
+
+
+# ---------------------------------------------------------------------------
+# Known codeword matching
+# ---------------------------------------------------------------------------
+
+def test_codeword_roster():
+    assert fishwatch.CODEWORDS == (
+        "Pepperoni Shockalaka Dinglehopper",
+        "DYWATTA Citrus Onion",
+        "Capybara Pinocchio Skibbibidy",
+    )
+
+
+def test_find_codeword_case_insensitive():
+    assert (
+        find_codeword("today: dywatta citrus onion please")
+        == "DYWATTA Citrus Onion"
+    )
+    assert (
+        find_codeword("PEPPERONI SHOCKALAKA DINGLEHOPPER")
+        == "Pepperoni Shockalaka Dinglehopper"
+    )
+
+
+def test_find_codeword_letter_spaced():
+    assert (
+        find_codeword("D Y W A T T A C i t r u s O n i o n")
+        == "DYWATTA Citrus Onion"
+    )
+
+
+def test_find_codeword_rejects_partial_and_embedded():
+    assert find_codeword("capybara pinocchio") is None
+    assert find_codeword("xcapybara pinocchio skibbibidy") is None
+    assert find_codeword("") is None
+    assert find_codeword("no codeword here") is None
+
+
+def test_find_codeword_returns_earliest_match():
+    text = "Capybara Pinocchio Skibbibidy then DYWATTA Citrus Onion"
+    assert find_codeword(text) == "Capybara Pinocchio Skibbibidy"
+
+
+def test_evaluate_multiword_codeword_variable_spacing():
+    # Multi-word codewords match with OCR-mangled whitespace, like fish.
+    text = "Norg\nchat: dywatta   citrus\nonion"
+    v = evaluate_submission(
+        text, codeword="DYWATTA Citrus Onion", expected_fish="Norg"
+    )
+    assert v.ok
 
 
 # ---------------------------------------------------------------------------
