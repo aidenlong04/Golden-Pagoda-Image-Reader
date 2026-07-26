@@ -149,6 +149,47 @@ def find_codeword(
     return best[1] if best else None
 
 
+# A watch admin can declare a brand-new codeword straight from chat (not just
+# the pre-registered roster) by leading the message with a "codeword" keyword,
+# e.g. "codeword: banana bread", "the codeword is banana bread",
+# "set codeword banana bread". The trailing phrase becomes the active codeword.
+# Requiring the keyword prefix keeps ordinary admin chatter from being mistaken
+# for a codeword (unlike fish, codewords have no fixed vocabulary to match on).
+# The optional lead-in (the / today's / new / set...) is a single, non-
+# overlapping group to avoid catastrophic regex backtracking.
+_CODEWORD_DECL_RE = re.compile(
+    r"^\s*(?:(?:the|today'?s|new|set(?:ting|s)?)\s+)?"
+    r"code\s*words?\b\s*"
+    r"(?:is|are|=|:|-|\u2014|\u2013)?\s*"
+    r"(?P<phrase>.+?)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def parse_codeword_declaration(text: str | None) -> str | None:
+    """Extract an explicitly declared codeword phrase from an admin message.
+
+    Recognises a message that leads with a ``codeword`` keyword (optionally
+    prefixed with ``the`` / ``today's`` / ``set`` / ``new`` and followed by
+    ``is`` / ``are`` / ``:`` / ``=`` / a dash) and returns the trailing phrase,
+    sanitized via :func:`normalize_codeword`. Returns ``None`` when the message
+    isn't a codeword declaration or carries no phrase. Lets a watch admin set
+    *any* codeword from chat without pre-registering it in the roster.
+    """
+    if not text:
+        return None
+    m = _CODEWORD_DECL_RE.match(text)
+    if not m:
+        return None
+    phrase = normalize_codeword(m.group("phrase"))
+    # Drop a leading separator that leaked past the optional matcher (e.g.
+    # "codeword:" captures ":") and reject a phrase with no real content.
+    phrase = phrase.lstrip(":=-\u2014\u2013 \t").strip()
+    if not any(ch.isalnum() for ch in phrase):
+        return None
+    return phrase
+
+
 def canonical_fish(name: str) -> str | None:
     """Resolve a raw fish name (any case) to its canonical form, or None."""
     fish = FISH_BY_KEY.get((name or "").strip().casefold())
@@ -271,11 +312,23 @@ class WatchState:
     @classmethod
     def from_env(cls) -> "WatchState":
         fish = canonical_fish(os.getenv(ENV_FISH, ""))
-        codewords = parse_codewords(os.getenv(ENV_CODEWORDS)) or list(CODEWORDS)
+        codeword = normalize_codeword(os.getenv(ENV_CODEWORD))
+        codewords = parse_codewords(os.getenv(ENV_CODEWORDS))
+        # The active codeword must stay in the roster, otherwise a watch admin
+        # re-typing it in the watched channel is never recognised (find_codeword
+        # only scans the roster). This also covers a legacy single-codeword
+        # install (FISH_WATCH_CODEWORD set, FISH_WATCH_CODEWORDS unset): seed the
+        # roster from that codeword rather than the built-in placeholders.
+        if not codewords:
+            codewords = [codeword] if codeword else list(CODEWORDS)
+        elif codeword and codeword.casefold() not in {
+            c.casefold() for c in codewords
+        }:
+            codewords.insert(0, codeword)
         return cls(
             enabled=_int_env(ENV_ENABLED) == 1,
             channel_id=_int_env(ENV_CHANNEL),
-            codeword=normalize_codeword(os.getenv(ENV_CODEWORD)),
+            codeword=codeword,
             admin_ids=set(_csv_ids(ENV_ADMIN_IDS)),
             current_fish=fish,
             codewords=codewords,

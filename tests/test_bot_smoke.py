@@ -1148,14 +1148,51 @@ class WatchAdminCodewordTests(unittest.TestCase):
         orig_codewords = list(self.state.codewords)
         self.state.codewords = ["Banana Bread Supreme"]
         try:
-            # A built-in default phrase no longer matches once removed.
-            msg = self._run_message("codeword is dywatta citrus onion")
+            # A built-in default phrase, typed bare (no keyword), no longer
+            # matches once it's removed from the roster.
+            msg = self._run_message("dywatta citrus onion")
             self.assertEqual(self.state.codeword, "")
             msg.add_reaction.assert_not_awaited()
             # The configured phrase does match.
             msg2 = self._run_message("today: banana bread supreme")
             self.assertEqual(self.state.codeword, "Banana Bread Supreme")
             msg2.add_reaction.assert_awaited_once()
+        finally:
+            self.state.codewords = orig_codewords
+
+    def test_admin_declares_new_codeword_from_chat(self):
+        # A "codeword: <phrase>" declaration sets ANY codeword, even one not in
+        # the roster, and remembers it in the roster.
+        orig_codewords = list(self.state.codewords)
+        self.state.codewords = ["Banana Bread Supreme"]
+        try:
+            msg = self._run_message("codeword: fresh new phrase")
+            self.assertEqual(self.state.codeword, "fresh new phrase")
+            self.assertIn("fresh new phrase", self.state.codewords)
+            msg.add_reaction.assert_awaited_once()
+        finally:
+            self.state.codewords = orig_codewords
+
+    def test_admin_declared_codeword_not_duplicated_in_roster(self):
+        orig_codewords = list(self.state.codewords)
+        self.state.codewords = ["fresh new phrase"]
+        try:
+            self._run_message("codeword: fresh new phrase")
+            self.assertEqual(self.state.codeword, "fresh new phrase")
+            self.assertEqual(
+                self.state.codewords.count("fresh new phrase"), 1
+            )
+        finally:
+            self.state.codewords = orig_codewords
+
+    def test_admin_chatter_without_keyword_is_not_a_codeword(self):
+        # Ordinary admin chatter (no roster match, no keyword) sets nothing.
+        orig_codewords = list(self.state.codewords)
+        self.state.codewords = ["Banana Bread Supreme"]
+        try:
+            msg = self._run_message("gg everyone nice session")
+            self.assertEqual(self.state.codeword, "")
+            msg.add_reaction.assert_not_awaited()
         finally:
             self.state.codewords = orig_codewords
 

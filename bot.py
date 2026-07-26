@@ -6849,9 +6849,11 @@ def _watch_components(
         f"**Channel:** {channel_line}\n"
         f"**Active codeword:** {codeword_line}\n"
         f"-# > Only the codeword a watch admin activated in the watched "
-        f"channel is shown. Configure the roster of allowed codewords with "
-        f"Set codewords; a watch admin typing one activates it, like naming "
-        f"a fish \u2014 even while the watch is stopped.\n"
+        f"channel is shown. A watch admin sets it by typing `codeword: "
+        f"<phrase>` in the watched channel (any phrase works, and is "
+        f"remembered), or by typing one of the Set codewords roster "
+        f"phrases \u2014 like naming a fish, even while the watch is "
+        f"stopped.\n"
         f"**Watch admins:** {admins_line}\n"
         f"**Current fish:** {fish_line}"
     )
@@ -7251,6 +7253,7 @@ async def on_message(message: discord.Message) -> None:
                 "watch: admin %s set fish to %s", message.author.id, fish
             )
         else:
+            # A roster phrase (bare, canonical casing) activates that codeword.
             codeword = fishwatch.find_codeword(content, state.codewords)
             if codeword:
                 state.codeword = codeword
@@ -7259,6 +7262,23 @@ async def on_message(message: discord.Message) -> None:
                     "watch: admin %s set codeword to %s",
                     message.author.id, codeword,
                 )
+            else:
+                # Otherwise an explicit "codeword: <phrase>" declaration sets
+                # ANY codeword — even one not in the roster — so a watch admin
+                # can announce a fresh codeword straight from chat. It's also
+                # remembered in the roster for future bare activation.
+                declared = fishwatch.parse_codeword_declaration(content)
+                if declared:
+                    state.codeword = declared
+                    if declared.casefold() not in {
+                        c.casefold() for c in state.codewords
+                    }:
+                        state.codewords.append(declared)
+                    changed = True
+                    logger.info(
+                        "watch: admin %s declared codeword %s",
+                        message.author.id, declared,
+                    )
         if changed:
             await asyncio.to_thread(_persist_watch_state)
             # The 🎣 reaction is the only acknowledgment — no confirmation

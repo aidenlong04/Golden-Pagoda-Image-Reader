@@ -147,6 +147,40 @@ def test_find_codeword_empty_roster_matches_nothing():
     assert find_codeword("dywatta citrus onion", []) is None
 
 
+def test_parse_codeword_declaration_extracts_phrase():
+    # A watch admin can declare ANY codeword from chat with a keyword prefix.
+    assert fishwatch.parse_codeword_declaration(
+        "codeword: banana bread"
+    ) == "banana bread"
+    assert fishwatch.parse_codeword_declaration(
+        "the codeword is banana bread"
+    ) == "banana bread"
+    assert fishwatch.parse_codeword_declaration(
+        "codeword banana bread"
+    ) == "banana bread"
+    assert fishwatch.parse_codeword_declaration(
+        "set codeword banana bread"
+    ) == "banana bread"
+    assert fishwatch.parse_codeword_declaration(
+        "today's codeword is banana bread"
+    ) == "banana bread"
+    # "code word" (spaced) and markdown backticks are tolerated / stripped.
+    assert fishwatch.parse_codeword_declaration(
+        "code word: `secret sauce`"
+    ) == "secret sauce"
+
+
+def test_parse_codeword_declaration_rejects_non_declarations():
+    # Ordinary admin chatter must not be mistaken for a codeword.
+    assert fishwatch.parse_codeword_declaration("gg everyone") is None
+    assert fishwatch.parse_codeword_declaration("hello team") is None
+    # A bare "codeword" keyword with no phrase carries nothing.
+    assert fishwatch.parse_codeword_declaration("codeword") is None
+    assert fishwatch.parse_codeword_declaration("codeword:") is None
+    assert fishwatch.parse_codeword_declaration("") is None
+    assert fishwatch.parse_codeword_declaration(None) is None
+
+
 def test_parse_codewords_splits_and_dedupes():
     raw = "Alpha One\nBeta Two, Alpha One\n\n`Gamma Three`"
     assert fishwatch.parse_codewords(raw) == [
@@ -307,10 +341,38 @@ def test_watch_state_from_env(monkeypatch: pytest.MonkeyPatch):
 
 def test_watch_state_from_env_codewords_default(monkeypatch: pytest.MonkeyPatch):
     # An unset (or blank) roster falls back to the built-in CODEWORDS.
+    monkeypatch.delenv(fishwatch.ENV_CODEWORD, raising=False)
     monkeypatch.delenv(fishwatch.ENV_CODEWORDS, raising=False)
     assert WatchState.from_env().codewords == list(fishwatch.CODEWORDS)
     monkeypatch.setenv(fishwatch.ENV_CODEWORDS, "")
     assert WatchState.from_env().codewords == list(fishwatch.CODEWORDS)
+
+
+def test_watch_state_from_env_seeds_roster_from_legacy_codeword(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # A legacy single-codeword install (FISH_WATCH_CODEWORD set, roster unset)
+    # must seed the roster from that codeword so an admin re-typing it in chat
+    # is still recognised (find_codeword only scans the roster).
+    monkeypatch.setenv(fishwatch.ENV_CODEWORD, "cerebral")
+    monkeypatch.delenv(fishwatch.ENV_CODEWORDS, raising=False)
+    state = WatchState.from_env()
+    assert state.codeword == "cerebral"
+    assert state.codewords == ["cerebral"]
+    assert fishwatch.find_codeword("cerebral", state.codewords) == "cerebral"
+
+
+def test_watch_state_from_env_keeps_active_codeword_in_roster(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # An active codeword missing from the configured roster is added back so it
+    # stays selectable/typable by a watch admin.
+    monkeypatch.setenv(fishwatch.ENV_CODEWORD, "cerebral")
+    monkeypatch.setenv(fishwatch.ENV_CODEWORDS, "limbic,cortex")
+    state = WatchState.from_env()
+    assert state.codeword == "cerebral"
+    assert state.codewords == ["cerebral", "limbic", "cortex"]
+    assert fishwatch.find_codeword("cerebral", state.codewords) == "cerebral"
 
 
 def test_watch_state_from_env_defaults(monkeypatch: pytest.MonkeyPatch):
