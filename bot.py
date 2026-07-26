@@ -7130,6 +7130,8 @@ async def _process_watch_submission(
     user_id = message.author.id
     channel_id = message.channel.id
     for old_id in _watch_error_replies.pop(user_id, []):
+        # The pop above only clears the per-user list; this also drops the
+        # submission-message entries pointing at the deleted reply.
         _untrack_watch_error_reply(user_id, old_id)
         await _delete_message(channel_id, old_id)
     if verdict.ok:
