@@ -271,11 +271,23 @@ class WatchState:
     @classmethod
     def from_env(cls) -> "WatchState":
         fish = canonical_fish(os.getenv(ENV_FISH, ""))
-        codewords = parse_codewords(os.getenv(ENV_CODEWORDS)) or list(CODEWORDS)
+        codeword = normalize_codeword(os.getenv(ENV_CODEWORD))
+        codewords = parse_codewords(os.getenv(ENV_CODEWORDS))
+        # The active codeword must stay in the roster, otherwise a watch admin
+        # re-typing it in the watched channel is never recognised (find_codeword
+        # only scans the roster). This also covers a legacy single-codeword
+        # install (FISH_WATCH_CODEWORD set, FISH_WATCH_CODEWORDS unset): seed the
+        # roster from that codeword rather than the built-in placeholders.
+        if not codewords:
+            codewords = [codeword] if codeword else list(CODEWORDS)
+        elif codeword and codeword.casefold() not in {
+            c.casefold() for c in codewords
+        }:
+            codewords.insert(0, codeword)
         return cls(
             enabled=_int_env(ENV_ENABLED) == 1,
             channel_id=_int_env(ENV_CHANNEL),
-            codeword=normalize_codeword(os.getenv(ENV_CODEWORD)),
+            codeword=codeword,
             admin_ids=set(_csv_ids(ENV_ADMIN_IDS)),
             current_fish=fish,
             codewords=codewords,
