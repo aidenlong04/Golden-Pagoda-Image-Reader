@@ -6735,6 +6735,9 @@ async def _watch_automation_history_delta(
     since_ts: int,
     roster: Iterable[str],
 ) -> tuple[int, list[str], list[str]]:
+    # oldest_first=True keeps the parser deterministic and lets us retain the
+    # latest seen fish/codeword pair as we sweep forward. The scan is bounded;
+    # activity beyond this limit is intentionally ignored to keep polling cheap.
     latest_ts = max(0, since_ts)
     delta_fish: list[str] = []
     delta_codewords: list[str] = []
@@ -6762,6 +6765,8 @@ async def _watch_automation_history_delta(
         if codeword:
             _append_casefold_unique(delta_codewords, codeword)
     if since_ts == 0:
+        # First run bootstraps from the latest known announcement/admin update
+        # only; ongoing runs collect every delta newer than since_ts.
         delta_fish = [latest_fish] if latest_fish else []
         delta_codewords = [latest_codeword] if latest_codeword else []
     return latest_ts, delta_fish, delta_codewords
@@ -6890,7 +6895,7 @@ async def _announce_watch_automation() -> bool:
     _append_casefold_unique(state.automate_used_fish, fish_name)
     _append_casefold_unique(state.automate_used_codewords, codeword)
     created = getattr(sent, "created_at", None)
-    state.automate_last_ts = int(created.timestamp()) if created else now_ts
+    state.automate_last_ts = int(created.timestamp()) if created else int(time.time())
     await asyncio.to_thread(_persist_watch_state)
     logger.info(
         "watch: automated announcement posted (%s | %s)", planet, fish_name
@@ -7073,7 +7078,7 @@ def _watch_components(
             _WATCH_STATE.automate_last_ts + _WATCH_AUTOMATE_INTERVAL_SECONDS
             if _WATCH_STATE.automate_last_ts else 0
         )
-        next_line = str(next_due) if next_due else "*unknown*"
+        next_line = f"<t:{next_due}:F> (`{next_due}`)" if next_due else "*unknown*"
         status = (
             "✅ **Running**" if _WATCH_STATE.automate_enabled
             else "⛔ **Stopped**"

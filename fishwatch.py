@@ -363,11 +363,11 @@ class WatchState:
         ]
         used_codewords = [c for c in used_codewords if c]
         last_ts = max(0, _int_env(ENV_AUTOMATE_LAST_TS))
-        planet_index = _int_env(ENV_AUTOMATE_PLANET_INDEX)
-        if planet_index < 0:
-            planet_index = 0
+        planet_index = max(0, _int_env(ENV_AUTOMATE_PLANET_INDEX))
         if PLANETS:
             planet_index = planet_index % len(PLANETS)
+        else:
+            planet_index = 0
         return cls(
             enabled=_int_env(ENV_ENABLED) == 1,
             channel_id=_int_env(ENV_CHANNEL),
