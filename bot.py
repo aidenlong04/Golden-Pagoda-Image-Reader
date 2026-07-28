@@ -6776,35 +6776,41 @@ def _watch_schedule_next_fish() -> str | None:
     if not fishwatch.FISH:
         return None
     schedule = _WATCH_STATE.automate_schedule
-    idx = max(0, schedule.next_fish_index) % len(fishwatch.FISH)
-    schedule.next_fish_index = idx
+    idx = schedule.next_fish_index % len(fishwatch.FISH)
     return fishwatch.FISH[idx].name
 
 
-def _watch_schedule_set_next_fish(fish_name: str) -> bool:
+def _watch_fish_index(fish_name: str) -> int | None:
     fish = fishwatch.FISH_BY_KEY.get((fish_name or "").casefold())
-    if fish is None or not fishwatch.FISH:
-        return False
+    if fish is None:
+        return None
     for idx, entry in enumerate(fishwatch.FISH):
         if entry.name.casefold() == fish.name.casefold():
-            _WATCH_STATE.automate_schedule.next_fish_index = idx
-            return True
-    return False
+            return idx
+    return None
+
+
+def _watch_schedule_set_next_fish(fish_name: str) -> bool:
+    if not fishwatch.FISH:
+        return False
+    idx = _watch_fish_index(fish_name)
+    if idx is None:
+        return False
+    _WATCH_STATE.automate_schedule.next_fish_index = idx
+    return True
 
 
 def _watch_schedule_advance_after(fish_name: str) -> bool:
     if not fishwatch.FISH:
         return False
-    fish = fishwatch.FISH_BY_KEY.get((fish_name or "").casefold())
-    if fish is None:
+    idx = _watch_fish_index(fish_name)
+    if idx is None:
         return False
-    for idx, entry in enumerate(fishwatch.FISH):
-        if entry.name.casefold() == fish.name.casefold():
-            next_idx = (idx + 1) % len(fishwatch.FISH)
-            if _WATCH_STATE.automate_schedule.next_fish_index != next_idx:
-                _WATCH_STATE.automate_schedule.next_fish_index = next_idx
-                return True
-            return False
+    next_idx = (idx + 1) % len(fishwatch.FISH)
+    # Idempotence guard: history scans can re-observe the same fish repeatedly.
+    if _WATCH_STATE.automate_schedule.next_fish_index != next_idx:
+        _WATCH_STATE.automate_schedule.next_fish_index = next_idx
+        return True
     return False
 
 
@@ -6849,6 +6855,7 @@ async def _announce_watch_automation() -> bool:
     changed = False
     for fish in delta_fish:
         changed = _watch_schedule_advance_after(fish) or changed
+        # Legacy compatibility for existing .env installs/state migrations.
         changed = _append_casefold_unique(state.automate_used_fish, fish) or changed
     for codeword in delta_codewords:
         changed = _append_casefold_unique(
@@ -6856,6 +6863,7 @@ async def _announce_watch_automation() -> bool:
         ) or changed
     if latest_ts > state.automate_schedule.last_send_ts:
         state.automate_schedule.last_send_ts = latest_ts
+        # Keep the legacy mirror field aligned while old state still exists.
         state.automate_last_ts = latest_ts
         changed = True
     now_ts = int(time.time())
@@ -6910,6 +6918,7 @@ async def _announce_watch_automation() -> bool:
     state.automate_schedule.last_send_ts = (
         int(created.timestamp()) if created else int(time.time())
     )
+    # Keep the legacy mirror field aligned while old state still exists.
     state.automate_last_ts = state.automate_schedule.last_send_ts
     _watch_schedule_advance_after(fish_name)
     await asyncio.to_thread(_persist_watch_state)
@@ -7314,8 +7323,9 @@ class _WatchAutomateFishModal(_GPModal):
 
     def __init__(self) -> None:
         super().__init__(title="watch — set next fish", timeout=600)
+        hours = _WATCH_AUTOMATE_INTERVAL_SECONDS // 3600
         self.add_item(discord.ui.TextDisplay(
-            "Pick the next fish to announce. The 6-hour cycle then continues "
+            f"Pick the next fish to announce. The {hours}-hour cycle then continues "
             "from that fish through the canonical roster order."
         ))
         current = _watch_schedule_next_fish()
@@ -7328,7 +7338,9 @@ class _WatchAutomateFishModal(_GPModal):
                     value=fish.name,
                     default=(fish.name == current),
                 )
-                for fish in fishwatch.FISH
+                # Discord Select options cap at 25 entries. The current roster
+                # is 12 fish; if it grows past 25 this modal should be paged.
+                for fish in fishwatch.FISH[:25]
             ],
         )
         self.add_item(discord.ui.Label(

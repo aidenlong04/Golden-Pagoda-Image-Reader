@@ -424,6 +424,14 @@ def test_fish_schedule_state_env_round_trip():
     assert items[fishwatch.ENV_AUTOMATE_LAST_SEND_TS] == "321"
 
 
+def test_fish_schedule_state_from_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(fishwatch.ENV_AUTOMATE_NEXT_FISH_INDEX, "5")
+    monkeypatch.setenv(fishwatch.ENV_AUTOMATE_LAST_SEND_TS, "321")
+    state = FishScheduleState.from_env()
+    assert state.next_fish_index == 5
+    assert state.last_send_ts == 321
+
+
 def test_watch_state_from_env_automation_fields(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv(fishwatch.ENV_AUTOMATE_ENABLED, "1")
     monkeypatch.setenv(fishwatch.ENV_AUTOMATE_PLANET_INDEX, "4")
@@ -638,7 +646,7 @@ def test_watch_automation_components():
         bot._WATCH_STATE.automate_schedule.next_fish_index = orig[2]
 
 
-def test_watch_set_next_fish_skips_earlier():
+def test_watch_set_next_fish_advances_rotation():
     import bot
 
     orig = bot._WATCH_STATE.automate_schedule.next_fish_index
@@ -646,6 +654,7 @@ def test_watch_set_next_fish_skips_earlier():
         assert bot._watch_schedule_set_next_fish("Longwinder")
         assert bot._watch_schedule_next_fish() == "Longwinder"
         bot._watch_schedule_advance_after("Longwinder")
+        assert bot._WATCH_STATE.automate_schedule.next_fish_index == 7
         planet, fish_name = bot._watch_next_planet_fish()
         assert planet == "Venus"
         assert fish_name == "Tromyzon"
