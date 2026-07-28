@@ -6922,6 +6922,10 @@ _WATCH_PAGES: list[tuple[str, str]] = [
     ("records", "Records"),
     ("automate", "Automation"),
 ]
+_WATCH_PAGE_AUTOMATE = next(
+    (i for i, (key, _title) in enumerate(_WATCH_PAGES) if key == "automate"),
+    0,
+)
 
 _WATCH_MEDALS = ("\U0001F947", "\U0001F948", "\U0001F949")  # gold/silver/bronze
 
@@ -7159,7 +7163,7 @@ def _watch_components(
             {"type": 2, "style": 1, "label": "Set admin",
              "custom_id": "watch:admins"},
             {"type": 2, "style": 2, "label": "Automate",
-             "custom_id": "watch:page:2"},
+             "custom_id": f"watch:page:{_WATCH_PAGE_AUTOMATE}"},
         ],
     }
     aux_row = {
@@ -7356,7 +7360,7 @@ async def _handle_watch_interaction(
         await asyncio.to_thread(_persist_watch_state)
         with contextlib.suppress(Exception):
             await _interaction_callback(
-                interaction, 7, _watch_components(page=2)
+                interaction, 7, _watch_components(page=_WATCH_PAGE_AUTOMATE)
             )
         return
     if action == "auto-stop":
@@ -7364,7 +7368,7 @@ async def _handle_watch_interaction(
         await asyncio.to_thread(_persist_watch_state)
         with contextlib.suppress(Exception):
             await _interaction_callback(
-                interaction, 7, _watch_components(page=2)
+                interaction, 7, _watch_components(page=_WATCH_PAGE_AUTOMATE)
             )
         return
     if action == "auto-run":
@@ -7444,7 +7448,9 @@ async def watch_cmd(
         _WATCH_STATE.channel_id = interaction.channel_id
     await asyncio.to_thread(_persist_watch_state)
     await _interaction_callback(
-        interaction, 4, _watch_components(page=2 if automate else 0)
+        interaction,
+        4,
+        _watch_components(page=_WATCH_PAGE_AUTOMATE if automate else 0),
     )
 
 
