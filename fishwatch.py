@@ -298,6 +298,10 @@ ENV_AUTOMATE_PLANET_INDEX = "FISH_WATCH_AUTOMATE_PLANET_INDEX"
 ENV_AUTOMATE_USED_FISH = "FISH_WATCH_AUTOMATE_USED_FISH"
 ENV_AUTOMATE_USED_CODEWORDS = "FISH_WATCH_AUTOMATE_USED_CODEWORDS"
 ENV_AUTOMATE_LAST_TS = "FISH_WATCH_AUTOMATE_LAST_TS"
+ENV_AUTOMATE_NEXT_FISH_INDEX = "FISH_WATCH_AUTOMATE_NEXT_FISH_INDEX"
+ENV_AUTOMATE_LAST_SEND_TS = "FISH_WATCH_AUTOMATE_LAST_SEND_TS"
+ENV_AUTOMATE_NEXT_FISH_INDEX_LEGACY = "FISH_AUTOMATE_NEXT_FISH_INDEX"
+ENV_AUTOMATE_LAST_SEND_TS_LEGACY = "FISH_AUTOMATE_LAST_SEND_TS"
 
 
 def _csv_text(raw: str | None) -> list[str]:
@@ -313,6 +317,48 @@ def _csv_text(raw: str | None) -> list[str]:
         seen.add(key)
         out.append(value)
     return out
+
+
+def _normalize_fish_index(index: int) -> int:
+    if FISH:
+        return index % len(FISH)
+    return 0
+
+
+@dataclass
+class FishScheduleState:
+    """Mutable fish-automation schedule state mirrored to .env."""
+
+    next_fish_index: int = 0
+    last_send_ts: int = 0
+
+    @classmethod
+    def from_env(cls, *, legacy_last_ts: int = 0) -> "FishScheduleState":
+        index = _normalize_fish_index(_int_env(ENV_AUTOMATE_NEXT_FISH_INDEX))
+        if not os.getenv(ENV_AUTOMATE_NEXT_FISH_INDEX):
+            index = _normalize_fish_index(
+                _int_env(ENV_AUTOMATE_NEXT_FISH_INDEX_LEGACY)
+            )
+        last_send = max(0, _int_env(ENV_AUTOMATE_LAST_SEND_TS))
+        if not os.getenv(ENV_AUTOMATE_LAST_SEND_TS):
+            last_send = max(0, _int_env(ENV_AUTOMATE_LAST_SEND_TS_LEGACY))
+        if not last_send:
+            last_send = max(0, legacy_last_ts)
+        return cls(next_fish_index=index, last_send_ts=last_send)
+
+    def env_items(self) -> list[tuple[str, str]]:
+        return [
+            (ENV_AUTOMATE_NEXT_FISH_INDEX, str(max(0, self.next_fish_index))),
+            (ENV_AUTOMATE_LAST_SEND_TS, str(max(0, self.last_send_ts))),
+            (
+                ENV_AUTOMATE_NEXT_FISH_INDEX_LEGACY,
+                str(max(0, self.next_fish_index)),
+            ),
+            (
+                ENV_AUTOMATE_LAST_SEND_TS_LEGACY,
+                str(max(0, self.last_send_ts)),
+            ),
+        ]
 
 
 @dataclass
@@ -333,6 +379,7 @@ class WatchState:
     automate_used_fish: list[str] = field(default_factory=list)
     automate_used_codewords: list[str] = field(default_factory=list)
     automate_last_ts: int = 0
+    automate_schedule: FishScheduleState = field(default_factory=FishScheduleState)
 
     @classmethod
     def from_env(cls) -> "WatchState":
@@ -368,6 +415,19 @@ class WatchState:
             planet_index = planet_index % len(PLANETS)
         else:
             planet_index = 0
+        schedule = FishScheduleState.from_env(legacy_last_ts=last_ts)
+        if (
+            not os.getenv(ENV_AUTOMATE_NEXT_FISH_INDEX)
+            and used_fish
+            and FISH
+        ):
+            used_keys = {f.casefold() for f in used_fish}
+            for idx, fish_data in enumerate(FISH):
+                if fish_data.name.casefold() not in used_keys:
+                    schedule.next_fish_index = idx
+                    break
+            else:
+                schedule.next_fish_index = 0
         return cls(
             enabled=_int_env(ENV_ENABLED) == 1,
             channel_id=_int_env(ENV_CHANNEL),
@@ -379,11 +439,19 @@ class WatchState:
             automate_planet_index=planet_index,
             automate_used_fish=used_fish,
             automate_used_codewords=used_codewords,
-            automate_last_ts=last_ts,
+            automate_last_ts=schedule.last_send_ts,
+            automate_schedule=schedule,
         )
 
     def env_items(self) -> list[tuple[str, str]]:
         """``(env_key, value)`` pairs for the .env persister."""
+        schedule_index = _normalize_fish_index(
+            self.automate_schedule.next_fish_index
+        )
+        schedule_last_send = max(0, self.automate_schedule.last_send_ts)
+        # Preserve the legacy mirror when newer schedule state is unset.
+        if not schedule_last_send:
+            schedule_last_send = max(0, self.automate_last_ts)
         return [
             (ENV_ENABLED, "1" if self.enabled else "0"),
             (ENV_CHANNEL, str(self.channel_id) if self.channel_id else ""),
@@ -398,7 +466,11 @@ class WatchState:
                 ENV_AUTOMATE_USED_CODEWORDS,
                 ",".join(self.automate_used_codewords),
             ),
-            (ENV_AUTOMATE_LAST_TS, str(max(0, self.automate_last_ts))),
+            (ENV_AUTOMATE_LAST_TS, str(schedule_last_send)),
+            (ENV_AUTOMATE_NEXT_FISH_INDEX, str(schedule_index)),
+            (ENV_AUTOMATE_LAST_SEND_TS, str(schedule_last_send)),
+            (ENV_AUTOMATE_NEXT_FISH_INDEX_LEGACY, str(schedule_index)),
+            (ENV_AUTOMATE_LAST_SEND_TS_LEGACY, str(schedule_last_send)),
         ]
 
 
