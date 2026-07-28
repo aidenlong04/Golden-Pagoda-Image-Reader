@@ -6783,9 +6783,10 @@ def _watch_next_planet_fish() -> tuple[str | None, str | None]:
         ]
         if not remaining:
             continue
-        state.automate_planet_index = idx if len(remaining) > 1 else (
-            (idx + 1) % len(planets)
-        )
+        if len(remaining) > 1:
+            state.automate_planet_index = idx
+        else:
+            state.automate_planet_index = (idx + 1) % len(planets)
         return planet, remaining[0]
     state.automate_used_fish.clear()
     idx = start
@@ -6793,9 +6794,10 @@ def _watch_next_planet_fish() -> tuple[str | None, str | None]:
     remaining = [f.name for f in fishwatch.FISH if f.planet == planet]
     if not remaining:
         return None, None
-    state.automate_planet_index = idx if len(remaining) > 1 else (
-        (idx + 1) % len(planets)
-    )
+    if len(remaining) > 1:
+        state.automate_planet_index = idx
+    else:
+        state.automate_planet_index = (idx + 1) % len(planets)
     return planet, remaining[0]
 
 
@@ -6805,9 +6807,11 @@ def _watch_next_codeword() -> str | None:
         fishwatch.normalize_codeword(c) for c in state.codewords
         if fishwatch.normalize_codeword(c)
     ] or list(fishwatch.CODEWORDS)
-    used = {fishwatch.normalize_codeword(c).casefold()
-            for c in state.automate_used_codewords
-            if fishwatch.normalize_codeword(c)}
+    used: set[str] = set()
+    for codeword in state.automate_used_codewords:
+        normalized = fishwatch.normalize_codeword(codeword)
+        if normalized:
+            used.add(normalized.casefold())
     for phrase in roster:
         if phrase.casefold() not in used:
             return phrase
@@ -6864,7 +6868,11 @@ async def _announce_watch_automation() -> bool:
         inline=False,
     )
     embed.add_field(name="Codeword", value=codeword, inline=False)
-    embed.add_field(name="Next Fish", value=str(next_ts), inline=False)
+    embed.add_field(
+        name="Next Fish",
+        value=f"<t:{next_ts}:F> (`{next_ts}`)",
+        inline=False,
+    )
     embed.set_image(url=_watch_fish_wiki_image_url(fish_name))
     try:
         sent = await channel.send(
