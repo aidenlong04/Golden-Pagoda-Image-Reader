@@ -6772,38 +6772,46 @@ async def _watch_automation_history_delta(
     return latest_ts, delta_fish, delta_codewords
 
 
+def _watch_schedule_next_fish() -> str | None:
+    if not fishwatch.FISH:
+        return None
+    schedule = _WATCH_STATE.automate_schedule
+    idx = max(0, schedule.next_fish_index) % len(fishwatch.FISH)
+    schedule.next_fish_index = idx
+    return fishwatch.FISH[idx].name
+
+
+def _watch_schedule_set_next_fish(fish_name: str) -> bool:
+    fish = fishwatch.FISH_BY_KEY.get((fish_name or "").casefold())
+    if fish is None or not fishwatch.FISH:
+        return False
+    for idx, entry in enumerate(fishwatch.FISH):
+        if entry.name.casefold() == fish.name.casefold():
+            _WATCH_STATE.automate_schedule.next_fish_index = idx
+            return True
+    return False
+
+
+def _watch_schedule_advance_after(fish_name: str) -> bool:
+    if not fishwatch.FISH:
+        return False
+    fish = fishwatch.FISH_BY_KEY.get((fish_name or "").casefold())
+    if fish is None:
+        return False
+    for idx, entry in enumerate(fishwatch.FISH):
+        if entry.name.casefold() == fish.name.casefold():
+            next_idx = (idx + 1) % len(fishwatch.FISH)
+            if _WATCH_STATE.automate_schedule.next_fish_index != next_idx:
+                _WATCH_STATE.automate_schedule.next_fish_index = next_idx
+                return True
+            return False
+    return False
+
+
 def _watch_next_planet_fish() -> tuple[str | None, str | None]:
-    planets = fishwatch.PLANETS
-    if not planets:
-        return None, None
-    state = _WATCH_STATE
-    start = max(0, state.automate_planet_index) % len(planets)
-    used = {name.casefold() for name in state.automate_used_fish}
-    for step in range(len(planets)):
-        idx = (start + step) % len(planets)
-        planet = planets[idx]
-        remaining = [
-            f.name for f in fishwatch.FISH
-            if f.planet == planet and f.name.casefold() not in used
-        ]
-        if not remaining:
-            continue
-        if len(remaining) > 1:
-            state.automate_planet_index = idx
-        else:
-            state.automate_planet_index = (idx + 1) % len(planets)
-        return planet, remaining[0]
-    state.automate_used_fish.clear()
-    idx = start
-    planet = planets[idx]
-    remaining = [f.name for f in fishwatch.FISH if f.planet == planet]
-    if not remaining:
-        return None, None
-    if len(remaining) > 1:
-        state.automate_planet_index = idx
-    else:
-        state.automate_planet_index = (idx + 1) % len(planets)
-    return planet, remaining[0]
+    fish_name = _watch_schedule_next_fish()
+    fish = fishwatch.FISH_BY_KEY.get((fish_name or "").casefold())
+    return (fish.planet if fish else None), fish_name
 
 
 def _watch_next_codeword() -> str | None:
@@ -6840,22 +6848,26 @@ async def _announce_watch_automation() -> bool:
     )
     changed = False
     for fish in delta_fish:
+        changed = _watch_schedule_advance_after(fish) or changed
         changed = _append_casefold_unique(state.automate_used_fish, fish) or changed
     for codeword in delta_codewords:
         changed = _append_casefold_unique(
             state.automate_used_codewords, codeword
         ) or changed
-    if latest_ts > state.automate_last_ts:
+    if latest_ts > state.automate_schedule.last_send_ts:
+        state.automate_schedule.last_send_ts = latest_ts
         state.automate_last_ts = latest_ts
         changed = True
     now_ts = int(time.time())
-    if state.automate_last_ts and (
-        now_ts < state.automate_last_ts + _WATCH_AUTOMATE_INTERVAL_SECONDS
+    if state.automate_schedule.last_send_ts and (
+        now_ts < state.automate_schedule.last_send_ts + _WATCH_AUTOMATE_INTERVAL_SECONDS
     ):
         if changed:
             await asyncio.to_thread(_persist_watch_state)
         return False
-    planet, fish_name = _watch_next_planet_fish()
+    fish_name = _watch_schedule_next_fish()
+    fish_data = fishwatch.FISH_BY_KEY.get((fish_name or "").casefold())
+    planet = fish_data.planet if fish_data else None
     codeword = _watch_next_codeword()
     if not planet or not fish_name or not codeword:
         if changed:
@@ -6895,7 +6907,11 @@ async def _announce_watch_automation() -> bool:
     _append_casefold_unique(state.automate_used_fish, fish_name)
     _append_casefold_unique(state.automate_used_codewords, codeword)
     created = getattr(sent, "created_at", None)
-    state.automate_last_ts = int(created.timestamp()) if created else int(time.time())
+    state.automate_schedule.last_send_ts = (
+        int(created.timestamp()) if created else int(time.time())
+    )
+    state.automate_last_ts = state.automate_schedule.last_send_ts
+    _watch_schedule_advance_after(fish_name)
     await asyncio.to_thread(_persist_watch_state)
     logger.info(
         "watch: automated announcement posted (%s | %s)", planet, fish_name
@@ -7078,11 +7094,17 @@ def _watch_components(
             },
         ]
     if key == "automate":
+        now_ts = int(time.time())
+        schedule = _WATCH_STATE.automate_schedule
+        next_fish = _watch_schedule_next_fish() or "*unknown*"
         next_due = (
-            _WATCH_STATE.automate_last_ts + _WATCH_AUTOMATE_INTERVAL_SECONDS
-            if _WATCH_STATE.automate_last_ts else 0
+            schedule.last_send_ts + _WATCH_AUTOMATE_INTERVAL_SECONDS
+            if schedule.last_send_ts else now_ts
         )
-        next_line = f"<t:{next_due}:F> (`{next_due}`)" if next_due else "*unknown*"
+        remaining = max(0, next_due - now_ts)
+        hours, rem = divmod(remaining, 3600)
+        minutes = rem // 60
+        due_line = f"<t:{next_due}:F> (`{next_due}`)"
         status = (
             "✅ **Running**" if _WATCH_STATE.automate_enabled
             else "⛔ **Stopped**"
@@ -7091,7 +7113,9 @@ def _watch_components(
             f"{status}\n"
             f"**Announcement channel:** <#{_WATCH_AUTOMATE_CHANNEL_ID}>\n"
             f"**Ping role:** <@&{_WATCH_AUTOMATE_ROLE_ID}>\n"
-            f"**Next Fish:** {next_line}"
+            f"**Next fish:** {next_fish}\n"
+            f"**Next send:** {due_line}\n"
+            f"**Sends in:** {hours}h {minutes}m"
         )
         button_row = {
             "type": 1,
@@ -7104,6 +7128,8 @@ def _watch_components(
                  "disabled": not _WATCH_STATE.automate_enabled},
                 {"type": 2, "style": 2, "label": "Run now",
                  "custom_id": "watch:auto-run"},
+                {"type": 2, "style": 1, "label": "Set next fish",
+                 "custom_id": "watch:auto-setfish"},
             ],
         }
         return [
@@ -7283,6 +7309,59 @@ class _WatchAdminModal(_GPModal):
         await _interaction_callback(interaction, 7, _watch_components())
 
 
+class _WatchAutomateFishModal(_GPModal):
+    """Set the next fish for the automation cycle."""
+
+    def __init__(self) -> None:
+        super().__init__(title="watch — set next fish", timeout=600)
+        self.add_item(discord.ui.TextDisplay(
+            "Pick the next fish to announce. The 6-hour cycle then continues "
+            "from that fish through the canonical roster order."
+        ))
+        current = _watch_schedule_next_fish()
+        self.fish_select = discord.ui.Select(
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=fish.name,
+                    value=fish.name,
+                    default=(fish.name == current),
+                )
+                for fish in fishwatch.FISH
+            ],
+        )
+        self.add_item(discord.ui.Label(
+            text="next fish",
+            description="Search and pick from the canonical fish roster.",
+            component=self.fish_select,
+        ))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        user = interaction.user
+        if not (
+            isinstance(user, discord.Member)
+            and user.guild_permissions.manage_guild
+        ):
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "Operator, you can't use this.", ephemeral=True
+                )
+            return
+        picked = list(self.fish_select.values or [])
+        fish_name = picked[0] if picked else ""
+        if not _watch_schedule_set_next_fish(fish_name):
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "❌ Pick a fish from the list.", ephemeral=True
+                )
+            return
+        await asyncio.to_thread(_persist_watch_state)
+        await _interaction_callback(
+            interaction, 7, _watch_components(page=_WATCH_PAGE_AUTOMATE)
+        )
+
+
 async def _handle_watch_interaction(
     interaction: discord.Interaction, custom_id: str
 ) -> None:
@@ -7354,6 +7433,10 @@ async def _handle_watch_interaction(
     if action == "admins":
         with contextlib.suppress(discord.HTTPException):
             await interaction.response.send_modal(_WatchAdminModal())
+        return
+    if action == "auto-setfish":
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.send_modal(_WatchAutomateFishModal())
         return
     if action == "auto-start":
         _WATCH_STATE.automate_enabled = True

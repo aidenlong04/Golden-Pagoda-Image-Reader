@@ -15,6 +15,7 @@ import fishwatch
 from fishwatch import (
     FISH,
     FISH_BY_KEY,
+    FishScheduleState,
     PROBLEM_CODEWORD,
     PROBLEM_UNREADABLE,
     PROBLEM_WRONG_FISH,
@@ -412,6 +413,15 @@ def test_watch_state_env_items_round_trip():
     assert items[fishwatch.ENV_AUTOMATE_USED_FISH] == "Norg,Mawfish"
     assert items[fishwatch.ENV_AUTOMATE_USED_CODEWORDS] == "w"
     assert items[fishwatch.ENV_AUTOMATE_LAST_TS] == "123"
+    assert items[fishwatch.ENV_AUTOMATE_NEXT_FISH_INDEX] == "0"
+    assert items[fishwatch.ENV_AUTOMATE_LAST_SEND_TS] == "123"
+
+
+def test_fish_schedule_state_env_round_trip():
+    state = FishScheduleState(next_fish_index=5, last_send_ts=321)
+    items = dict(state.env_items())
+    assert items[fishwatch.ENV_AUTOMATE_NEXT_FISH_INDEX] == "5"
+    assert items[fishwatch.ENV_AUTOMATE_LAST_SEND_TS] == "321"
 
 
 def test_watch_state_from_env_automation_fields(monkeypatch: pytest.MonkeyPatch):
@@ -424,12 +434,27 @@ def test_watch_state_from_env_automation_fields(monkeypatch: pytest.MonkeyPatch)
         fishwatch.ENV_AUTOMATE_USED_CODEWORDS, "Alpha,alpha,beta"
     )
     monkeypatch.setenv(fishwatch.ENV_AUTOMATE_LAST_TS, "99")
+    monkeypatch.setenv(fishwatch.ENV_AUTOMATE_NEXT_FISH_INDEX, "7")
     state = WatchState.from_env()
     assert state.automate_enabled is True
     assert state.automate_planet_index == 1
     assert state.automate_used_fish == ["Norg", "Mawfish"]
     assert state.automate_used_codewords == ["Alpha", "beta"]
     assert state.automate_last_ts == 99
+    assert state.automate_schedule.last_send_ts == 99
+    assert state.automate_schedule.next_fish_index == 7
+
+
+def test_watch_state_from_env_schedule_migrates_used_fish(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv(fishwatch.ENV_AUTOMATE_NEXT_FISH_INDEX, raising=False)
+    monkeypatch.setenv(
+        fishwatch.ENV_AUTOMATE_USED_FISH,
+        "Mortus Lungfish,Mawfish,Sharrac,Norg",
+    )
+    state = WatchState.from_env()
+    assert state.automate_schedule.next_fish_index == 4
 
 
 # ---------------------------------------------------------------------------
@@ -589,40 +614,43 @@ def test_watch_automation_components():
 
     orig = (
         bot._WATCH_STATE.automate_enabled,
-        bot._WATCH_STATE.automate_last_ts,
+        bot._WATCH_STATE.automate_schedule.last_send_ts,
+        bot._WATCH_STATE.automate_schedule.next_fish_index,
     )
     try:
         bot._WATCH_STATE.automate_enabled = True
-        bot._WATCH_STATE.automate_last_ts = 100
+        bot._WATCH_STATE.automate_schedule.last_send_ts = 100
+        bot._WATCH_STATE.automate_schedule.next_fish_index = 2
         comps = bot._watch_components(2, guild_id=1, top={})
         assert "Automation" in comps[0]["content"]
         body = comps[1]["components"][0]["content"]
         assert "Running" in body
+        assert "Next fish" in body and "Sharrac" in body
+        assert "Sends in:" in body
         btns = [b["custom_id"] for b in comps[1]["components"][1]["components"]]
-        assert btns == ["watch:auto-start", "watch:auto-stop", "watch:auto-run"]
+        assert btns == [
+            "watch:auto-start", "watch:auto-stop", "watch:auto-run",
+            "watch:auto-setfish",
+        ]
     finally:
         bot._WATCH_STATE.automate_enabled = orig[0]
-        bot._WATCH_STATE.automate_last_ts = orig[1]
+        bot._WATCH_STATE.automate_schedule.last_send_ts = orig[1]
+        bot._WATCH_STATE.automate_schedule.next_fish_index = orig[2]
 
 
-def test_watch_next_planet_fish_rotates_after_planet_exhausted():
+def test_watch_set_next_fish_skips_earlier():
     import bot
 
-    orig = (
-        list(bot._WATCH_STATE.automate_used_fish),
-        bot._WATCH_STATE.automate_planet_index,
-    )
+    orig = bot._WATCH_STATE.automate_schedule.next_fish_index
     try:
-        bot._WATCH_STATE.automate_used_fish = [
-            f.name for f in fishwatch.FISH if f.planet == "Earth"
-        ]
-        bot._WATCH_STATE.automate_planet_index = 0
+        assert bot._watch_schedule_set_next_fish("Longwinder")
+        assert bot._watch_schedule_next_fish() == "Longwinder"
+        bot._watch_schedule_advance_after("Longwinder")
         planet, fish_name = bot._watch_next_planet_fish()
         assert planet == "Venus"
-        assert fish_name == "Scrubber"
+        assert fish_name == "Tromyzon"
     finally:
-        bot._WATCH_STATE.automate_used_fish = orig[0]
-        bot._WATCH_STATE.automate_planet_index = orig[1]
+        bot._WATCH_STATE.automate_schedule.next_fish_index = orig
 
 
 def test_watch_next_codeword_skips_used():
