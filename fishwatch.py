@@ -293,6 +293,26 @@ ENV_CODEWORD = "FISH_WATCH_CODEWORD"
 ENV_CODEWORDS = "FISH_WATCH_CODEWORDS"
 ENV_ADMIN_IDS = "FISH_WATCH_ADMIN_IDS"
 ENV_FISH = "FISH_WATCH_FISH"
+ENV_AUTOMATE_ENABLED = "FISH_WATCH_AUTOMATE_ENABLED"
+ENV_AUTOMATE_PLANET_INDEX = "FISH_WATCH_AUTOMATE_PLANET_INDEX"
+ENV_AUTOMATE_USED_FISH = "FISH_WATCH_AUTOMATE_USED_FISH"
+ENV_AUTOMATE_USED_CODEWORDS = "FISH_WATCH_AUTOMATE_USED_CODEWORDS"
+ENV_AUTOMATE_LAST_TS = "FISH_WATCH_AUTOMATE_LAST_TS"
+
+
+def _csv_text(raw: str | None) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for chunk in (raw or "").split(","):
+        value = chunk.strip()
+        if not value:
+            continue
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
 
 
 @dataclass
@@ -308,6 +328,11 @@ class WatchState:
     # watch admin typing one in the watched channel promotes it to the active
     # ``codeword``. Defaults to the built-in CODEWORDS when none configured.
     codewords: list[str] = field(default_factory=lambda: list(CODEWORDS))
+    automate_enabled: bool = False
+    automate_planet_index: int = 0
+    automate_used_fish: list[str] = field(default_factory=list)
+    automate_used_codewords: list[str] = field(default_factory=list)
+    automate_last_ts: int = 0
 
     @classmethod
     def from_env(cls) -> "WatchState":
@@ -325,6 +350,24 @@ class WatchState:
             c.casefold() for c in codewords
         }:
             codewords.insert(0, codeword)
+        used_fish: list[str] = []
+        for name in _csv_text(os.getenv(ENV_AUTOMATE_USED_FISH)):
+            fish_name = canonical_fish(name)
+            if fish_name and fish_name.casefold() not in {
+                f.casefold() for f in used_fish
+            }:
+                used_fish.append(fish_name)
+        used_codewords = [
+            normalize_codeword(c)
+            for c in _csv_text(os.getenv(ENV_AUTOMATE_USED_CODEWORDS))
+        ]
+        used_codewords = [c for c in used_codewords if c]
+        last_ts = max(0, _int_env(ENV_AUTOMATE_LAST_TS))
+        planet_index = max(0, _int_env(ENV_AUTOMATE_PLANET_INDEX))
+        if PLANETS:
+            planet_index = planet_index % len(PLANETS)
+        else:
+            planet_index = 0
         return cls(
             enabled=_int_env(ENV_ENABLED) == 1,
             channel_id=_int_env(ENV_CHANNEL),
@@ -332,6 +375,11 @@ class WatchState:
             admin_ids=set(_csv_ids(ENV_ADMIN_IDS)),
             current_fish=fish,
             codewords=codewords,
+            automate_enabled=_int_env(ENV_AUTOMATE_ENABLED) == 1,
+            automate_planet_index=planet_index,
+            automate_used_fish=used_fish,
+            automate_used_codewords=used_codewords,
+            automate_last_ts=last_ts,
         )
 
     def env_items(self) -> list[tuple[str, str]]:
@@ -343,6 +391,14 @@ class WatchState:
             (ENV_CODEWORDS, ",".join(self.codewords)),
             (ENV_ADMIN_IDS, ",".join(str(i) for i in sorted(self.admin_ids))),
             (ENV_FISH, self.current_fish or ""),
+            (ENV_AUTOMATE_ENABLED, "1" if self.automate_enabled else "0"),
+            (ENV_AUTOMATE_PLANET_INDEX, str(max(0, self.automate_planet_index))),
+            (ENV_AUTOMATE_USED_FISH, ",".join(self.automate_used_fish)),
+            (
+                ENV_AUTOMATE_USED_CODEWORDS,
+                ",".join(self.automate_used_codewords),
+            ),
+            (ENV_AUTOMATE_LAST_TS, str(max(0, self.automate_last_ts))),
         ]
 
 
