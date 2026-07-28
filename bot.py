@@ -15,6 +15,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from typing import NamedTuple
+from urllib.parse import quote
 
 # Suppress discord.py's audioop DeprecationWarning on Python 3.12. The bot
 # never uses voice, but discord.player imports audioop unconditionally and
@@ -504,6 +505,9 @@ async def on_ready() -> None:
     if not getattr(client, "_caches_warmed", False):
         client._caches_warmed = True  # type: ignore[attr-defined]
         _spawn_bg_task(_prewarm_caches())
+    if not getattr(client, "_watch_automate_started", False):
+        client._watch_automate_started = True  # type: ignore[attr-defined]
+        _spawn_bg_task(_watch_automation_task())
 
 
 async def _prewarm_caches() -> None:
@@ -6630,6 +6634,12 @@ _watch_pending_deletes: dict[int, asyncio.Task] = {}
 # is deleted, the error reply that pointed at it is deleted too.
 _watch_submission_replies: dict[int, tuple[int, int]] = {}
 
+_WATCH_AUTOMATE_CHANNEL_ID = 1530983491284766772
+_WATCH_AUTOMATE_ROLE_ID = 1531100935156138075
+_WATCH_AUTOMATE_INTERVAL_SECONDS = 6 * 60 * 60
+_WATCH_AUTOMATE_POLL_SECONDS = 60
+_WATCH_AUTOMATE_HISTORY_LIMIT = 200
+
 
 def _untrack_watch_error_reply(user_id: int, reply_id: int) -> None:
     """Drop one error reply from the per-user + per-submission tracking."""
@@ -6668,11 +6678,236 @@ def _persist_watch_state() -> None:
         _update_env_value(key, value)
 
 
+def _watch_fish_wiki_url(name: str) -> str:
+    return f"https://warframe.fandom.com/wiki/{quote(name.replace(' ', '_'))}"
+
+
+def _watch_fish_wiki_image_url(name: str) -> str:
+    filename = quote(name.replace(" ", "_"))
+    return f"https://warframe.fandom.com/wiki/Special:FilePath/{filename}.png"
+
+
+def _append_casefold_unique(items: list[str], value: str) -> bool:
+    key = (value or "").casefold()
+    if not key:
+        return False
+    for existing in items:
+        if existing.casefold() == key:
+            return False
+    items.append(value)
+    return True
+
+
+def _watch_message_fish_codeword(
+    message: discord.Message, roster: Iterable[str]
+) -> tuple[str | None, str | None]:
+    parts: list[str] = [message.content or ""]
+    codeword: str | None = fishwatch.parse_codeword_declaration(
+        message.content or ""
+    )
+    for embed in getattr(message, "embeds", ()) or ():
+        title = getattr(embed, "title", None)
+        desc = getattr(embed, "description", None)
+        if title:
+            parts.append(str(title))
+        if desc:
+            parts.append(str(desc))
+        for field in getattr(embed, "fields", ()) or ():
+            name = str(getattr(field, "name", "") or "")
+            value = str(getattr(field, "value", "") or "")
+            parts.append(name)
+            parts.append(value)
+            if name.strip().casefold() == "codeword":
+                parsed = fishwatch.normalize_codeword(value.strip("` ").strip())
+                if parsed:
+                    codeword = parsed
+    blob = "\n".join(parts)
+    fish = fishwatch.find_fish(blob)
+    if not codeword:
+        codeword = fishwatch.find_codeword(blob, roster)
+    return fishwatch.canonical_fish(fish or ""), codeword
+
+
+async def _watch_automation_history_delta(
+    channel: discord.abc.Messageable,
+    *,
+    admin_ids: set[int],
+    since_ts: int,
+    roster: Iterable[str],
+) -> tuple[int, list[str], list[str]]:
+    latest_ts = max(0, since_ts)
+    delta_fish: list[str] = []
+    delta_codewords: list[str] = []
+    latest_fish: str | None = None
+    latest_codeword: str | None = None
+    async for message in channel.history(
+        limit=_WATCH_AUTOMATE_HISTORY_LIMIT, oldest_first=True
+    ):
+        author = getattr(message, "author", None)
+        author_id = getattr(author, "id", 0)
+        from_watcher = bool(getattr(author, "bot", False)) or author_id in admin_ids
+        if not from_watcher:
+            continue
+        fish, codeword = _watch_message_fish_codeword(message, roster)
+        if not fish and not codeword:
+            continue
+        created = getattr(message, "created_at", None)
+        ts = int(created.timestamp()) if created else 0
+        latest_ts = max(latest_ts, ts)
+        latest_fish, latest_codeword = fish, codeword
+        if since_ts and ts <= since_ts:
+            continue
+        if fish:
+            _append_casefold_unique(delta_fish, fish)
+        if codeword:
+            _append_casefold_unique(delta_codewords, codeword)
+    if since_ts == 0:
+        delta_fish = [latest_fish] if latest_fish else []
+        delta_codewords = [latest_codeword] if latest_codeword else []
+    return latest_ts, delta_fish, delta_codewords
+
+
+def _watch_next_planet_fish() -> tuple[str | None, str | None]:
+    planets = fishwatch.PLANETS
+    if not planets:
+        return None, None
+    state = _WATCH_STATE
+    start = max(0, state.automate_planet_index) % len(planets)
+    used = {name.casefold() for name in state.automate_used_fish}
+    for step in range(len(planets)):
+        idx = (start + step) % len(planets)
+        planet = planets[idx]
+        remaining = [
+            f.name for f in fishwatch.FISH
+            if f.planet == planet and f.name.casefold() not in used
+        ]
+        if not remaining:
+            continue
+        state.automate_planet_index = idx if len(remaining) > 1 else (
+            (idx + 1) % len(planets)
+        )
+        return planet, remaining[0]
+    state.automate_used_fish.clear()
+    idx = start
+    planet = planets[idx]
+    remaining = [f.name for f in fishwatch.FISH if f.planet == planet]
+    if not remaining:
+        return None, None
+    state.automate_planet_index = idx if len(remaining) > 1 else (
+        (idx + 1) % len(planets)
+    )
+    return planet, remaining[0]
+
+
+def _watch_next_codeword() -> str | None:
+    state = _WATCH_STATE
+    roster = [
+        fishwatch.normalize_codeword(c) for c in state.codewords
+        if fishwatch.normalize_codeword(c)
+    ] or list(fishwatch.CODEWORDS)
+    used = {fishwatch.normalize_codeword(c).casefold()
+            for c in state.automate_used_codewords
+            if fishwatch.normalize_codeword(c)}
+    for phrase in roster:
+        if phrase.casefold() not in used:
+            return phrase
+    state.automate_used_codewords.clear()
+    return roster[0] if roster else None
+
+
+async def _announce_watch_automation() -> bool:
+    state = _WATCH_STATE
+    channel = client.get_channel(_WATCH_AUTOMATE_CHANNEL_ID)
+    if channel is None:
+        with contextlib.suppress(discord.HTTPException):
+            channel = await client.fetch_channel(_WATCH_AUTOMATE_CHANNEL_ID)
+    if channel is None:
+        return False
+    latest_ts, delta_fish, delta_codewords = await _watch_automation_history_delta(
+        channel,
+        admin_ids=set(state.admin_ids),
+        since_ts=state.automate_last_ts,
+        roster=state.codewords,
+    )
+    changed = False
+    for fish in delta_fish:
+        changed = _append_casefold_unique(state.automate_used_fish, fish) or changed
+    for codeword in delta_codewords:
+        changed = _append_casefold_unique(
+            state.automate_used_codewords, codeword
+        ) or changed
+    if latest_ts > state.automate_last_ts:
+        state.automate_last_ts = latest_ts
+        changed = True
+    now_ts = int(time.time())
+    if state.automate_last_ts and (
+        now_ts < state.automate_last_ts + _WATCH_AUTOMATE_INTERVAL_SECONDS
+    ):
+        if changed:
+            await asyncio.to_thread(_persist_watch_state)
+        return False
+    planet, fish_name = _watch_next_planet_fish()
+    codeword = _watch_next_codeword()
+    if not planet or not fish_name or not codeword:
+        if changed:
+            await asyncio.to_thread(_persist_watch_state)
+        return False
+    next_ts = now_ts + _WATCH_AUTOMATE_INTERVAL_SECONDS
+    embed = discord.Embed(
+        title="Fish Watch — Next Catch",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="Planet", value=planet, inline=False)
+    embed.add_field(
+        name="Fish",
+        value=f"[{fish_name}]({_watch_fish_wiki_url(fish_name)})",
+        inline=False,
+    )
+    embed.add_field(name="Codeword", value=codeword, inline=False)
+    embed.add_field(name="Next Fish", value=str(next_ts), inline=False)
+    embed.set_image(url=_watch_fish_wiki_image_url(fish_name))
+    try:
+        sent = await channel.send(
+            content=f"<@&{_WATCH_AUTOMATE_ROLE_ID}>",
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(
+                roles=True, users=False, everyone=False
+            ),
+        )
+    except discord.HTTPException:
+        logger.exception("watch: failed to post automated fish announcement")
+        if changed:
+            await asyncio.to_thread(_persist_watch_state)
+        return False
+    _append_casefold_unique(state.automate_used_fish, fish_name)
+    _append_casefold_unique(state.automate_used_codewords, codeword)
+    created = getattr(sent, "created_at", None)
+    state.automate_last_ts = int(created.timestamp()) if created else now_ts
+    await asyncio.to_thread(_persist_watch_state)
+    logger.info(
+        "watch: automated announcement posted (%s | %s)", planet, fish_name
+    )
+    return True
+
+
+async def _watch_automation_task() -> None:
+    while True:
+        try:
+            if _WATCH_STATE.automate_enabled:
+                await _announce_watch_automation()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("watch: automation loop failed")
+        await asyncio.sleep(_WATCH_AUTOMATE_POLL_SECONDS)
+
+
 # (page key, title) for the paginated /watch panel — page bodies are built
 # inline in _watch_components (they need the watch state / leaderboard).
 _WATCH_PAGES: list[tuple[str, str]] = [
     ("watch",   "Watch"),
     ("records", "Records"),
+    ("automate", "Automation"),
 ]
 
 _WATCH_MEDALS = ("\U0001F947", "\U0001F948", "\U0001F949")  # gold/silver/bronze
@@ -6825,6 +7060,47 @@ def _watch_components(
                 "components": container_components,
             },
         ]
+    if key == "automate":
+        next_due = (
+            _WATCH_STATE.automate_last_ts + _WATCH_AUTOMATE_INTERVAL_SECONDS
+            if _WATCH_STATE.automate_last_ts else 0
+        )
+        next_line = str(next_due) if next_due else "*unknown*"
+        status = (
+            "✅ **Running**" if _WATCH_STATE.automate_enabled
+            else "⛔ **Stopped**"
+        )
+        body = (
+            f"{status}\n"
+            f"**Announcement channel:** <#{_WATCH_AUTOMATE_CHANNEL_ID}>\n"
+            f"**Ping role:** <@&{_WATCH_AUTOMATE_ROLE_ID}>\n"
+            f"**Next Fish:** {next_line}"
+        )
+        button_row = {
+            "type": 1,
+            "components": [
+                {"type": 2, "style": 3, "label": "Start automation",
+                 "custom_id": "watch:auto-start",
+                 "disabled": bool(_WATCH_STATE.automate_enabled)},
+                {"type": 2, "style": 4, "label": "Stop automation",
+                 "custom_id": "watch:auto-stop",
+                 "disabled": not _WATCH_STATE.automate_enabled},
+                {"type": 2, "style": 2, "label": "Run now",
+                 "custom_id": "watch:auto-run"},
+            ],
+        }
+        return [
+            {"type": 10, "content": f"### 🎣  Fish Watch — {title}"},
+            {
+                "type": 17,
+                "accent_color": ACCENT_PASS if _WATCH_STATE.automate_enabled else ACCENT_FAIL,
+                "components": [
+                    {"type": 10, "content": body},
+                    button_row,
+                    nav_row,
+                ],
+            },
+        ]
 
     status_line = (
         "\u2705 **Watching**" if running else "\u26D4 **Stopped**"
@@ -6869,6 +7145,13 @@ def _watch_components(
              "custom_id": "watch:codeword"},
             {"type": 2, "style": 1, "label": "Set admin",
              "custom_id": "watch:admins"},
+            {"type": 2, "style": 2, "label": "Automate",
+             "custom_id": "watch:page:2"},
+        ],
+    }
+    aux_row = {
+        "type": 1,
+        "components": [
             {"type": 2, "style": 2, "label": "Leaderboards",
              "custom_id": "watch:leaderboard"},
         ],
@@ -6881,6 +7164,7 @@ def _watch_components(
             "components": [
                 {"type": 10, "content": body},
                 button_row,
+                aux_row,
                 nav_row,
             ],
         },
@@ -7054,6 +7338,36 @@ async def _handle_watch_interaction(
         with contextlib.suppress(discord.HTTPException):
             await interaction.response.send_modal(_WatchAdminModal())
         return
+    if action == "auto-start":
+        _WATCH_STATE.automate_enabled = True
+        await asyncio.to_thread(_persist_watch_state)
+        with contextlib.suppress(Exception):
+            await _interaction_callback(
+                interaction, 7, _watch_components(page=2)
+            )
+        return
+    if action == "auto-stop":
+        _WATCH_STATE.automate_enabled = False
+        await asyncio.to_thread(_persist_watch_state)
+        with contextlib.suppress(Exception):
+            await _interaction_callback(
+                interaction, 7, _watch_components(page=2)
+            )
+        return
+    if action == "auto-run":
+        ran = await _announce_watch_automation()
+        body = (
+            "✅ Posted the automated fish announcement."
+            if ran else "ℹ️ No automated fish announcement was due."
+        )
+        with contextlib.suppress(Exception):
+            await _interaction_callback(
+                interaction,
+                4,
+                [{"type": 17, "accent_color": ACCENT_PASS,
+                  "components": [{"type": 10, "content": body}]}],
+            )
+        return
     if action == "start" and _WATCH_STATE.channel_id:
         _WATCH_STATE.enabled = True
         await asyncio.to_thread(_persist_watch_state)
@@ -7087,6 +7401,9 @@ async def _handle_watch_interaction(
         "The channel, thread or forum to watch (defaults to the current "
         "channel)."
     ),
+    automate=(
+        "Open the automation controls for 6-hour fish announcements."
+    ),
 )
 @app_commands.default_permissions(manage_guild=True)
 async def watch_cmd(
@@ -7097,6 +7414,7 @@ async def watch_cmd(
         | discord.ForumChannel
         | None
     ) = None,
+    automate: bool = False,
 ) -> None:
     user = interaction.user
     if interaction.guild is None or not (
@@ -7112,7 +7430,9 @@ async def watch_cmd(
     elif not _WATCH_STATE.channel_id and interaction.channel_id:
         _WATCH_STATE.channel_id = interaction.channel_id
     await asyncio.to_thread(_persist_watch_state)
-    await _interaction_callback(interaction, 4, _watch_components())
+    await _interaction_callback(
+        interaction, 4, _watch_components(page=2 if automate else 0)
+    )
 
 
 async def _process_watch_submission(

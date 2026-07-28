@@ -394,6 +394,11 @@ def test_watch_state_env_items_round_trip():
         enabled=True, channel_id=99, codeword="w",
         admin_ids={5, 2}, current_fish="Norg",
         codewords=["w", "x y"],
+        automate_enabled=True,
+        automate_planet_index=2,
+        automate_used_fish=["Norg", "Mawfish"],
+        automate_used_codewords=["w"],
+        automate_last_ts=123,
     )
     items = dict(state.env_items())
     assert items[fishwatch.ENV_ENABLED] == "1"
@@ -402,6 +407,29 @@ def test_watch_state_env_items_round_trip():
     assert items[fishwatch.ENV_CODEWORDS] == "w,x y"
     assert items[fishwatch.ENV_ADMIN_IDS] == "2,5"
     assert items[fishwatch.ENV_FISH] == "Norg"
+    assert items[fishwatch.ENV_AUTOMATE_ENABLED] == "1"
+    assert items[fishwatch.ENV_AUTOMATE_PLANET_INDEX] == "2"
+    assert items[fishwatch.ENV_AUTOMATE_USED_FISH] == "Norg,Mawfish"
+    assert items[fishwatch.ENV_AUTOMATE_USED_CODEWORDS] == "w"
+    assert items[fishwatch.ENV_AUTOMATE_LAST_TS] == "123"
+
+
+def test_watch_state_from_env_automation_fields(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(fishwatch.ENV_AUTOMATE_ENABLED, "1")
+    monkeypatch.setenv(fishwatch.ENV_AUTOMATE_PLANET_INDEX, "4")
+    monkeypatch.setenv(
+        fishwatch.ENV_AUTOMATE_USED_FISH, "norg,MAWFISH,unknown fish"
+    )
+    monkeypatch.setenv(
+        fishwatch.ENV_AUTOMATE_USED_CODEWORDS, "Alpha,alpha,beta"
+    )
+    monkeypatch.setenv(fishwatch.ENV_AUTOMATE_LAST_TS, "99")
+    state = WatchState.from_env()
+    assert state.automate_enabled is True
+    assert state.automate_planet_index == 1
+    assert state.automate_used_fish == ["Norg", "Mawfish"]
+    assert state.automate_used_codewords == ["Alpha", "beta"]
+    assert state.automate_last_ts == 99
 
 
 # ---------------------------------------------------------------------------
@@ -541,9 +569,10 @@ def test_watch_components_and_state(monkeypatch):
     ids = [b["custom_id"] for b in rows[1]["components"]]
     assert ids == [
         "watch:start", "watch:stop", "watch:codeword", "watch:admins",
-        "watch:leaderboard",
+        "watch:page:2",
     ]
-    nav_ids = [b["custom_id"] for b in rows[2]["components"]]
+    assert [b["custom_id"] for b in rows[2]["components"]] == ["watch:leaderboard"]
+    nav_ids = [b["custom_id"] for b in rows[3]["components"]]
     assert nav_ids == [
         "watch:page:-1", "watch:noop", "watch:page:1", "watch:page:0",
     ]
@@ -553,6 +582,63 @@ def test_watch_components_and_state(monkeypatch):
     assert "Active codeword" in body
     # The fish reference table was removed from the Watch page.
     assert "Mortus Lungfish" not in body
+
+
+def test_watch_automation_components():
+    import bot
+
+    orig = (
+        bot._WATCH_STATE.automate_enabled,
+        bot._WATCH_STATE.automate_last_ts,
+    )
+    try:
+        bot._WATCH_STATE.automate_enabled = True
+        bot._WATCH_STATE.automate_last_ts = 100
+        comps = bot._watch_components(2, guild_id=1, top={})
+        assert "Automation" in comps[0]["content"]
+        body = comps[1]["components"][0]["content"]
+        assert "Running" in body
+        btns = [b["custom_id"] for b in comps[1]["components"][1]["components"]]
+        assert btns == ["watch:auto-start", "watch:auto-stop", "watch:auto-run"]
+    finally:
+        bot._WATCH_STATE.automate_enabled = orig[0]
+        bot._WATCH_STATE.automate_last_ts = orig[1]
+
+
+def test_watch_next_planet_fish_rotates_after_planet_exhausted():
+    import bot
+
+    orig = (
+        list(bot._WATCH_STATE.automate_used_fish),
+        bot._WATCH_STATE.automate_planet_index,
+    )
+    try:
+        bot._WATCH_STATE.automate_used_fish = [
+            f.name for f in fishwatch.FISH if f.planet == "Earth"
+        ]
+        bot._WATCH_STATE.automate_planet_index = 0
+        planet, fish_name = bot._watch_next_planet_fish()
+        assert planet == "Venus"
+        assert fish_name == "Scrubber"
+    finally:
+        bot._WATCH_STATE.automate_used_fish = orig[0]
+        bot._WATCH_STATE.automate_planet_index = orig[1]
+
+
+def test_watch_next_codeword_skips_used():
+    import bot
+
+    orig = (
+        list(bot._WATCH_STATE.codewords),
+        list(bot._WATCH_STATE.automate_used_codewords),
+    )
+    try:
+        bot._WATCH_STATE.codewords = ["Alpha", "Beta", "Gamma"]
+        bot._WATCH_STATE.automate_used_codewords = ["alpha", "beta"]
+        assert bot._watch_next_codeword() == "Gamma"
+    finally:
+        bot._WATCH_STATE.codewords = orig[0]
+        bot._WATCH_STATE.automate_used_codewords = orig[1]
 
 
 # ---------------------------------------------------------------------------
