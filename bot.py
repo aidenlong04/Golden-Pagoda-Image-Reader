@@ -6932,6 +6932,8 @@ def _watch_next_codeword() -> str | None:
     for phrase in roster:
         if phrase.casefold() != active:
             return phrase
+    # Degenerate single-codeword roster: reuse it rather than skipping the
+    # announcement entirely.
     return roster[0] if roster else None
 
 
