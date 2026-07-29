@@ -678,6 +678,324 @@ def test_watch_next_codeword_skips_used():
         bot._WATCH_STATE.automate_used_codewords = orig[1]
 
 
+def test_watch_next_codeword_reset_skips_active():
+    import bot
+
+    orig = (
+        list(bot._WATCH_STATE.codewords),
+        list(bot._WATCH_STATE.automate_used_codewords),
+        bot._WATCH_STATE.codeword,
+    )
+    try:
+        bot._WATCH_STATE.codewords = ["Alpha", "Beta"]
+        bot._WATCH_STATE.automate_used_codewords = ["alpha", "beta"]
+        bot._WATCH_STATE.codeword = "Alpha"
+        # Roster exhausted: the cycle restarts but never repeats the codeword
+        # that is active right now.
+        assert bot._watch_next_codeword() == "Beta"
+        assert bot._WATCH_STATE.automate_used_codewords == []
+    finally:
+        bot._WATCH_STATE.codewords = orig[0]
+        bot._WATCH_STATE.automate_used_codewords = orig[1]
+        bot._WATCH_STATE.codeword = orig[2]
+
+
+def test_watch_activate_codeword_sets_active_and_roster():
+    import bot
+
+    orig = (list(bot._WATCH_STATE.codewords), bot._WATCH_STATE.codeword)
+    try:
+        bot._WATCH_STATE.codewords = ["Alpha"]
+        bot._WATCH_STATE.codeword = "Alpha"
+        assert bot._watch_activate_codeword("`Beta`") is True
+        assert bot._WATCH_STATE.codeword == "Beta"
+        assert bot._WATCH_STATE.codewords == ["Alpha", "Beta"]
+        # Idempotent.
+        assert bot._watch_activate_codeword("Beta") is False
+    finally:
+        bot._WATCH_STATE.codewords = orig[0]
+        bot._WATCH_STATE.codeword = orig[1]
+
+
+# ---------------------------------------------------------------------------
+# Local-day bucket + one-day rerun
+# ---------------------------------------------------------------------------
+
+def test_local_day_start_and_next_midnight():
+    import time as _time
+
+    now = int(_time.time())
+    start = fishwatch.local_day_start(now)
+    assert start <= now
+    assert fishwatch.local_day_start(start) == start
+    nxt = fishwatch.next_local_midnight(now)
+    assert nxt > now
+    assert fishwatch.local_day_start(nxt) == nxt
+    # Exactly one local day apart (23-25h across DST shifts).
+    assert 23 * 3600 <= nxt - start <= 25 * 3600
+
+
+def test_fish_schedule_state_replay_env_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state = FishScheduleState(
+        day_start_ts=100, day_fish=["Norg"],
+        replay_fish=["Mawfish"], replay_start_ts=200,
+        replay_pending=True, replay_armed_ts=50,
+    )
+    items = dict(state.env_items())
+    assert items[fishwatch.ENV_AUTOMATE_DAY_START_TS] == "100"
+    assert items[fishwatch.ENV_AUTOMATE_DAY_FISH] == "Norg"
+    assert items[fishwatch.ENV_AUTOMATE_REPLAY_FISH] == "Mawfish"
+    assert items[fishwatch.ENV_AUTOMATE_REPLAY_START_TS] == "200"
+    assert items[fishwatch.ENV_AUTOMATE_REPLAY_PENDING] == "1"
+    assert items[fishwatch.ENV_AUTOMATE_REPLAY_ARMED_TS] == "50"
+    for key, value in items.items():
+        monkeypatch.setenv(key, value)
+    loaded = FishScheduleState.from_env()
+    assert loaded.day_start_ts == 100
+    assert loaded.day_fish == ["Norg"]
+    assert loaded.replay_fish == ["Mawfish"]
+    assert loaded.replay_start_ts == 200
+    assert loaded.replay_pending is True
+    assert loaded.replay_armed_ts == 50
+
+
+def test_watch_state_env_items_carry_replay_state():
+    state = WatchState(
+        automate_schedule=FishScheduleState(
+            day_start_ts=7, day_fish=["Norg"], replay_fish=["Mawfish"],
+            replay_start_ts=9, replay_pending=True, replay_armed_ts=3,
+        ),
+    )
+    items = dict(state.env_items())
+    assert items[fishwatch.ENV_AUTOMATE_DAY_FISH] == "Norg"
+    assert items[fishwatch.ENV_AUTOMATE_REPLAY_FISH] == "Mawfish"
+    assert items[fishwatch.ENV_AUTOMATE_REPLAY_START_TS] == "9"
+    assert items[fishwatch.ENV_AUTOMATE_REPLAY_PENDING] == "1"
+    assert items[fishwatch.ENV_AUTOMATE_REPLAY_ARMED_TS] == "3"
+
+
+@pytest.fixture()
+def watch_schedule():
+    """Isolate + restore the automation schedule around a test."""
+    import bot
+
+    state = bot._WATCH_STATE
+    saved = (
+        state.automate_schedule,
+        state.codeword,
+        list(state.codewords),
+        list(state.automate_used_codewords),
+        state.current_fish,
+        state.automate_last_ts,
+    )
+    state.automate_schedule = FishScheduleState()
+    state.automate_last_ts = 0
+    try:
+        yield state.automate_schedule
+    finally:
+        (
+            state.automate_schedule, state.codeword, state.codewords,
+            state.automate_used_codewords, state.current_fish,
+            state.automate_last_ts,
+        ) = saved
+
+
+def test_watch_arm_replay_is_one_shot(watch_schedule):
+    import bot
+
+    assert bot._watch_arm_replay(1000) is True
+    assert watch_schedule.replay_pending is True
+    assert watch_schedule.replay_armed_ts == 1000
+    watch_schedule.replay_pending = False
+    # A restart (or a later poll) must never re-arm the one-shot rerun.
+    assert bot._watch_arm_replay(2000) is False
+    assert watch_schedule.replay_pending is False
+
+
+def test_watch_roll_day_promotes_pending_replay(watch_schedule):
+    import bot
+    import time as _time
+
+    now = int(_time.time())
+    today = fishwatch.local_day_start(now)
+    yesterday = fishwatch.local_day_start(today - 3600)
+    watch_schedule.day_start_ts = yesterday
+    watch_schedule.day_fish = ["Norg", "Mawfish"]
+    watch_schedule.replay_pending = True
+    assert bot._watch_roll_day(now) is True
+    assert watch_schedule.day_start_ts == today
+    assert watch_schedule.day_fish == []
+    assert watch_schedule.replay_fish == ["Norg", "Mawfish"]
+    # The rerun is anchored to local midnight and only happens once.
+    assert watch_schedule.replay_start_ts == today
+    assert watch_schedule.replay_pending is False
+    assert bot._watch_roll_day(now) is False
+
+
+def test_watch_upcoming_fish_prefers_replay_queue(watch_schedule):
+    import bot
+
+    watch_schedule.next_fish_index = 4
+    assert bot._watch_upcoming_fish(1000) == "Scrubber"
+    watch_schedule.replay_fish = ["Norg"]
+    watch_schedule.replay_start_ts = 2000
+    # Not due yet — the rotation still owns the next send.
+    assert bot._watch_upcoming_fish(1000) == "Scrubber"
+    assert bot._watch_upcoming_fish(2000) == "Norg"
+
+
+def test_watch_set_next_fish_overrides_replay_head(watch_schedule):
+    import bot
+    import time as _time
+
+    watch_schedule.replay_fish = ["Norg", "Mawfish"]
+    watch_schedule.replay_start_ts = int(_time.time()) - 10
+    assert bot._watch_schedule_set_next_fish("Mawfish") is True
+    assert watch_schedule.replay_fish == ["Mawfish", "Norg"]
+
+
+class _FakeHistory:
+    def __init__(self, messages):
+        self._messages = messages
+
+    def __aiter__(self):
+        async def gen():
+            for message in self._messages:
+                yield message
+        return gen()
+
+
+class _FakeAnnounceChannel:
+    def __init__(self, messages=()):
+        # discord.py yields newest-first by default.
+        self.messages = list(messages)
+        self.sent = []
+
+    def history(self, limit=None, oldest_first=False):
+        assert not oldest_first, "the bounded scan must start from the newest"
+        return _FakeHistory(list(self.messages)[:limit])
+
+    async def send(self, **kwargs):
+        self.sent.append(kwargs)
+        return SimpleNamespace(
+            created_at=datetime.datetime.now(datetime.timezone.utc)
+        )
+
+
+def _announce(monkeypatch, channel):
+    import bot
+
+    monkeypatch.setattr(bot.client, "get_channel", lambda _id: channel)
+    monkeypatch.setattr(bot, "_persist_watch_state", lambda: None)
+    return asyncio.run(bot._announce_watch_automation())
+
+
+def test_announcement_watches_its_own_fish_and_codeword(
+    watch_schedule, monkeypatch
+):
+    import bot
+
+    state = bot._WATCH_STATE
+    state.codewords = ["Alpha", "Beta"]
+    state.automate_used_codewords = []
+    state.codeword = ""
+    state.current_fish = None
+    watch_schedule.next_fish_index = 3  # Norg
+    channel = _FakeAnnounceChannel()
+    assert _announce(monkeypatch, channel) is True
+    assert channel.sent
+    # The automated pair is now what submissions are graded against.
+    assert state.current_fish == "Norg"
+    assert state.codeword == "Alpha"
+    assert "Alpha" in state.codewords
+    assert watch_schedule.day_fish == ["Norg"]
+    assert watch_schedule.next_fish_index == 4
+
+
+def test_replay_day_reruns_fish_with_a_different_codeword(
+    watch_schedule, monkeypatch
+):
+    import bot
+    import time as _time
+
+    state = bot._WATCH_STATE
+    state.codewords = ["Alpha", "Beta"]
+    state.automate_used_codewords = ["Alpha"]
+    state.codeword = "Alpha"
+    now = int(_time.time())
+    watch_schedule.day_start_ts = fishwatch.local_day_start(now)
+    watch_schedule.next_fish_index = 4  # rotation resumes at Scrubber
+    watch_schedule.replay_fish = ["Norg", "Mawfish"]
+    watch_schedule.replay_start_ts = watch_schedule.day_start_ts
+    watch_schedule.replay_armed_ts = now - 1
+    # Last send was well under the interval ago: the midnight rerun kickoff
+    # ignores the interval gate, then the 6-hour cadence resumes.
+    watch_schedule.last_send_ts = watch_schedule.day_start_ts - 600
+    channel = _FakeAnnounceChannel()
+    assert _announce(monkeypatch, channel) is True
+    assert state.current_fish == "Norg"
+    assert state.codeword == "Beta"  # today's codeword is not reused
+    assert watch_schedule.replay_fish == ["Mawfish"]
+    # The rotation pointer is untouched while the rerun day runs.
+    assert watch_schedule.next_fish_index == 4
+    # A second call inside the interval is not due.
+    assert _announce(monkeypatch, channel) is False
+
+
+def test_replay_queue_exhausted_resumes_rotation(watch_schedule, monkeypatch):
+    import bot
+    import time as _time
+
+    state = bot._WATCH_STATE
+    state.codewords = ["Alpha", "Beta"]
+    state.automate_used_codewords = []
+    now = int(_time.time())
+    watch_schedule.day_start_ts = fishwatch.local_day_start(now)
+    watch_schedule.replay_armed_ts = now - 1
+    watch_schedule.next_fish_index = 4
+    watch_schedule.replay_fish = ["Norg"]
+    watch_schedule.replay_start_ts = now - 5
+    channel = _FakeAnnounceChannel()
+    assert _announce(monkeypatch, channel) is True
+    assert watch_schedule.replay_fish == []
+    assert watch_schedule.replay_start_ts == 0
+    assert bot._watch_upcoming_fish() == "Scrubber"
+
+
+def test_history_scan_reads_newest_messages_first(watch_schedule, monkeypatch):
+    import bot
+
+    state = bot._WATCH_STATE
+    state.codewords = ["Alpha", "Beta"]
+    state.automate_used_codewords = []
+    state.current_fish = None
+    state.codeword = ""
+    state.automate_last_ts = 0
+    now = datetime.datetime.now(datetime.timezone.utc)
+    watch_schedule.replay_armed_ts = 1  # don't arm a rerun mid-test
+    watch_schedule.last_send_ts = int(now.timestamp())
+    channel = _FakeAnnounceChannel([
+        SimpleNamespace(
+            author=SimpleNamespace(id=9, bot=True),
+            content="Fish: Norg codeword: Alpha", embeds=(),
+            attachments=(), created_at=now,
+        ),
+        SimpleNamespace(
+            author=SimpleNamespace(id=9, bot=True),
+            content="Fish: Mawfish", embeds=(),
+            attachments=(),
+            created_at=now - datetime.timedelta(hours=6),
+        ),
+    ])
+    # Not due (last send is now), but the scan still adopts the latest
+    # announced pair, and a fish-only message doesn't clear the codeword.
+    assert _announce(monkeypatch, channel) is False
+    assert state.current_fish == "Norg"
+    assert state.codeword == "Alpha"
+
+
 # ---------------------------------------------------------------------------
 # Weight extraction + Records leaderboard page
 # ---------------------------------------------------------------------------

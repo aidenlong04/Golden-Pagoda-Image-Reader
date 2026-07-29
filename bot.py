@@ -13,6 +13,7 @@ import time
 import warnings
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import NamedTuple
 from urllib.parse import quote
@@ -6728,24 +6729,42 @@ def _watch_message_fish_codeword(
     return fishwatch.canonical_fish(fish or ""), codeword
 
 
+@dataclass
+class _WatchHistoryDelta:
+    """What a scan of the announcement channel learned since ``since_ts``."""
+
+    latest_ts: int = 0
+    fish: list[str] = field(default_factory=list)
+    codewords: list[str] = field(default_factory=list)
+    # Every fish announced on the current local day (used to build the replay
+    # queue), regardless of ``since_ts``.
+    day_fish: list[str] = field(default_factory=list)
+    latest_fish: str | None = None
+    latest_codeword: str | None = None
+
+
 async def _watch_automation_history_delta(
     channel: discord.abc.Messageable,
     *,
     admin_ids: set[int],
     since_ts: int,
     roster: Iterable[str],
-) -> tuple[int, list[str], list[str]]:
-    # oldest_first=True keeps the parser deterministic and lets us retain the
-    # latest seen fish/codeword pair as we sweep forward. The scan is bounded;
-    # activity beyond this limit is intentionally ignored to keep polling cheap.
-    latest_ts = max(0, since_ts)
-    delta_fish: list[str] = []
-    delta_codewords: list[str] = []
-    latest_fish: str | None = None
-    latest_codeword: str | None = None
-    async for message in channel.history(
-        limit=_WATCH_AUTOMATE_HISTORY_LIMIT, oldest_first=True
-    ):
+    day_start_ts: int = 0,
+) -> _WatchHistoryDelta:
+    # The scan is bounded, so it must start from the NEWEST messages —
+    # history(oldest_first=True) walks forward from the beginning of the
+    # channel and would never reach recent announcements in a busy channel.
+    # The newest-first page is reversed into chronological order afterwards so
+    # the parser stays deterministic and "latest wins".
+    out = _WatchHistoryDelta(latest_ts=max(0, since_ts))
+    recent = [
+        message
+        async for message in channel.history(
+            limit=_WATCH_AUTOMATE_HISTORY_LIMIT
+        )
+    ]
+    recent.reverse()
+    for message in recent:
         author = getattr(message, "author", None)
         author_id = getattr(author, "id", 0)
         from_watcher = bool(getattr(author, "bot", False)) or author_id in admin_ids
@@ -6756,20 +6775,27 @@ async def _watch_automation_history_delta(
             continue
         created = getattr(message, "created_at", None)
         ts = int(created.timestamp()) if created else 0
-        latest_ts = max(latest_ts, ts)
-        latest_fish, latest_codeword = fish, codeword
+        out.latest_ts = max(out.latest_ts, ts)
+        # Fish and codeword are tracked independently: a message naming only a
+        # fish must not clear the last seen codeword (and vice versa).
+        if fish:
+            out.latest_fish = fish
+        if codeword:
+            out.latest_codeword = codeword
+        if fish and day_start_ts and ts >= day_start_ts:
+            _append_casefold_unique(out.day_fish, fish)
         if since_ts and ts <= since_ts:
             continue
         if fish:
-            _append_casefold_unique(delta_fish, fish)
+            _append_casefold_unique(out.fish, fish)
         if codeword:
-            _append_casefold_unique(delta_codewords, codeword)
+            _append_casefold_unique(out.codewords, codeword)
     if since_ts == 0:
         # First run bootstraps from the latest known announcement/admin update
         # only; ongoing runs collect every delta newer than since_ts.
-        delta_fish = [latest_fish] if latest_fish else []
-        delta_codewords = [latest_codeword] if latest_codeword else []
-    return latest_ts, delta_fish, delta_codewords
+        out.fish = [out.latest_fish] if out.latest_fish else []
+        out.codewords = [out.latest_codeword] if out.latest_codeword else []
+    return out
 
 
 def _watch_schedule_next_fish() -> str | None:
@@ -6796,7 +6822,16 @@ def _watch_schedule_set_next_fish(fish_name: str) -> bool:
     idx = _watch_fish_index(fish_name)
     if idx is None:
         return False
-    _WATCH_STATE.automate_schedule.next_fish_index = idx
+    schedule = _WATCH_STATE.automate_schedule
+    schedule.next_fish_index = idx
+    if _watch_replay_active() and schedule.replay_fish:
+        # An explicit admin pick wins over the rerun queue head; the rest of
+        # the queue still runs afterwards.
+        canonical = fishwatch.FISH[idx].name
+        schedule.replay_fish = [canonical] + [
+            name for name in schedule.replay_fish
+            if name.casefold() != canonical.casefold()
+        ]
     return True
 
 
@@ -6815,9 +6850,64 @@ def _watch_schedule_advance_after(fish_name: str) -> bool:
 
 
 def _watch_next_planet_fish() -> tuple[str | None, str | None]:
-    fish_name = _watch_schedule_next_fish()
+    fish_name = _watch_upcoming_fish()
     fish = fishwatch.FISH_BY_KEY.get((fish_name or "").casefold())
     return (fish.planet if fish else None), fish_name
+
+
+def _watch_replay_active(now_ts: int | None = None) -> bool:
+    """True when the queued one-day rerun is due (or already running)."""
+    schedule = _WATCH_STATE.automate_schedule
+    if not schedule.replay_fish:
+        return False
+    now_ts = int(time.time()) if now_ts is None else now_ts
+    return now_ts >= schedule.replay_start_ts
+
+
+def _watch_upcoming_fish(now_ts: int | None = None) -> str | None:
+    """The fish the next announcement will use: the replay queue head while a
+    rerun day is running, otherwise the normal rotation."""
+    schedule = _WATCH_STATE.automate_schedule
+    if _watch_replay_active(now_ts):
+        return schedule.replay_fish[0]
+    return _watch_schedule_next_fish()
+
+
+def _watch_roll_day(now_ts: int) -> bool:
+    """Advance the local-day bucket, promoting a pending rerun request into a
+    scheduled replay of the day that just ended. Returns True on change."""
+    schedule = _WATCH_STATE.automate_schedule
+    day_start = fishwatch.local_day_start(now_ts)
+    if schedule.day_start_ts == day_start:
+        return False
+    finished_day_fish = list(schedule.day_fish) if schedule.day_start_ts else []
+    schedule.day_start_ts = day_start
+    schedule.day_fish = []
+    if schedule.replay_pending and finished_day_fish:
+        schedule.replay_fish = finished_day_fish
+        # The rerun runs the same 6-hour cadence anchored to local midnight.
+        schedule.replay_start_ts = day_start
+        schedule.replay_pending = False
+        logger.info(
+            "watch: replaying %d fish from the previous day at <t:%d>",
+            len(finished_day_fish), day_start,
+        )
+    return True
+
+
+def _watch_arm_replay(now_ts: int) -> bool:
+    """One-shot arm of the "rerun the current day tomorrow" request.
+
+    Persisted via ``replay_armed_ts`` so a restart (or a second poll) never
+    re-arms it — the rerun happens exactly once, after which the rotation
+    resumes with the fish that have not been announced yet.
+    """
+    schedule = _WATCH_STATE.automate_schedule
+    if schedule.replay_armed_ts:
+        return False
+    schedule.replay_armed_ts = now_ts
+    schedule.replay_pending = True
+    return True
 
 
 def _watch_next_codeword() -> str | None:
@@ -6834,8 +6924,36 @@ def _watch_next_codeword() -> str | None:
     for phrase in roster:
         if phrase.casefold() not in used:
             return phrase
+    # Roster exhausted: start a fresh cycle, but never hand back the codeword
+    # that is active right now — two announcements in a row sharing a codeword
+    # would let a stale screenshot pass the next session.
     state.automate_used_codewords.clear()
+    active = fishwatch.normalize_codeword(state.codeword).casefold()
+    for phrase in roster:
+        if phrase.casefold() != active:
+            return phrase
     return roster[0] if roster else None
+
+
+def _watch_activate_codeword(codeword: str) -> bool:
+    """Make *codeword* the active session codeword and keep it in the roster.
+
+    The roster is what ``find_codeword`` scans, so an automated codeword has to
+    live there too — otherwise a watch admin re-typing it in the watched
+    channel would not re-activate it. Returns True when anything changed.
+    """
+    state = _WATCH_STATE
+    phrase = fishwatch.normalize_codeword(codeword)
+    if not phrase:
+        return False
+    changed = False
+    if state.codeword != phrase:
+        state.codeword = phrase
+        changed = True
+    if phrase.casefold() not in {c.casefold() for c in state.codewords}:
+        state.codewords.append(phrase)
+        changed = True
+    return changed
 
 
 async def _announce_watch_automation() -> bool:
@@ -6846,34 +6964,58 @@ async def _announce_watch_automation() -> bool:
             channel = await client.fetch_channel(_WATCH_AUTOMATE_CHANNEL_ID)
     if channel is None:
         return False
-    latest_ts, delta_fish, delta_codewords = await _watch_automation_history_delta(
+    schedule = state.automate_schedule
+    now_ts = int(time.time())
+    # Roll the local-day bucket first so the history scan knows where "today"
+    # starts, and so a pending rerun is promoted the moment midnight passes.
+    changed = _watch_roll_day(now_ts)
+    delta = await _watch_automation_history_delta(
         channel,
         admin_ids=set(state.admin_ids),
         since_ts=state.automate_last_ts,
         roster=state.codewords,
+        day_start_ts=schedule.day_start_ts,
     )
-    changed = False
-    for fish in delta_fish:
-        changed = _watch_schedule_advance_after(fish) or changed
+    replaying = _watch_replay_active(now_ts)
+    for fish in delta.fish:
+        if not replaying:
+            # While a rerun day is running the rotation index must stay put:
+            # it already points at the fish the rotation resumes with.
+            changed = _watch_schedule_advance_after(fish) or changed
         # Legacy compatibility for existing .env installs/state migrations.
         changed = _append_casefold_unique(state.automate_used_fish, fish) or changed
-    for codeword in delta_codewords:
+    for codeword in delta.codewords:
         changed = _append_casefold_unique(
             state.automate_used_codewords, codeword
         ) or changed
-    if latest_ts > state.automate_schedule.last_send_ts:
-        state.automate_schedule.last_send_ts = latest_ts
-        # Keep the legacy mirror field aligned while old state still exists.
-        state.automate_last_ts = latest_ts
+    for fish in delta.day_fish:
+        changed = _append_casefold_unique(schedule.day_fish, fish) or changed
+    # An announcement the bot missed (restart, second instance, or an admin
+    # posting in the announcement channel) still decides what is being
+    # watched — same as an admin declaration in the watched channel.
+    if delta.fish and state.current_fish != delta.fish[-1]:
+        state.current_fish = delta.fish[-1]
         changed = True
-    now_ts = int(time.time())
-    if state.automate_schedule.last_send_ts and (
-        now_ts < state.automate_schedule.last_send_ts + _WATCH_AUTOMATE_INTERVAL_SECONDS
+    if delta.codewords:
+        changed = _watch_activate_codeword(delta.codewords[-1]) or changed
+    # One-shot arm of the "rerun this day's announcements tomorrow" request.
+    changed = _watch_arm_replay(now_ts) or changed
+    if delta.latest_ts > schedule.last_send_ts:
+        schedule.last_send_ts = delta.latest_ts
+        # Keep the legacy mirror field aligned while old state still exists.
+        state.automate_last_ts = delta.latest_ts
+        changed = True
+    # A rerun day is anchored to local midnight: its first announcement fires
+    # as soon as the day starts, then the usual 6-hour cadence continues.
+    replaying = _watch_replay_active(now_ts)
+    replay_kickoff = replaying and schedule.last_send_ts < schedule.replay_start_ts
+    if not replay_kickoff and schedule.last_send_ts and (
+        now_ts < schedule.last_send_ts + _WATCH_AUTOMATE_INTERVAL_SECONDS
     ):
         if changed:
             await asyncio.to_thread(_persist_watch_state)
         return False
-    fish_name = _watch_schedule_next_fish()
+    fish_name = _watch_upcoming_fish(now_ts)
     fish_data = fishwatch.FISH_BY_KEY.get((fish_name or "").casefold())
     planet = fish_data.planet if fish_data else None
     codeword = _watch_next_codeword()
@@ -6914,13 +7056,27 @@ async def _announce_watch_automation() -> bool:
         return False
     _append_casefold_unique(state.automate_used_fish, fish_name)
     _append_casefold_unique(state.automate_used_codewords, codeword)
+    _append_casefold_unique(schedule.day_fish, fish_name)
     created = getattr(sent, "created_at", None)
-    state.automate_schedule.last_send_ts = (
+    schedule.last_send_ts = (
         int(created.timestamp()) if created else int(time.time())
     )
     # Keep the legacy mirror field aligned while old state still exists.
-    state.automate_last_ts = state.automate_schedule.last_send_ts
-    _watch_schedule_advance_after(fish_name)
+    state.automate_last_ts = schedule.last_send_ts
+    if replaying and schedule.replay_fish:
+        # Consume the rerun queue; the rotation resumes once it empties.
+        schedule.replay_fish = [
+            name for name in schedule.replay_fish
+            if name.casefold() != fish_name.casefold()
+        ]
+        if not schedule.replay_fish:
+            schedule.replay_start_ts = 0
+    else:
+        _watch_schedule_advance_after(fish_name)
+    # The announced pair is what submissions are graded against, exactly like a
+    # watch admin declaring them in the watched channel.
+    state.current_fish = fish_name
+    _watch_activate_codeword(codeword)
     await asyncio.to_thread(_persist_watch_state)
     logger.info(
         "watch: automated announcement posted (%s | %s)", planet, fish_name
@@ -7105,11 +7261,17 @@ def _watch_components(
     if key == "automate":
         now_ts = int(time.time())
         schedule = _WATCH_STATE.automate_schedule
-        next_fish = _watch_schedule_next_fish() or "*unknown*"
+        next_fish = _watch_upcoming_fish(now_ts) or "*unknown*"
         next_due = (
             schedule.last_send_ts + _WATCH_AUTOMATE_INTERVAL_SECONDS
             if schedule.last_send_ts else now_ts
         )
+        if _watch_replay_active(now_ts) and (
+            schedule.last_send_ts < schedule.replay_start_ts
+        ):
+            next_due = max(schedule.replay_start_ts, now_ts)
+        elif schedule.replay_fish and schedule.replay_start_ts > now_ts:
+            next_due = schedule.replay_start_ts
         remaining = max(0, next_due - now_ts)
         hours, rem = divmod(remaining, 3600)
         minutes = rem // 60
@@ -7118,11 +7280,22 @@ def _watch_components(
             "✅ **Running**" if _WATCH_STATE.automate_enabled
             else "⛔ **Stopped**"
         )
+        replay_line = ""
+        if schedule.replay_fish:
+            replay_line = (
+                f"**Rerun queue:** {', '.join(schedule.replay_fish)} "
+                f"(from <t:{schedule.replay_start_ts}:t>)\n"
+            )
+        elif schedule.replay_pending:
+            replay_line = (
+                "**Rerun queue:** today's fish repeat from local midnight\n"
+            )
         body = (
             f"{status}\n"
             f"**Announcement channel:** <#{_WATCH_AUTOMATE_CHANNEL_ID}>\n"
             f"**Ping role:** <@&{_WATCH_AUTOMATE_ROLE_ID}>\n"
             f"**Next fish:** {next_fish}\n"
+            f"{replay_line}"
             f"**Next send:** {due_line}\n"
             f"**Sends in:** {hours}h {minutes}m"
         )
@@ -7328,7 +7501,7 @@ class _WatchAutomateFishModal(_GPModal):
             f"Pick the next fish to announce. The {hours}-hour cycle then continues "
             "from that fish through the canonical roster order."
         ))
-        current = _watch_schedule_next_fish()
+        current = _watch_upcoming_fish()
         self.fish_select = discord.ui.Select(
             min_values=1,
             max_values=1,

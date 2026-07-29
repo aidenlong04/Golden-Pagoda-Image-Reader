@@ -172,7 +172,14 @@ full env reference.
   to each weight. Ties go to the first submission — ranked by the message's
   post time, so the first member to reach a weight keeps the higher rank.
   Catches live in the analytics SQLite DB (`fish_catches`) and
-  are anonymised by the on-leave data purge. State persists to `.env`
+  are anonymised by the on-leave data purge. An **Automation** page runs the
+  6-hour fish announcement cycle (Start/Stop/Run now/Set next fish): each
+  announcement's fish + codeword immediately become the active watched pair,
+  exactly as if a watch admin had declared them. A one-day rerun can be queued
+  — the fish announced on one local day are re-announced the next day starting
+  at local midnight on the same 6-hour cadence, each with a different codeword,
+  after which the normal roster rotation resumes with the fish that haven't run
+  yet. State persists to `.env`
   (`FISH_WATCH_*`). Requires **Manage Server**.
 - `/manage member:<member>` — paginated ephemeral admin console (styled like
   `/status`, with Prev/Next/Refresh). The **Overview**, **Titles** and

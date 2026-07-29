@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Iterable
 
 from config import _csv_ids, _int_env
@@ -302,6 +303,12 @@ ENV_AUTOMATE_NEXT_FISH_INDEX = "FISH_WATCH_AUTOMATE_NEXT_FISH_INDEX"
 ENV_AUTOMATE_LAST_SEND_TS = "FISH_WATCH_AUTOMATE_LAST_SEND_TS"
 ENV_AUTOMATE_NEXT_FISH_INDEX_LEGACY = "FISH_AUTOMATE_NEXT_FISH_INDEX"
 ENV_AUTOMATE_LAST_SEND_TS_LEGACY = "FISH_AUTOMATE_LAST_SEND_TS"
+ENV_AUTOMATE_DAY_START_TS = "FISH_WATCH_AUTOMATE_DAY_START_TS"
+ENV_AUTOMATE_DAY_FISH = "FISH_WATCH_AUTOMATE_DAY_FISH"
+ENV_AUTOMATE_REPLAY_FISH = "FISH_WATCH_AUTOMATE_REPLAY_FISH"
+ENV_AUTOMATE_REPLAY_START_TS = "FISH_WATCH_AUTOMATE_REPLAY_START_TS"
+ENV_AUTOMATE_REPLAY_PENDING = "FISH_WATCH_AUTOMATE_REPLAY_PENDING"
+ENV_AUTOMATE_REPLAY_ARMED_TS = "FISH_WATCH_AUTOMATE_REPLAY_ARMED_TS"
 
 
 def _csv_text(raw: str | None) -> list[str]:
@@ -325,12 +332,58 @@ def _normalize_fish_index(index: int) -> int:
     return 0
 
 
+def _canonical_fish_list(names: Iterable[str]) -> list[str]:
+    """Canonicalise + de-duplicate a list of fish names, dropping unknowns."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in names:
+        name = canonical_fish(raw)
+        if not name or name.casefold() in seen:
+            continue
+        seen.add(name.casefold())
+        out.append(name)
+    return out
+
+
+def local_day_start(ts: int) -> int:
+    """Epoch seconds of local midnight (00:00) on the day containing ``ts``."""
+    moment = datetime.fromtimestamp(max(0, int(ts))).astimezone()
+    midnight = moment.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(midnight.timestamp())
+
+
+def next_local_midnight(ts: int) -> int:
+    """Epoch seconds of the next local midnight strictly after ``ts``."""
+    start = local_day_start(ts)
+    if start > ts:
+        # A DST shift can push the computed day start past ``ts``; that value
+        # is already the next boundary.
+        return start
+    moment = datetime.fromtimestamp(start).astimezone() + timedelta(days=1)
+    # Re-normalize: adding a day across a DST boundary can land at 23:00/01:00.
+    return local_day_start(int(moment.timestamp()))
+
+
 @dataclass
 class FishScheduleState:
     """Mutable fish-automation schedule state mirrored to .env."""
 
     next_fish_index: int = 0
     last_send_ts: int = 0
+    # Local-day bucket: the fish announced since ``day_start_ts``. When the
+    # day rolls over and a replay is pending, that list becomes ``replay_fish``.
+    day_start_ts: int = 0
+    day_fish: list[str] = field(default_factory=list)
+    # A one-day rerun of the previous day's fish, starting at ``replay_start_ts``
+    # (local midnight) on the usual interval. Entries are consumed as they are
+    # re-announced; the normal rotation resumes once the queue empties.
+    replay_fish: list[str] = field(default_factory=list)
+    replay_start_ts: int = 0
+    # ``replay_pending`` is an armed-but-not-yet-scheduled rerun request;
+    # ``replay_armed_ts`` marks that the one-shot request was already made so
+    # a restart never re-arms it.
+    replay_pending: bool = False
+    replay_armed_ts: int = 0
 
     @classmethod
     def from_env(cls, *, legacy_last_ts: int = 0) -> "FishScheduleState":
@@ -344,7 +397,20 @@ class FishScheduleState:
             last_send = max(0, _int_env(ENV_AUTOMATE_LAST_SEND_TS_LEGACY))
         if not last_send:
             last_send = max(0, legacy_last_ts)
-        return cls(next_fish_index=index, last_send_ts=last_send)
+        return cls(
+            next_fish_index=index,
+            last_send_ts=last_send,
+            day_start_ts=max(0, _int_env(ENV_AUTOMATE_DAY_START_TS)),
+            day_fish=_canonical_fish_list(
+                _csv_text(os.getenv(ENV_AUTOMATE_DAY_FISH))
+            ),
+            replay_fish=_canonical_fish_list(
+                _csv_text(os.getenv(ENV_AUTOMATE_REPLAY_FISH))
+            ),
+            replay_start_ts=max(0, _int_env(ENV_AUTOMATE_REPLAY_START_TS)),
+            replay_pending=_int_env(ENV_AUTOMATE_REPLAY_PENDING) == 1,
+            replay_armed_ts=max(0, _int_env(ENV_AUTOMATE_REPLAY_ARMED_TS)),
+        )
 
     def env_items(self) -> list[tuple[str, str]]:
         return [
@@ -358,6 +424,12 @@ class FishScheduleState:
                 ENV_AUTOMATE_LAST_SEND_TS_LEGACY,
                 str(max(0, self.last_send_ts)),
             ),
+            (ENV_AUTOMATE_DAY_START_TS, str(max(0, self.day_start_ts))),
+            (ENV_AUTOMATE_DAY_FISH, ",".join(self.day_fish)),
+            (ENV_AUTOMATE_REPLAY_FISH, ",".join(self.replay_fish)),
+            (ENV_AUTOMATE_REPLAY_START_TS, str(max(0, self.replay_start_ts))),
+            (ENV_AUTOMATE_REPLAY_PENDING, "1" if self.replay_pending else "0"),
+            (ENV_AUTOMATE_REPLAY_ARMED_TS, str(max(0, self.replay_armed_ts))),
         ]
 
 
@@ -471,6 +543,30 @@ class WatchState:
             (ENV_AUTOMATE_LAST_SEND_TS, str(schedule_last_send)),
             (ENV_AUTOMATE_NEXT_FISH_INDEX_LEGACY, str(schedule_index)),
             (ENV_AUTOMATE_LAST_SEND_TS_LEGACY, str(schedule_last_send)),
+            (
+                ENV_AUTOMATE_DAY_START_TS,
+                str(max(0, self.automate_schedule.day_start_ts)),
+            ),
+            (
+                ENV_AUTOMATE_DAY_FISH,
+                ",".join(self.automate_schedule.day_fish),
+            ),
+            (
+                ENV_AUTOMATE_REPLAY_FISH,
+                ",".join(self.automate_schedule.replay_fish),
+            ),
+            (
+                ENV_AUTOMATE_REPLAY_START_TS,
+                str(max(0, self.automate_schedule.replay_start_ts)),
+            ),
+            (
+                ENV_AUTOMATE_REPLAY_PENDING,
+                "1" if self.automate_schedule.replay_pending else "0",
+            ),
+            (
+                ENV_AUTOMATE_REPLAY_ARMED_TS,
+                str(max(0, self.automate_schedule.replay_armed_ts)),
+            ),
         ]
 
 
